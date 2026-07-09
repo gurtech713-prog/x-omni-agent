@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Halo pill background — pure black rounded rectangle, follows Dynamic Island aesthetic. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/black" />
+    <corners android:radius="20dp" />
+</shape>

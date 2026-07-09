@@ -1,0 +1,60 @@
+<resources>
+    <string name="app_name">X-OmniClaw</string>
+    <string name="app_tagline">Edge-native multimodal Android agent</string>
+    <string name="splash_title">X-OMNICLAW</string>
+    <string name="splash_subtitle">EDGE-NATIVE MULTIMODAL AGENT</string>
+
+    <!-- Bottom navigation -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_sessions">Sessions</string>
+    <string name="nav_skills">Skills</string>
+    <string name="nav_memory">Memory</string>
+    <string name="nav_schedule">Schedule</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Accessibility service -->
+    <string name="accessibility_service_label">X-OmniClaw Agent</string>
+    <string name="accessibility_service_description">Allows X-OmniClaw to read the on-screen UI tree and dispatch taps, swipes, and text input on your behalf. Required for the agent loop to execute device actions.</string>
+
+    <!-- Foreground service -->
+    <string name="fg_service_channel_name">Agent execution</string>
+    <string name="fg_service_channel_desc">Runs the on-device agent loop in the background so long tasks can complete without the app staying open.</string>
+    <string name="fg_service_notification_title">X-OmniClaw running</string>
+    <string name="fg_service_notification_text">Agent is executing a task on your device.</string>
+
+    <!-- Screen capture service -->
+    <string name="capture_notification_title">Screen capture active</string>
+    <string name="capture_notification_text">X-OmniClaw is capturing the screen for vision fallback.</string>
+
+    <!-- Overlay -->
+    <string name="overlay_channel_name">Floating bubble</string>
+    <string name="overlay_channel_desc">Push-to-talk bubble that overlays other apps.</string>
+
+    <!-- Generic -->
+    <string name="action_stop">Stop</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_save">Save</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_enable">Enable</string>
+    <string name="action_disable">Disable</string>
+    <string name="action_new_session">New session</string>
+    <string name="action_send">Send</string>
+    <string name="action_record">Hold to speak</string>
+
+    <!-- Permissions -->
+    <string name="perm_accessibility_title">Accessibility service</string>
+    <string name="perm_accessibility_rationale">X-OmniClaw needs the accessibility service to inspect the current UI and perform taps, swipes, and text entry. Without it, the agent can reason but cannot act.</string>
+    <string name="perm_overlay_title">Display over other apps</string>
+    <string name="perm_overlay_rationale">Required to show the floating push-to-talk bubble on top of other apps.</string>
+    <string name="perm_camera_title">Camera</string>
+    <string name="perm_camera_rationale">Used by Omni Perception to capture real-world frames when you point the camera at an object.</string>
+    <string name="perm_mic_title">Microphone</string>
+    <string name="perm_mic_rationale">Used for speech-to-action: your voice is transcribed and routed into the agent loop.</string>
+    <string name="perm_notifications_title">Notifications</string>
+    <string name="perm_notifications_rationale">Required to keep the agent loop alive as a foreground service on Android 13+.</string>
+    <string name="perm_media_title">Photos &amp; videos</string>
+    <string name="perm_media_rationale">Required by gallery memory and the one-tap video skill to scan your local gallery.</string>
+</resources>

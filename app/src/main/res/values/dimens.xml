@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="grid_0.5">2dp</dimen>
+    <dimen name="grid_1">4dp</dimen>
+    <dimen name="grid_2">8dp</dimen>
+    <dimen name="grid_3">12dp</dimen>
+    <dimen name="grid_4">16dp</dimen>
+    <dimen name="grid_5">20dp</dimen>
+    <dimen name="grid_6">24dp</dimen>
+    <dimen name="grid_8">32dp</dimen>
+    <dimen name="grid_10">40dp</dimen>
+    <dimen name="grid_12">48dp</dimen>
+
+    <dimen name="border_thin">0.5dp</dimen>
+    <dimen name="border_med">1dp</dimen>
+    <dimen name="border_thick">2dp</dimen>
+
+    <dimen name="text_caption">11sp</dimen>
+    <dimen name="text_body">14sp</dimen>
+    <dimen name="text_title">16sp</dimen>
+    <dimen name="text_h1">22sp</dimen>
+    <dimen name="text_h0">28sp</dimen>
+
+    <dimen name="elevation_none">0dp</dimen>
+</resources>

@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network for LLM calls -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Foreground service for agent loop & scheduled automation -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- REMOVED: RECEIVE_BOOT_COMPLETED — there is no BOOT_COMPLETED receiver
+         declared anywhere in the manifest, so this permission is unused. -->
+
+    <!-- Multimodal perception: camera + microphone -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- Optional hardware acceleration for LiteRT on-device inference.
+         Not required — LiteRT falls back to CPU if NNAPI/GPU are unavailable. -->
+    <uses-feature android:name="android.hardware.neuralnetworks" android:required="false" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="false" />
+
+    <!-- Media access for gallery memory & capcut skill (Android 13+) -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <!-- Legacy storage for older devices -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- REMOVED: MANAGE_EXTERNAL_STORAGE — GalleryScanner uses MediaStore
+         queries which don't require all-files-access on Android 10+. This
+         broad permission triggers Play Store policy review and is unnecessary. -->
+
+    <!-- Overlay: floating widget / push-to-talk bubble -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- REMOVED: READ_CLIPBOARD — this is NOT a standard Android permission.
+         Clipboard access on Android is governed by foreground app status, not
+         a manifest permission. Declaring it is a no-op (system ignores unknown
+         permissions) and indicates a misunderstanding. -->
+
+    <!-- Exact alarm for scheduled automation. Only SCHEDULE_EXACT_ALARM is
+         needed (and only if we used AlarmManager.setExact*). We use WorkManager
+         for all scheduling, so even this is technically optional — but keeping
+         it allows future use without a manifest change.
+         REMOVED: USE_EXACT_ALARM — this is a restricted permission on Play
+         Store (requires policy approval) and is NOT needed since we use
+         WorkManager, not AlarmManager.setExact*. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <application
+        android:name=".OmniApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.XOmniClaw"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="34">
+
+        <!-- Disable WorkManager's default initializer — we use Configuration.Provider
+             via HiltWorkerFactory in OmniApplication. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.XOmniClaw"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Accessibility service: real UI automation (taps, swipes, tree inspection) -->
+        <service
+            android:name=".service.OmniAccessibilityService"
+            android:exported="false"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Foreground service: keeps the agent loop alive across long tasks -->
+        <service
+            android:name=".service.AgentForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device agent execution loop for accessibility-driven automation." />
+        </service>
+
+        <!-- Overlay service: floating push-to-talk bubble -->
+        <service
+            android:name=".service.OverlayService"
+            android:exported="false" />
+
+        <!-- Halo overlay: Dynamic Island-style agent status pill -->
+        <service
+            android:name=".service.HaloOverlayService"
+            android:exported="false" />
+
+        <!-- Screen capture service: MediaProjection for vision fallback -->
+        <service
+            android:name=".service.ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+    </application>
+</manifest>

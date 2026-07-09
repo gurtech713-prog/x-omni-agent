@@ -1,0 +1,18 @@
+# Built files
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Keystore
+*.jks
+*.keystore
+keystore.properties
+
+# Logs
+*.log

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Three minimal claw marks - pure white on black -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M40,30 L46,30 L44,78 L38,78 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,28 L60,28 L58,80 L52,80 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M68,30 L74,30 L72,78 L66,78 Z" />
+</vector>
