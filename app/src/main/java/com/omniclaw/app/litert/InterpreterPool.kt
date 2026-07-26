@@ -69,12 +69,19 @@ class InterpreterPool @Inject constructor() {
         // wakes up. The other waits again, then re-checks for free slots
         // before deciding to wait further.
         while (true) {
+            // Carry the decision out of the lock via LOCAL vars — never a shared
+            // instance field: concurrent acquire() calls for DIFFERENT models would
+            // otherwise overwrite each other's chosen interpreter and lease the
+            // wrong one.
+            var leased: LeasedInterpreter? = null
+            var waitFor: PooledInterpreter? = null
             poolLock.withLock {
                 val pool = pools.computeIfAbsent(key) { mutableListOf() }
                 // Find a free interpreter (one whose mutex is unlocked).
                 for (pi in pool) {
                     if (pi.mutex.tryLock()) {
-                        return LeasedInterpreter(pi, key, this)
+                        leased = LeasedInterpreter(pi, key, this)
+                        return@withLock
                     }
                 }
                 // All in use — create a new one if below capacity.
@@ -82,30 +89,22 @@ class InterpreterPool @Inject constructor() {
                     val pi = factory()
                     pool.add(pi)
                     pi.mutex.lock()
-                    return LeasedInterpreter(pi, key, this)
+                    leased = LeasedInterpreter(pi, key, this)
+                    return@withLock
                 }
-                // Pool at capacity — pick the first interpreter to wait on.
-                // We do this OUTSIDE poolLock so other acquirers can progress.
-                val first = pool.first()
-                firstRef = first
+                // Pool at capacity — remember which interpreter to wait on, then
+                // release poolLock so other acquirers can progress.
+                waitFor = pool.first()
             }
-            // Wait on the first interpreter's mutex (released poolLock already).
-            // After we acquire it, return the lease. No re-lock race — we hold
-            // the interpreter's mutex until the lease is closed.
-            val chosen = firstRef
-            if (chosen != null) {
-                chosen.mutex.withLock {
-                    return LeasedInterpreter(chosen, key, this)
-                }
-            }
-            // firstRef was null (race with closeAll) — loop back and retry.
+            leased?.let { return it }
+            val chosen = waitFor ?: continue  // null only on a race with closeAll → retry
+            // Acquire exclusively with lock() (NOT withLock): the lease must KEEP
+            // the mutex held until release(). withLock's finally block would unlock
+            // on return, handing out an unheld interpreter → concurrent run() corruption.
+            chosen.mutex.lock()
+            return LeasedInterpreter(chosen, key, this)
         }
     }
-
-    // Scratch field used to pass the chosen interpreter from inside poolLock
-    // to outside poolLock without re-querying the pool. Safe because poolLock
-    // is held during the assignment and immediately released before the read.
-    @Volatile private var firstRef: PooledInterpreter? = null
 
     /** Release a leased interpreter back to the pool. */
     fun release(lease: LeasedInterpreter) {

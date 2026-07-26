@@ -1,12 +1,11 @@
 package com.omniclaw.app.logging
 
 import android.util.Log
-import com.google.firebase.crashlytics.FirebaseCrashlytics
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Structured agent-loop logger with Crashlytics integration.
+ * Structured agent-loop logger.
  *
  * Implements the original X-OmniClaw 2026-04-22 "execution policy tightened"
  * update: stronger cross-package ref rebinding and error-location logging.
@@ -17,17 +16,12 @@ import javax.inject.Singleton
  *   - The action that was attempted
  *   - The class + line where the error was caught
  *
- * Additionally, non-fatal errors are reported to Firebase Crashlytics for
- * production crash tracking and analytics.
- *
  * This makes debugging much easier when the agent fails inside a third-party
  * app (where the accessibility tree references resources from another package
  * and needs rebinding to the current package's namespace).
  */
 @Singleton
 class AgentLogger @Inject constructor() {
-
-    private val crashlytics: FirebaseCrashlytics by lazy { FirebaseCrashlytics.getInstance() }
 
     data class ErrorLocation(
         val sessionId: String,
@@ -43,15 +37,11 @@ class AgentLogger @Inject constructor() {
         val sanitized = redactSecrets(loc.message)
         Log.w(TAG, "[${loc.sessionId}#${loc.step}] ${loc.action} @ ${loc.className}.${loc.methodName}:${loc.lineNumber} — $sanitized")
         
-        // Report to Crashlytics for production tracking
-        crashlytics.log("Agent Error: [${loc.sessionId}#${loc.step}] ${loc.action} @ ${loc.className}.${loc.methodName}:${loc.lineNumber}")
-        crashlytics.recordException(RuntimeException(sanitized))
     }
 
     fun logWarning(sessionId: String, step: Int, msg: String) {
         val sanitized = redactSecrets(msg)
         Log.w(TAG, "[$sessionId#$step] WARNING: $sanitized")
-        crashlytics.log("Agent Warning: [$sessionId#$step] $sanitized")
     }
 
     fun logInfo(sessionId: String, step: Int, msg: String) {

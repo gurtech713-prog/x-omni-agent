@@ -4,6 +4,7 @@ import android.content.Context
 import com.omniclaw.app.service.AgentForegroundService
 import com.omniclaw.app.service.HaloOverlayService
 import com.omniclaw.app.service.ScreenCaptureService
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -15,7 +16,7 @@ import javax.inject.Singleton
  */
 @Singleton
 class ServiceGateway @Inject constructor(
-    private val ctx: Context,
+    @ApplicationContext private val ctx: Context,
 ) {
     /** Start the foreground service for agent operation. */
     fun startForegroundService() {

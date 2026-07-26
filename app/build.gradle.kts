@@ -6,8 +6,6 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
-    id("com.google.gms.google-services")
-    id("com.google.firebase.crashlytics")
 }
 
 android {
@@ -163,13 +161,6 @@ dependencies {
     // Implementation-only (we wrap the REST API directly via OkHttp), so we
     // don't pull in the full google-genai client to keep the APK small.
     // The GeminiClient class implements the wire protocol itself.
-
-    // ---- Firebase Crashlytics ----
-    // Production crash reporting. Automatically captures uncaught exceptions,
-    // ANRs, and can be extended with custom non-fatal error logging.
-    implementation(platform("com.google.firebase:firebase-bom:33.16.0"))
-    implementation("com.google.firebase:firebase-crashlytics")
-    implementation("com.google.firebase:firebase-analytics")
 
     // ---- Test dependencies ----
     testImplementation("junit:junit:4.13.2")

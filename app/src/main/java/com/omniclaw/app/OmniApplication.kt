@@ -8,8 +8,6 @@ import android.os.StrictMode
 import android.util.Log
 import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
-import com.google.firebase.analytics.FirebaseAnalytics
-import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.omniclaw.app.BuildConfig
 import com.omniclaw.app.data.local.LocalLlmClient
 import com.omniclaw.app.data.llm.LlmClient
@@ -23,8 +21,6 @@ class OmniApplication : Application(), Configuration.Provider {
     @Inject lateinit var workerFactory: HiltWorkerFactory
     @Inject lateinit var localLlmClient: LocalLlmClient
     @Inject lateinit var ttsManager: TextToSpeechManager
-    private lateinit var firebaseAnalytics: FirebaseAnalytics
-    private lateinit var crashlytics: FirebaseCrashlytics
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
@@ -32,19 +28,6 @@ class OmniApplication : Application(), Configuration.Provider {
             .build()
 
     override fun onCreate() {
-        // Initialize Firebase services FIRST — before any subsystem that might crash.
-        // FirebaseCrashlytics must be initialized before the custom uncaught exception
-        // handler is installed so it can properly capture crashes.
-        try {
-            crashlytics = FirebaseCrashlytics.getInstance()
-            firebaseAnalytics = FirebaseAnalytics.getInstance(this)
-            // Set user properties for analytics segmentation.
-            crashlytics.setUserId(android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID))
-            Log.i(TAG, "Firebase Crashlytics & Analytics initialized")
-        } catch (e: Exception) {
-            Log.w(TAG, "Firebase initialization failed (likely missing google-services.json): ${e.message}")
-        }
-
         // Install a process-wide uncaught-exception handler BEFORE any subsystem
         // initializes — if Hilt graph construction or DB init throws, we still
         // capture the trace. The handler logs the crash and then delegates to
@@ -114,33 +97,6 @@ class OmniApplication : Application(), Configuration.Provider {
         )
     }
 
-    /**
-     * Record a non-fatal exception to Firebase Crashlytics.
-     * Use this for expected error conditions that don't crash the app but should
-     * be tracked (e.g., LLM API failures, accessibility timeouts).
-     */
-    fun recordNonFatal(throwable: Throwable) {
-        try {
-            crashlytics.recordException(throwable)
-        } catch (_: Exception) {
-            // Firebase may not be initialized; silently ignore.
-        }
-    }
-
-    /**
-     * Log an event to Firebase Analytics.
-     * Parameters are optional — only include what's relevant.
-     */
-    fun logEvent(eventName: String, params: Map<String, String> = emptyMap()) {
-        try {
-            val bundle = android.os.Bundle()
-            params.forEach { (key, value) -> bundle.putString(key, value) }
-            firebaseAnalytics.logEvent(eventName, bundle)
-        } catch (_: Exception) {
-            // Firebase may not be initialized; silently ignore.
-        }
-    }
-
     companion object {
         const val CHANNEL_AGENT = "agent.fg"
         const val CHANNEL_OVERLAY = "overlay.bubble"
@@ -149,8 +105,8 @@ class OmniApplication : Application(), Configuration.Provider {
         /**
          * Process-wide uncaught-exception handler. Logs the crash to Logcat
          * with the offending thread + stack, then delegates to the previous
-         * handler. In release builds, this is the only crash signal we get
-         * (no Crashlytics); the user sees the standard "App keeps stopping"
+         * handler. In release builds, this is the only crash signal we get;
+         * the user sees the standard "App keeps stopping"
          * dialog. In debug, StrictMode + Logcat together give full visibility.
          */
         private fun installCrashHandler() {

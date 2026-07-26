@@ -71,7 +71,7 @@ class WindowTracker @Inject constructor() {
 
         // Heuristic detection of special window states.
         val isKeyboard = type == AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
-            pkg in KEYBOARD_PACKAGES
+            pkg != null && pkg in KEYBOARD_PACKAGES
         val isShade = pkg == SYSTEM_UI_PACKAGE && (
             className?.contains("StatusBar", ignoreCase = true) == true ||
             className?.contains("NotificationShade", ignoreCase = true) == true ||

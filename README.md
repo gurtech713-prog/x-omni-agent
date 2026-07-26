@@ -27,7 +27,6 @@ XOmniClaw implements a four-layer closed-loop agent system:
 - **Database**: Room with WAL mode
 - **Networking**: OkHttp 4.x
 - **ML**: LiteRT (on-device inference)
-- **Crash Reporting**: Firebase Crashlytics
 
 ## Development Setup
 

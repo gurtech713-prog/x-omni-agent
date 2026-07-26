@@ -80,7 +80,9 @@ class InferenceScheduler @Inject constructor(
         val start = System.currentTimeMillis()
         try {
             val result = runWithOomRecovery(modelPath, useGpu, useNnapi) { interp ->
-                val output = tensorCache.outputFloat(modelPath, outputSize)
+                // Per-call output buffer: tensorCache returns a SHARED array that
+                // races when the InterpreterPool runs concurrent same-model inferences.
+                val output = FloatArray(outputSize)
                 interp.run(input, output)
                 output
             }
@@ -106,7 +108,9 @@ class InferenceScheduler @Inject constructor(
         val start = System.currentTimeMillis()
         try {
             val result = runWithOomRecovery(modelPath, useGpu, useNnapi) { interp ->
-                val output = tensorCache.outputFloat(modelPath, outputSize)
+                // Per-call output buffer: tensorCache returns a SHARED array that
+                // races when the InterpreterPool runs concurrent same-model inferences.
+                val output = FloatArray(outputSize)
                 interp.run(input, output)
                 output
             }

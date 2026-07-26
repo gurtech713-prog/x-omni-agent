@@ -79,7 +79,11 @@ private const val TAG = "OmniNav"
 fun OmniApp() {
     val nav = rememberNavController()
     val stack by nav.currentBackStackEntryAsState()
-    val current = stack?.destination?.route ?: Routes.CHAT_ROUTE
+    // destination.route returns the full pattern (e.g. "chat?sessionId={sessionId}"),
+    // so strip the query string before comparing against the bare tab routes —
+    // otherwise the Chat tab is never shown selected and BackHandler can never
+    // exit from the start destination.
+    val current = (stack?.destination?.route ?: Routes.CHAT_ROUTE).substringBefore('?')
     val isImeVisible = WindowInsets.ime.asPaddingValues().calculateBottomPadding() > 0.dp
 
     // BackHandler: pressing back from a non-Chat tab returns to Chat (the

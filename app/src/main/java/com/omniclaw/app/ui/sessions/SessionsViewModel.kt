@@ -36,12 +36,15 @@ class SessionsViewModel @Inject constructor(
         viewModelScope.launch {
             _isLoading.value = true
             try {
+                // StateFlow collection never completes, so clear the loading flag on
+                // each emission (the first marks initial load done) instead of in an
+                // unreachable `finally` block.
                 sessionRepo.sessions.collectLatest { sessionList ->
                     _sessions.value = sessionList
+                    _isLoading.value = false
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
-            } finally {
                 _isLoading.value = false
             }
         }

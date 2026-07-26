@@ -27,7 +27,18 @@ class DatabaseBackupManager @Inject constructor(
         try {
             val dbFile = File(ctx.getDatabasePath("omniclaw.db").path)
             if (!dbFile.exists()) return@withContext null
-            
+
+            // The DB runs in WAL mode, so recent writes may still live in the
+            // sidecar `omniclaw.db-wal` file. Checkpoint (TRUNCATE) flushes the WAL
+            // into the main file so a single-file copy is a complete, consistent
+            // snapshot. Best-effort: if the checkpoint fails we still copy the main
+            // file rather than aborting the backup.
+            runCatching {
+                SQLiteDatabase.openDatabase(dbFile.path, null, SQLiteDatabase.OPEN_READWRITE).use {
+                    it.execSQL("PRAGMA wal_checkpoint(TRUNCATE);")
+                }
+            }
+
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val backupDir = File(ctx.getExternalFilesDir(null), "backups").apply { mkdirs() }
             val backupFile = File(backupDir, "omniclaw_$timestamp.db")
