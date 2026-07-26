@@ -3,6 +3,7 @@ package com.omniclaw.app.agent
 import android.content.Context
 import android.util.Log
 import com.omniclaw.app.agent.tools.DeviceAction
+import com.omniclaw.app.agent.tools.DeviceToolSchema
 import com.omniclaw.app.agent.tools.DeviceScheduler
 import com.omniclaw.app.agent.learning.EpisodeRecorder
 import com.omniclaw.app.agent.learning.LearningEngine
@@ -86,6 +87,7 @@ class AgentLoop @Inject constructor(
     private val episodeRecorder: EpisodeRecorder,
     private val memoryRepo: MemoryRepository,
     private val skillRepo: SkillRepository,
+    private val planner: Planner,
 ) {
 
     /** Number of currently-running sessions; used to start/stop the foreground service. */
@@ -311,6 +313,10 @@ class AgentLoop @Inject constructor(
         }
 
         val cfg = settings.modelConfig.first()
+        // Hermes improvements: de-hardcoded loop constants + feature flags.
+        val tuning = settings.agentTuning.first()
+        // Plan-then-act state (created on step 1, replanned when stuck).
+        var plan: Planner.Plan? = null
 
         // Guard: validate config before starting the loop. Give the user a clear
         // error instead of a cryptic HTTP 401 or timeout.
@@ -353,7 +359,9 @@ class AgentLoop @Inject constructor(
         }
 
         val recentActions = ArrayDeque<Pair<String, String>>()  // (actionSig, fingerprint)
-        val maxSteps = 24
+        val maxSteps = tuning.maxSteps
+        // De-hardcoded: shadow the class-level default with the tunable value.
+        val stepTimeoutMs = tuning.stepTimeoutMs
         // Token budget guard — prevents runaway sessions from burning unlimited
         // tokens. When cumulative usage exceeds this, force DONE with a clear
         // message. Default 30k tokens (~$0.30 on GPT-4o-mini, ~$0.90 on Opus).
@@ -389,9 +397,13 @@ class AgentLoop @Inject constructor(
                     }
                 }
             }
+            // ---- Hermes-style planning: create a plan on the first step ----
+            if (step == 1 && tuning.enablePlanner && plan == null) {
+                plan = planner.makePlan(cfg, prompt, observation)
+            }
             val systemMsg = LlmClient.Message(
                 role = "system",
-                content = buildSystemPrompt(observation, recentActions, usedVision, sessionId, step)
+                content = buildSystemPrompt(observation, recentActions, usedVision, sessionId, step, plan)
             )
 
             val thought: String
@@ -403,11 +415,53 @@ class AgentLoop @Inject constructor(
                 // streaming complete() if streaming isn't supported (e.g. LITERT
                 // or if the endpoint doesn't support SSE). ----
                 var streamedThought: String? = null
+                var structuredUsage: LlmUsage? = null
+                // ---- PRIMARY: Hermes-style structured tool-calling (fail-closed) ----
+                // Request the device_action tool. If the model returns a structured
+                // tool_call, synthesize a canonical THOUGHT/ACTION text so the existing
+                // downstream parsing/dispatch/verify runs unchanged - but the action now
+                // comes from a VALIDATED JSON object (no regex, no silent tap(0,0)), and
+                // usage uses the provider's REAL token counts.
+                if (tuning.useStructuredTools) {
+                    runCatching {
+                        withTimeout(stepTimeoutMs) {
+                            llm.complete(
+                                provider = cfg.provider,
+                                baseUrl = cfg.baseUrl,
+                                apiKey = cfg.apiKey,
+                                model = cfg.model,
+                                messages = listOf(systemMsg) + history,
+                                temperature = cfg.temperature,
+                                maxTokens = cfg.maxTokens,
+                                tools = listOf(DeviceToolSchema.SPEC),
+                                toolChoice = "auto",
+                            )
+                        }
+                    }.getOrNull()?.let { res ->
+                        val tc = res.toolCalls.firstOrNull()
+                        if (tc != null) {
+                            val parsed = DeviceToolSchema.parse(tc.arguments)
+                            val canonical = DeviceToolSchema.toActionLine(parsed.action)
+                            streamedThought = buildString {
+                                append("THOUGHT: ")
+                                appendLine(parsed.thought.ifBlank { "Acting on the plan." })
+                                when {
+                                    parsed.done -> appendLine("ACTION: done")
+                                    canonical != null -> appendLine("ACTION: $canonical")
+                                    else -> appendLine("ACTION: invalid")
+                                }
+                            }.trimEnd()
+                            structuredUsage = res.usage
+                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!))
+                            _events.tryEmit(Event.ToolCall(sessionId, step, ToolCall(id = tc.id, name = tc.name, args = tc.arguments)))
+                        }
+                    }
+                }
                 // Per-step timeout — prevents a single slow LLM call (or a
                 // hung connection) from blocking the session for 10+ minutes.
                 // Cancellation propagates to the underlying OkHttp call via
                 // suspendCancellableCoroutine (see LlmClient.stream).
-                runCatching {
+                if (streamedThought == null) runCatching {
                     withTimeout(stepTimeoutMs) {
                         val thoughtBuilder = StringBuilder()
                         var lastEmitMs = 0L
@@ -446,7 +500,7 @@ class AgentLoop @Inject constructor(
                     // hardcoded to 0, breaking the maxSessionTokens budget guard.
                     val promptChars = (listOf(systemMsg) + history).sumOf { it.content.length }
                     val promptEstimate = (promptChars / 2).toLong()
-                    usage = LlmUsage(promptEstimate, completionEstimate, promptEstimate + completionEstimate)
+                    usage = structuredUsage ?: LlmUsage(promptEstimate, completionEstimate, promptEstimate + completionEstimate)
                 } else {
                     // Streaming produced nothing (or failed) — fall back to non-streaming with fast retry.
                     val result = withTimeout(stepTimeoutMs) {
@@ -635,8 +689,13 @@ class AgentLoop @Inject constructor(
                 Pair(true, skillResult)
             } else {
                 val deviceAction = parseDeviceAction(action)
-                val dispatchOk = runCatching { scheduler.dispatch(deviceAction) }.getOrDefault(false)
-                Pair(dispatchOk, if (dispatchOk) "ok" else "error")
+                if (deviceAction == null) {
+                    // FAIL-CLOSED: a malformed tap/swipe must NOT fire a default gesture.
+                    Pair(false, "error: could not parse valid coordinates from: $action")
+                } else {
+                    val dispatchOk = runCatching { scheduler.dispatch(deviceAction) }.getOrDefault(false)
+                    Pair(dispatchOk, if (dispatchOk) "ok" else "error")
+                }
             }
             val call = ToolCall(
                 id = UUID.randomUUID().toString(),
@@ -663,7 +722,10 @@ class AgentLoop @Inject constructor(
 
             // Verify — pass the already-captured observation as preSnapshot so
             // SuccessMonitor doesn't build the same tree a second time.
-            val verifyOk = verifier.verifyLast(sessionId, call, preSnapshot = observation)
+            val verifyResult = verifier.verifyLastDetailed(sessionId, call, preSnapshot = observation)
+            val verifyOk = verifyResult.ok
+            // Hermes-style plan tracking: a verified-successful action advances the plan.
+            if (verifyOk) plan?.nextStep?.let { it.done = true }
             // Record this step in the episode for self-learning reflection.
             episodeRecorder.recordStep(sessionId, step, observation, action, call, verifyOk)
             // Record a direct (fingerprint, action, outcome) lesson immediately —
@@ -677,16 +739,38 @@ class AgentLoop @Inject constructor(
             val fFp = currentFingerprint; val fAs = sig
             scope.launch { runCatching { learning.recordDirectLesson(sessionId, fFp, fAs, outcome, observation) } }
             if (!verifyOk) {
-                // Tell the LLM and let it retry on next iteration
+                // GROUNDED self-correction: feed the model WHY the action failed
+                // (diagnostic reason + whether the screen changed) instead of a
+                // generic "try a different approach" string.
+                val screenNote = if (verifyResult.postFingerprint == currentFingerprint) "The screen did NOT change." else "The screen changed."
                 sessions.appendMessage(
                     sessionId,
                     ChatMessage(
                         id = UUID.randomUUID().toString(),
                         role = ChatMessage.Role.SYSTEM,
-                        content = "Previous action failed. Try a different approach.",
+                        content = "Previous action FAILED (reason: ${verifyResult.reason}). Action was: ${call.name}. $screenNote Diagnose the cause and try a different, specific action.",
                         timestamp = System.currentTimeMillis(),
                     )
                 )
+                // Hermes-style stuck detection. SuccessMonitor.isStuck() was
+                // previously DEAD CODE - now it triggers a replan (when a plan is
+                // active) so the agent changes strategy instead of burning steps.
+                if (verifier.isStuck(sessionId, tuning.stuckThreshold)) {
+                    val stuckReason = "Stuck: ${tuning.stuckThreshold} consecutive failures (last: ${verifyResult.reason})."
+                    if (tuning.enablePlanner && plan != null) {
+                        plan = planner.replan(cfg, prompt, observation, plan!!, stuckReason)
+                        sessions.appendMessage(
+                            sessionId,
+                            ChatMessage(
+                                id = UUID.randomUUID().toString(),
+                                role = ChatMessage.Role.SYSTEM,
+                                content = "Agent replanned. $stuckReason",
+                                timestamp = System.currentTimeMillis(),
+                            )
+                        )
+                    }
+                    verifier.reset(sessionId)
+                }
             }
 
             // ---- Inter-step delay + screen stabilization ----
@@ -769,23 +853,27 @@ class AgentLoop @Inject constructor(
     private fun parseThoughts(text: String): List<String> =
         Regex("(?m)^THOUGHT:\\s*(.+)$").findAll(text).map { it.groupValues[1].trim() }.toList()
 
-    private fun parseDeviceAction(action: String): DeviceAction {
+    private fun parseDeviceAction(action: String): DeviceAction? {
         val s = action.trim()
         return when {
             s.startsWith("tap", ignoreCase = true) -> {
                 val m = Regex("(?i)tap\\s*\\(\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\)").find(s)
-                val x = m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt() ?: 0
-                val y = m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt() ?: 0
-                DeviceAction.Tap(x, y)
+                val x = m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt()
+                val y = m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt()
+                // FAIL-CLOSED: a coordinate parse miss must NOT default to tap(0,0).
+                if (x == null || y == null) null else DeviceAction.Tap(x, y)
             }
             s.startsWith("swipe", ignoreCase = true) -> {
                 val m = Regex("(?i)swipe\\s*\\(\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\)").find(s)
-                DeviceAction.Swipe(
-                    m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt() ?: 0,
-                    m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt() ?: 0,
-                    m?.groupValues?.getOrNull(3)?.toFloatOrNull()?.roundToInt() ?: 0,
-                    m?.groupValues?.getOrNull(4)?.toFloatOrNull()?.roundToInt() ?: 0,
-                )
+                run {
+                    val x1 = m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt()
+                    val y1 = m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt()
+                    val x2 = m?.groupValues?.getOrNull(3)?.toFloatOrNull()?.roundToInt()
+                    val y2 = m?.groupValues?.getOrNull(4)?.toFloatOrNull()?.roundToInt()
+                    // FAIL-CLOSED: missing coordinates -> null (never a bogus swipe).
+                    if (x1 == null || y1 == null || x2 == null || y2 == null) null
+                    else DeviceAction.Swipe(x1, y1, x2, y2)
+                }
             }
             s.startsWith("type", ignoreCase = true) -> {
                 // Use lazy/non-greedy match to handle quoted text correctly.
@@ -996,8 +1084,10 @@ class AgentLoop @Inject constructor(
         usedVision: Boolean = false,
         sessionId: String,
         step: Int,
+        plan: Planner.Plan? = null,
     ): String = buildString {
         appendLine("You are X-OmniClaw, an edge-native multimodal Android agent with self-learning.")
+        planner.renderForPrompt(plan)?.let { appendLine(); appendLine(it) }
         appendLine("You can answer questions conversationally AND automate the device when asked.")
         appendLine()
         appendLine("Respond using this strict format:")

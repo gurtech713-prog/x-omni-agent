@@ -3,6 +3,7 @@ package com.omniclaw.app.data.llm
 import android.util.Log
 import com.omniclaw.app.data.local.LiteRtException
 import com.omniclaw.app.data.local.LocalLlmClient
+import com.omniclaw.app.data.model.ToolSpec
 import com.omniclaw.app.data.prefs.LlmProvider
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -56,13 +57,15 @@ class UnifiedLlmClient @Inject constructor(
         messages: List<LlmClient.Message>,
         temperature: Float = 0.2f,
         maxTokens: Int = 2048,
+        tools: List<ToolSpec>? = null,
+        toolChoice: String? = null,
     ): LlmClient.CompletionResult = when (provider) {
         LlmProvider.OPENAI_COMPAT -> openAi.complete(
-            baseUrl, apiKey, model, messages, temperature, maxTokens,
+            baseUrl, apiKey, model, messages, temperature, maxTokens, tools, toolChoice,
         )
         LlmProvider.GEMINI -> {
             val url = baseUrl.ifBlank { gemini.defaultBaseUrl }
-            gemini.complete(url, apiKey, model, messages, temperature, maxTokens)
+            gemini.complete(url, apiKey, model, messages, temperature, maxTokens, tools, toolChoice)
         }
         LlmProvider.LITERT -> {
             // Model format: "local-<family>:<path>"

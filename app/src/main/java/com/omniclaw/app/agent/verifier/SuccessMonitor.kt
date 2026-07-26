@@ -55,11 +55,34 @@ class SuccessMonitor @Inject constructor(
      *   1. scheduler.snapshot() at step start for the LLM observation
      *   2. scheduler.snapshotBlocking() here for verification
      */
-    fun verifyLast(sessionId: String, call: ToolCall, preSnapshot: String? = null): Boolean = synchronized(lock) {
+    /**
+     * Typed verification outcome. [reason] is a stable machine-readable code the
+     * agent feeds back to the LLM as a GROUNDED error observation (Hermes-style
+     * self-correction) instead of a generic "previous action failed" string.
+     * [postFingerprint] is the screen fingerprint AFTER the action, so the agent
+     * can reason about whether / how the screen changed.
+     */
+    data class VerifyResult(
+        val ok: Boolean,
+        val reason: String,
+        val postFingerprint: String,
+    )
+
+    /** Backwards-compatible boolean facade over [verifyLastDetailed]. */
+    fun verifyLast(sessionId: String, call: ToolCall, preSnapshot: String? = null): Boolean =
+        verifyLastDetailed(sessionId, call, preSnapshot).ok
+
+    /**
+     * Verify the last action and return a typed [VerifyResult] with a diagnostic
+     * reason code. Reason codes: dispatch_failed, app_error_or_anr,
+     * no_screen_drift, misclick_or_dead_service, ok.
+     */
+    fun verifyLastDetailed(sessionId: String, call: ToolCall, preSnapshot: String? = null): VerifyResult = synchronized(lock) {
         val state = sessionStates.getOrPut(sessionId) { SessionState() }
+        val preFp = preSnapshot?.let { episodeRecorder.fingerprint(it) }.orEmpty()
         if (!call.ok) {
             state.consecutiveFailures++
-            return@synchronized false
+            return@synchronized VerifyResult(false, "dispatch_failed", preFp)
         }
 
         val snap = preSnapshot ?: scheduler.snapshotBlocking()
@@ -69,7 +92,7 @@ class SuccessMonitor @Inject constructor(
             snap.contains("has stopped", ignoreCase = true)
         ) {
             state.consecutiveFailures++
-            return@synchronized false
+            return@synchronized VerifyResult(false, "app_error_or_anr", episodeRecorder.fingerprint(snap))
         }
 
         // Drift detection — use the shared fingerprint (SHA-256 of normalized
@@ -83,7 +106,7 @@ class SuccessMonitor @Inject constructor(
         if (state.recentSnapshots.size > 6) state.recentSnapshots.removeFirst()
         if (identicalCount >= 2) {
             state.consecutiveFailures++
-            return@synchronized false
+            return@synchronized VerifyResult(false, "no_screen_drift", fp)
         }
 
         // Mis-click guard. Also catch the "service not connected" sentinel
@@ -96,15 +119,15 @@ class SuccessMonitor @Inject constructor(
             (snap.isBlank() || snap.contains("not connected", ignoreCase = true))
         ) {
             state.consecutiveFailures++
-            return@synchronized false
+            return@synchronized VerifyResult(false, "misclick_or_dead_service", fp)
         }
 
         state.consecutiveFailures = 0
-        return@synchronized true
+        return@synchronized VerifyResult(true, "ok", fp)
     }
 
-    fun isStuck(sessionId: String): Boolean = synchronized(lock) {
-        sessionStates[sessionId]?.consecutiveFailures?.let { it >= 5 } ?: false
+    fun isStuck(sessionId: String, threshold: Int = 5): Boolean = synchronized(lock) {
+        sessionStates[sessionId]?.consecutiveFailures?.let { it >= threshold } ?: false
     }
 
     fun reset(sessionId: String) {

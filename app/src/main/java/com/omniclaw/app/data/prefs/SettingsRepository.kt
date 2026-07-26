@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -137,8 +138,26 @@ data class PermissionsState(
     val notifications: Boolean = false,
 )
 
+/**
+ * Tunable agent-loop constants (Hermes-improvement: de-hardcoded). Previously
+ * these were magic numbers baked into AgentLoop (maxSteps = 24, 45s step
+ * timeout, 6-min session timeout, memory cap 50). They now live here so they can
+ * be changed without a rebuild. [useStructuredTools] toggles the Hermes-style
+ * function-calling path; [enablePlanner] toggles plan-then-act.
+ */
+data class AgentTuning(
+    val maxSteps: Int = 24,
+    val stepTimeoutMs: Long = 45_000L,
+    val sessionTimeoutMs: Long = 360_000L,
+    val memoryCap: Int = 50,
+    val stuckThreshold: Int = 5,
+    val useStructuredTools: Boolean = true,
+    val enablePlanner: Boolean = true,
+)
+
 interface SettingsRepository {
     val modelConfig: Flow<ModelConfig>
+    val agentTuning: Flow<AgentTuning>
     val channelConfig: Flow<ChannelConfig>
     val uiPrefs: Flow<UiPrefs>
     val permissions: Flow<PermissionsState>
@@ -148,6 +167,7 @@ interface SettingsRepository {
     val secureStorageState: Flow<SecureStorage.StorageState>
 
     suspend fun setModelConfig(cfg: ModelConfig)
+    suspend fun setAgentTuning(t: AgentTuning)
     
     fun getApiKeyForProvider(provider: LlmProvider, baseUrl: String): String
     suspend fun setChannelConfig(cfg: ChannelConfig)
@@ -175,6 +195,14 @@ class SettingsRepositoryImpl @Inject constructor(
         val model = stringPreferencesKey("llm.model")
         val temp = stringPreferencesKey("llm.temperature")
         val maxTokens = intPreferencesKey("llm.max_tokens")
+        // Agent tuning (Hermes improvements — de-hardcoded loop constants)
+        val agentMaxSteps = intPreferencesKey("agent.max_steps")
+        val agentStepTimeoutMs = longPreferencesKey("agent.step_timeout_ms")
+        val agentSessionTimeoutMs = longPreferencesKey("agent.session_timeout_ms")
+        val agentMemoryCap = intPreferencesKey("agent.memory_cap")
+        val agentStuckThreshold = intPreferencesKey("agent.stuck_threshold")
+        val agentUseStructuredTools = booleanPreferencesKey("agent.use_structured_tools")
+        val agentEnablePlanner = booleanPreferencesKey("agent.enable_planner")
 
         // STT (speech-to-text)
         val sttBaseUrl = stringPreferencesKey("stt.base_url")
@@ -223,6 +251,18 @@ class SettingsRepositoryImpl @Inject constructor(
 
     // Secrets (API keys, webhooks) are read from SecureStorage (encrypted at
     // rest via Tink + Android Keystore). Non-secret fields come from DataStore.
+    override val agentTuning: Flow<AgentTuning> = ctx.dataStore.data.map { p ->
+        AgentTuning(
+            maxSteps = p[Keys.agentMaxSteps] ?: 24,
+            stepTimeoutMs = p[Keys.agentStepTimeoutMs] ?: 45_000L,
+            sessionTimeoutMs = p[Keys.agentSessionTimeoutMs] ?: 360_000L,
+            memoryCap = p[Keys.agentMemoryCap] ?: 50,
+            stuckThreshold = p[Keys.agentStuckThreshold] ?: 5,
+            useStructuredTools = p[Keys.agentUseStructuredTools] ?: true,
+            enablePlanner = p[Keys.agentEnablePlanner] ?: true,
+        )
+    }.flowOn(Dispatchers.IO)
+
     override val modelConfig: Flow<ModelConfig> = ctx.dataStore.data.map { p ->
         val provider = LlmProvider.fromString(p[Keys.provider])
         val storedBaseUrl = p[Keys.baseUrl] ?: "https://open.bigmodel.cn/api/paas/v4"
@@ -362,6 +402,18 @@ class SettingsRepositoryImpl @Inject constructor(
             p[Keys.permMic] = state.mic
             p[Keys.permMedia] = state.media
             p[Keys.permNotifications] = state.notifications
+        }
+    }
+
+    override suspend fun setAgentTuning(t: AgentTuning) {
+        ctx.dataStore.edit { p ->
+            p[Keys.agentMaxSteps] = t.maxSteps
+            p[Keys.agentStepTimeoutMs] = t.stepTimeoutMs
+            p[Keys.agentSessionTimeoutMs] = t.sessionTimeoutMs
+            p[Keys.agentMemoryCap] = t.memoryCap
+            p[Keys.agentStuckThreshold] = t.stuckThreshold
+            p[Keys.agentUseStructuredTools] = t.useStructuredTools
+            p[Keys.agentEnablePlanner] = t.enablePlanner
         }
     }
 

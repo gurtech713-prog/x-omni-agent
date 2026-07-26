@@ -41,6 +41,31 @@ data class ToolCall(
     val durationMs: Long = 0L,
 )
 
+/**
+ * A structured tool call REQUESTED by the LLM (Hermes-style function-calling).
+ * Distinct from [ToolCall], which records an EXECUTED call with its result.
+ * [arguments] is the raw JSON object string the model emitted for the tool's
+ * parameters schema — parsed and validated by the agent before dispatch.
+ */
+@Serializable
+data class LlmToolCall(
+    val id: String,
+    val name: String,
+    val arguments: String,
+)
+
+/**
+ * A tool declaration handed to the LLM so it can emit structured tool calls.
+ * [parametersSchema] is a JSON-Schema object string; each provider client wraps
+ * it in its own envelope (OpenAI tools[].function, Gemini functionDeclarations).
+ */
+@Serializable
+data class ToolSpec(
+    val name: String,
+    val description: String,
+    val parametersSchema: String,
+)
+
 @Serializable
 data class Skill(
     val id: String,

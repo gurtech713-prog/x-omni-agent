@@ -2,7 +2,9 @@ package com.omniclaw.app.data.llm
 
 import android.util.Log
 import com.omniclaw.app.core.retry
+import com.omniclaw.app.data.model.LlmToolCall
 import com.omniclaw.app.data.model.LlmUsage
+import com.omniclaw.app.data.model.ToolSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -70,6 +72,8 @@ class GeminiClient(
         messages: List<LlmClient.Message>,
         temperature: Float = 0.2f,
         maxTokens: Int = 2048,
+        tools: List<ToolSpec>? = null,
+        toolChoice: String? = null,
     ): LlmClient.CompletionResult = withContext(Dispatchers.IO) {
         val (systemInstruction, contents) = convertMessages(messages)
         val payload = buildJsonObject {
@@ -100,6 +104,28 @@ class GeminiClient(
                         put("category", c)
                         put("threshold", "BLOCK_ONLY_HIGH")
                     })
+                }
+            }
+            // Hermes-style function-calling: declare the tools so the model can
+            // emit structured functionCall parts instead of free-text actions.
+            if (tools != null) {
+                putJsonArray("tools") {
+                    add(buildJsonObject {
+                        putJsonArray("functionDeclarations") {
+                            tools.forEach { t ->
+                                add(buildJsonObject {
+                                    put("name", t.name)
+                                    put("description", t.description)
+                                    put("parameters", json.parseToJsonElement(t.parametersSchema).jsonObject)
+                                })
+                            }
+                        }
+                    })
+                }
+                putJsonObject("toolConfig") {
+                    putJsonObject("functionCallingConfig") {
+                        put("mode", if (toolChoice == "auto") "AUTO" else "ANY")
+                    }
                 }
             }
         }
@@ -179,7 +205,16 @@ class GeminiClient(
         if (Log.isLoggable(TAG, Log.DEBUG)) {
             Log.d(TAG, "complete done: ${text.take(80)} | finish=$finishReason | tokens=${usage.totalTokens}")
         }
-        LlmClient.CompletionResult(text, usage, finishReason)
+        // Structured tool calls (Gemini functionCall parts). Empty for plain text.
+        val toolCalls = candidate
+            ?.get("content")?.jsonObject?.get("parts")?.jsonArray
+            ?.mapNotNull { partObj ->
+                val fc = partObj.jsonObject["functionCall"]?.jsonObject ?: return@mapNotNull null
+                val name = fc["name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                val args = fc["args"]?.jsonObject?.toString() ?: "{}"
+                LlmToolCall(id = java.util.UUID.randomUUID().toString(), name = name, arguments = args)
+            }.orEmpty()
+        LlmClient.CompletionResult(text, usage, finishReason, toolCalls)
     }
 
     /**

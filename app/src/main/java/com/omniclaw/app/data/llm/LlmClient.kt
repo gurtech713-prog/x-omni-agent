@@ -1,7 +1,9 @@
 package com.omniclaw.app.data.llm
 
 import android.util.Log
+import com.omniclaw.app.data.model.LlmToolCall
 import com.omniclaw.app.data.model.LlmUsage
+import com.omniclaw.app.data.model.ToolSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -21,6 +23,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -58,16 +61,22 @@ class LlmClient @Inject constructor(
 ) {
 
     @Serializable
-    data class Message(val role: String, val content: String)
+    data class Message(
+        val role: String,
+        val content: String,
+        val toolCalls: List<LlmToolCall>? = null,
+        val toolCallId: String? = null,
+    )
 
     @Serializable
     data class CompletionResult(
         val text: String,
         val usage: LlmUsage,
         val finishReason: String,
+        val toolCalls: List<LlmToolCall> = emptyList(),
     )
 
-    /** Non-streaming completion. Cancellable. */
+    /** Non-streaming completion. Cancellable. Supports Hermes-style structured tool-calling. */
     suspend fun complete(
         baseUrl: String,
         apiKey: String,
@@ -75,6 +84,8 @@ class LlmClient @Inject constructor(
         messages: List<Message>,
         temperature: Float = 0.2f,
         maxTokens: Int = 2048,
+        tools: List<ToolSpec>? = null,
+        toolChoice: String? = null,
     ): CompletionResult = withContext(Dispatchers.IO) {
         val payload = buildJsonObject {
             put("model", model)
@@ -82,12 +93,22 @@ class LlmClient @Inject constructor(
             put("max_tokens", maxTokens)
             put("stream", false)
             putJsonArray("messages") {
-                messages.forEach { m ->
-                    add(buildJsonObject {
-                        put("role", m.role)
-                        put("content", m.content)
-                    })
+                messages.forEach { m -> add(messageToJson(m)) }
+            }
+            if (tools != null) {
+                putJsonArray("tools") {
+                    tools.forEach { t ->
+                        add(buildJsonObject {
+                            put("type", "function")
+                            putJsonObject("function") {
+                                put("name", t.name)
+                                put("description", t.description)
+                                put("parameters", json.parseToJsonElement(t.parametersSchema).jsonObject)
+                            }
+                        })
+                    }
                 }
+                put("tool_choice", toolChoice ?: "auto")
             }
         }
         val resp = executeCancellable(buildRequest(baseUrl, apiKey, payload.toString()))
@@ -218,7 +239,19 @@ class LlmClient @Inject constructor(
             completionTokens = usageObj?.get("completion_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
             totalTokens = usageObj?.get("total_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
         )
-        return CompletionResult(text, usage, finish)
+        // Structured tool calls (Hermes-style function-calling). Empty for plain
+        // text completions or providers that ignore the tools schema.
+        val toolCalls = msgObj?.get("tool_calls")?.jsonArray?.mapNotNull { el ->
+            val o = el.jsonObject
+            val fn = o["function"]?.jsonObject ?: return@mapNotNull null
+            val name = fn["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            LlmToolCall(
+                id = o["id"]?.jsonPrimitive?.content ?: java.util.UUID.randomUUID().toString(),
+                name = name,
+                arguments = fn["arguments"]?.jsonPrimitive?.content ?: "{}",
+            )
+        }.orEmpty()
+        return CompletionResult(text, usage, finish, toolCalls)
     }
 
     /**
@@ -254,6 +287,27 @@ class LlmClient @Inject constructor(
             builder.header("Authorization", "Bearer $cleanKey")
         }
         return builder.build()
+    }
+
+    /** Serialize a [Message] honoring the OpenAI tool protocol (tool_calls / tool role). */
+    private fun messageToJson(m: Message): JsonObject = buildJsonObject {
+        put("role", m.role)
+        put("content", m.content)
+        m.toolCallId?.let { put("tool_call_id", it) }
+        if (!m.toolCalls.isNullOrEmpty()) {
+            putJsonArray("tool_calls") {
+                m.toolCalls.forEach { tc ->
+                    add(buildJsonObject {
+                        put("id", tc.id)
+                        put("type", "function")
+                        putJsonObject("function") {
+                            put("name", tc.name)
+                            put("arguments", tc.arguments)
+                        }
+                    })
+                }
+            }
+        }
     }
 
     companion object {
