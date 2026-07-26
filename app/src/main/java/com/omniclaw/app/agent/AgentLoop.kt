@@ -30,6 +30,7 @@ import com.omniclaw.app.service.HaloOverlayService
 import com.omniclaw.app.service.ScreenCaptureService
 import com.omniclaw.app.vision.VlmClient
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -763,18 +764,18 @@ class AgentLoop @Inject constructor(
         val s = action.trim()
         return when {
             s.startsWith("tap", ignoreCase = true) -> {
-                val m = Regex("(?i)tap\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)").find(s)
-                val x = m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-                val y = m?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0
+                val m = Regex("(?i)tap\\s*\\(\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\)").find(s)
+                val x = m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt() ?: 0
+                val y = m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt() ?: 0
                 DeviceAction.Tap(x, y)
             }
             s.startsWith("swipe", ignoreCase = true) -> {
-                val m = Regex("(?i)swipe\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)").find(s)
+                val m = Regex("(?i)swipe\\s*\\(\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\)").find(s)
                 DeviceAction.Swipe(
-                    m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(3)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(4)?.toIntOrNull() ?: 0,
+                    m?.groupValues?.getOrNull(1)?.toFloatOrNull()?.roundToInt() ?: 0,
+                    m?.groupValues?.getOrNull(2)?.toFloatOrNull()?.roundToInt() ?: 0,
+                    m?.groupValues?.getOrNull(3)?.toFloatOrNull()?.roundToInt() ?: 0,
+                    m?.groupValues?.getOrNull(4)?.toFloatOrNull()?.roundToInt() ?: 0,
                 )
             }
             s.startsWith("type", ignoreCase = true) -> {

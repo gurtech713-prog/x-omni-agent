@@ -7,6 +7,7 @@ import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.session.SessionRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -27,13 +28,18 @@ class SessionsViewModel @Inject constructor(
     private val _savedBehaviors = MutableStateFlow<List<BehaviorRecorder.RecordedSkill>>(emptyList())
     val savedBehaviors: StateFlow<List<BehaviorRecorder.RecordedSkill>> = _savedBehaviors.asStateFlow()
 
+    // Tracks the single perpetual sessions collector so refresh() cancels the
+    // previous one instead of stacking a new never-completing collector each call.
+    private var sessionsJob: Job? = null
+
     init {
         loadSessions()
         refreshBehaviors()
     }
 
     fun loadSessions() {
-        viewModelScope.launch {
+        sessionsJob?.cancel()
+        sessionsJob = viewModelScope.launch {
             _isLoading.value = true
             try {
                 // StateFlow collection never completes, so clear the loading flag on

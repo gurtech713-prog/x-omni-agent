@@ -161,7 +161,12 @@ class ChatViewModel @Inject constructor(
         // fresh.
         val existingId = _activeId.value
         val existingSession = existingId?.let { sessions.getByIdSnapshot(it) }
-        val id = if (existingId == null || existingSession == null) {
+        // CHAT-2 FIX: a terminal session (DONE/FAILED/STOPPED) is archived - the
+        // next message starts a fresh session instead of reusing finished history.
+        val existingIsTerminal = existingSession?.status?.let {
+            it == SessionStatus.DONE || it == SessionStatus.FAILED || it == SessionStatus.STOPPED
+        } == true
+        val id = if (existingId == null || existingSession == null || existingIsTerminal) {
             Log.d(TAG, "Creating a new session for message: $text")
             newSession()
         } else {

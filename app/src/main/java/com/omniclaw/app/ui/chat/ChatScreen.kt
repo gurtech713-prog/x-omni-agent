@@ -113,7 +113,7 @@ fun ChatScreen(sessionId: String? = null) {
     // (the already-filtered StateFlow) and only adds +1 for the typing
     // indicator when the session is RUNNING and has at least one message
     // (matching the `else if` condition that renders TypingIndicator below).
-    LaunchedEffect(messages.size, session?.status) {
+    LaunchedEffect(messages.size, session?.status, messages.lastOrNull()?.content?.length) {
         val n = messages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING

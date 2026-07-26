@@ -188,7 +188,24 @@ class OverlayService : Service() {
         scope.launch {
             (bubble as? TextView)?.text = "…"
             // Use the production-grade StreamingSttClient with structured results.
-            val result = streamingStt.transcribeStructured(audioFile)
+            // Guard against unexpected throws so a malformed STT response can't
+            // crash the coroutine, and always clean up the temp audio file.
+            val result = try {
+                streamingStt.transcribeStructured(audioFile)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                runCatching { audioFile.delete() }
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "STT transcribe threw unexpectedly", t)
+                runCatching { audioFile.delete() }
+                (bubble as? TextView)?.text = "PUSH"
+                android.widget.Toast.makeText(
+                    this@OverlayService,
+                    "STT failed: ${t.message ?: "unknown error"}",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
             // Clean up the temp file regardless of outcome.
             runCatching { audioFile.delete() }
             val transcript = when (result) {

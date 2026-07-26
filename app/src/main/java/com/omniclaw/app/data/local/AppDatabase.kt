@@ -47,7 +47,6 @@ class DatabaseProvider @Inject constructor(
     val db: AppDatabase by lazy {
         Room.databaseBuilder(ctx, AppDatabase::class.java, "omniclaw.db")
             .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
-            .fallbackToDestructiveMigration()
             // Write-Ahead Logging: enables concurrent readers + 1 writer.
             // Critical for the agent loop (writer) + chat UI (reader) to not
             // block each other. Default on modern Android, but we set it

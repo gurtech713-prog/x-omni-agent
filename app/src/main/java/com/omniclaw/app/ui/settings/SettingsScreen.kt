@@ -946,6 +946,7 @@ private fun ChannelConfigEditor(
     // Synchronize local states when external config updates
     LaunchedEffect(cfg) {
         localDiscordWebhook = cfg.discordWebhook
+        discordEnabled = cfg.discordWebhook.isNotEmpty()
     }
 
     fun computeDirty(): Boolean = listOf(

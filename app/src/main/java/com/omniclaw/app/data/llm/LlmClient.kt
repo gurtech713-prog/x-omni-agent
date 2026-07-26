@@ -206,13 +206,13 @@ class LlmClient @Inject constructor(
         }
         val firstChoice = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
             ?: throw LlmException("No choices in response: ${body.take(200)}")
-        val msgObj = firstChoice["message"]?.jsonObject
+        val msgObj = firstChoice["message"] as? JsonObject
         val content = msgObj?.get("content")?.jsonPrimitive?.content.orEmpty()
         val reasoning = msgObj?.get("reasoning_content")?.jsonPrimitive?.content.orEmpty()
         val reasoningAlt = msgObj?.get("reasoning")?.jsonPrimitive?.content.orEmpty()
         val text = content.ifEmpty { reasoning.ifEmpty { reasoningAlt } }
         val finish = firstChoice["finish_reason"]?.jsonPrimitive?.content.orEmpty()
-        val usageObj = obj["usage"]?.jsonObject
+        val usageObj = obj["usage"] as? JsonObject
         val usage = LlmUsage(
             promptTokens = usageObj?.get("prompt_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
             completionTokens = usageObj?.get("completion_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,

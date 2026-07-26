@@ -606,7 +606,7 @@ private fun scheduleDescription(t: ScheduledTask): String = when (t.scheduleKind
     ScheduleKind.WEEKDAY -> "Weekdays at ${t.timeOfDay}"
     ScheduleKind.WEEKLY -> {
         val names = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
-        val days = t.weekdays.sorted().joinToString(",") { names.getOrElse(it) { "?" } }
+        val days = t.weekdays.sorted().joinToString(",") { names.getOrElse(it - 1) { "?" } }
         "Weekly at ${t.timeOfDay} on [$days]"
     }
 }

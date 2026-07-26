@@ -23,5 +23,4 @@
     android:canTakeScreenshot="true"
     android:isAccessibilityTool="true"
     android:description="@string/accessibility_service_description"
-    android:notificationTimeout="100"
-    android:packageNames="" />
+    android:notificationTimeout="100" />
