@@ -1,5 +1,6 @@
 package com.omniclaw.app.core.nav
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -20,7 +21,10 @@ import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -48,11 +52,11 @@ import com.omniclaw.app.ui.sessions.SessionsScreen
 import com.omniclaw.app.ui.settings.SettingsScreen
 
 private sealed class TopRoute(val route: String, val label: String, val icon: ImageVector, val iconSelected: ImageVector) {
-    data object Chat     : TopRoute("chat?sessionId={sessionId}", "Chat", Icons.Outlined.AutoAwesome, Icons.Filled.AutoAwesome)
-    data object Sessions : TopRoute("sessions", "Sessions", Icons.Outlined.Hub,        Icons.Filled.Hub)
-    data object Memory   : TopRoute("memory",   "Memory",   Icons.Outlined.Bookmark,   Icons.Filled.Bookmark)
-    data object Schedule : TopRoute("schedule", "Schedule", Icons.Outlined.Schedule,   Icons.Filled.Schedule)
-    data object Settings : TopRoute("settings", "Settings", Icons.Outlined.Settings,   Icons.Filled.Settings)
+    data object Chat     : TopRoute(Routes.CHAT_ROUTE, "Chat", Icons.Outlined.AutoAwesome, Icons.Filled.AutoAwesome)
+    data object Sessions : TopRoute(Routes.SESSIONS_ROUTE, "Sessions", Icons.Outlined.Hub,        Icons.Filled.Hub)
+    data object Memory   : TopRoute(Routes.MEMORY_ROUTE, "Memory",   Icons.Outlined.Bookmark,   Icons.Filled.Bookmark)
+    data object Schedule : TopRoute(Routes.SCHEDULE_ROUTE, "Schedule", Icons.Outlined.Schedule,   Icons.Filled.Schedule)
+    data object Settings : TopRoute(Routes.SETTINGS_ROUTE, "Settings", Icons.Outlined.Settings,   Icons.Filled.Settings)
 }
 
 // Material Design guidelines cap NavigationBar at 5 destinations. The app
@@ -69,17 +73,21 @@ private val TopRoutes = listOf(
     TopRoute.Settings,
 )
 
+private const val TAG = "OmniNav"
+
 @Composable
 fun OmniApp() {
     val nav = rememberNavController()
     val stack by nav.currentBackStackEntryAsState()
-    val current = stack?.destination?.route ?: TopRoute.Chat.route
+    val current = stack?.destination?.route ?: Routes.CHAT_ROUTE
+    val isImeVisible = WindowInsets.ime.asPaddingValues().calculateBottomPadding() > 0.dp
 
     // BackHandler: pressing back from a non-Chat tab returns to Chat (the
     // start destination). Pressing back from Chat exits the app (default
     // behavior). Previously back exited from ANY tab, which surprised users.
-    androidx.activity.compose.BackHandler(enabled = current != TopRoute.Chat.route) {
-        nav.navigate(TopRoute.Chat.route) {
+    androidx.activity.compose.BackHandler(enabled = current != Routes.CHAT_ROUTE) {
+        Log.i(TAG, "Back pressed: navigating back from $current to ${Routes.CHAT_ROUTE}")
+        nav.navigate(Routes.CHAT_ROUTE) {
             popUpTo(nav.graph.findStartDestination().id) { saveState = true }
             launchSingleTop = true
             restoreState = true
@@ -87,27 +95,37 @@ fun OmniApp() {
     }
 
     Scaffold(
-        contentWindowInsets = WindowInsets.safeDrawing,
+        contentWindowInsets = WindowInsets.statusBars,
         bottomBar = {
-            OmniBottomBar(
-                current = current,
-                onSelect = { route ->
-                    nav.navigate(route) {
-                        popUpTo(nav.graph.findStartDestination().id) { saveState = true }
-                        launchSingleTop = true
-                        restoreState = true
+            AnimatedVisibility(
+                visible = !isImeVisible,
+                enter = fadeIn(tween(Motion.DurationFast)),
+                exit = fadeOut(tween(Motion.DurationFast)),
+            ) {
+                OmniBottomBar(
+                    current = current,
+                    onSelect = { route ->
+                        Log.i(TAG, "Navigating from $current to $route via bottom bar")
+                        nav.navigate(route) {
+                            popUpTo(nav.graph.findStartDestination().id) { saveState = true }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
                     }
-                }
-            )
+                )
+            }
         }
     ) { padding ->
         NavHost(
             navController = nav,
-            startDestination = TopRoute.Chat.route,
-            modifier = Modifier.padding(padding)
+            startDestination = Routes.CHAT_ROUTE,
+            modifier = Modifier.padding(
+                top = padding.calculateTopPadding(),
+                bottom = if (isImeVisible) 0.dp else padding.calculateBottomPadding()
+            )
         ) {
             composable(
-                route = TopRoute.Chat.route,
+                route = "${Routes.CHAT_ROUTE}?sessionId={sessionId}",
                 arguments = listOf(
                     androidx.navigation.navArgument("sessionId") {
                         type = androidx.navigation.NavType.StringType
@@ -119,10 +137,10 @@ fun OmniApp() {
                 val sessionId = backStackEntry.arguments?.getString("sessionId")
                 FadeInScreen { ChatScreen(sessionId = sessionId) }
             }
-            composable(TopRoute.Sessions.route) {
+            composable(Routes.SESSIONS_ROUTE) {
                 FadeInScreen {
                     SessionsScreen(onSelectSession = { id ->
-                        nav.navigate("chat?sessionId=$id") {
+                        nav.navigate("${Routes.CHAT_ROUTE}?sessionId=$id") {
                             popUpTo(nav.graph.findStartDestination().id) { saveState = true }
                             launchSingleTop = true
                             restoreState = true
@@ -130,9 +148,9 @@ fun OmniApp() {
                     })
                 }
             }
-            composable(TopRoute.Memory.route)   { FadeInScreen { MemoryScreen() } }
-            composable(TopRoute.Schedule.route) { FadeInScreen { ScheduleScreen() } }
-            composable(TopRoute.Settings.route) { FadeInScreen { SettingsScreen() } }
+            composable(Routes.MEMORY_ROUTE)   { FadeInScreen { MemoryScreen() } }
+            composable(Routes.SCHEDULE_ROUTE) { FadeInScreen { ScheduleScreen() } }
+            composable(Routes.SETTINGS_ROUTE) { FadeInScreen { SettingsScreen() } }
         }
     }
 }

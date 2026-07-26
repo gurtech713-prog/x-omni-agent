@@ -1,6 +1,8 @@
 package com.omniclaw.app.service
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -25,12 +27,60 @@ class AgentForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Ensure the notification channel exists before promoting to foreground.
+        ensureNotificationChannel()
         val notif = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            tryStartForegroundSpecialUse(notif)
         } else {
-            startForeground(NOTIF_ID, notif)
+            tryStartForegroundPlain(notif)
         }
+
+        if (!started) {
+            android.util.Log.e("AgentForegroundService", "AgentForegroundService failed to promote to foreground onCreate; stopping service.")
+            stopSelf()
+        }
+    }
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        val existing = nm.getNotificationChannel(OmniApplication.CHANNEL_AGENT)
+        if (existing != null) return
+        nm.createNotificationChannel(
+            NotificationChannel(
+                OmniApplication.CHANNEL_AGENT,
+                getString(R.string.fg_service_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = getString(R.string.fg_service_channel_desc)
+                setShowBadge(false)
+            }
+        )
+    }
+
+    private fun tryStartForegroundSpecialUse(notif: Notification): Boolean {
+        return runCatching {
+            startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        }.map { true }
+            .recoverCatching { e ->
+                android.util.Log.w(
+                    "AgentForegroundService",
+                    "specialUse foreground start failed; falling back to plain foreground: ${e.message}",
+                    e,
+                )
+                tryStartForegroundPlain(notif)
+            }
+            .getOrDefault(false)
+    }
+
+    private fun tryStartForegroundPlain(notif: Notification): Boolean {
+        return runCatching {
+            startForeground(NOTIF_ID, notif)
+        }.onFailure { e ->
+            android.util.Log.e("AgentForegroundService", "Failed to start foreground service in onCreate: ${e.message}", e)
+        }.isSuccess
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -57,10 +107,16 @@ class AgentForegroundService : Service() {
     companion object {
         const val NOTIF_ID = 0xC1A
 
-        fun start(ctx: Context) {
+        fun start(ctx: Context): Boolean {
             val i = Intent(ctx, AgentForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
-            else ctx.startService(i)
+            return runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                else ctx.startService(i)
+                true
+            }.getOrElse { e ->
+                android.util.Log.e("AgentForegroundService", "Failed to start AgentForegroundService: ${e.message}", e)
+                false
+            }
         }
 
         fun stop(ctx: Context) {

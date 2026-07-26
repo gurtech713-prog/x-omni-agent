@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.memory
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omniclaw.app.data.local.LessonDao
@@ -32,10 +33,16 @@ class LessonsViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     fun forget(id: String) {
+        Log.i(TAG, "Forgetting/deleting learned lesson: $id")
         viewModelScope.launch { lessonDao.delete(id) }
     }
 
     fun clearAll() {
+        Log.i(TAG, "Clearing all learned lessons")
         viewModelScope.launch { lessonDao.clearAll() }
+    }
+
+    companion object {
+        private const val TAG = "LessonsViewModel"
     }
 }

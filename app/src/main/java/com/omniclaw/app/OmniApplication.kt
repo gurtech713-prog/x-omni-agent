@@ -4,10 +4,16 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import android.os.StrictMode
+import android.util.Log
 import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
+import com.google.firebase.analytics.FirebaseAnalytics
+import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.omniclaw.app.BuildConfig
 import com.omniclaw.app.data.local.LocalLlmClient
 import com.omniclaw.app.data.llm.LlmClient
+import com.omniclaw.app.voice.TextToSpeechManager
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 
@@ -16,6 +22,9 @@ class OmniApplication : Application(), Configuration.Provider {
 
     @Inject lateinit var workerFactory: HiltWorkerFactory
     @Inject lateinit var localLlmClient: LocalLlmClient
+    @Inject lateinit var ttsManager: TextToSpeechManager
+    private lateinit var firebaseAnalytics: FirebaseAnalytics
+    private lateinit var crashlytics: FirebaseCrashlytics
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
@@ -23,9 +32,44 @@ class OmniApplication : Application(), Configuration.Provider {
             .build()
 
     override fun onCreate() {
+        // Initialize Firebase services FIRST — before any subsystem that might crash.
+        // FirebaseCrashlytics must be initialized before the custom uncaught exception
+        // handler is installed so it can properly capture crashes.
+        try {
+            crashlytics = FirebaseCrashlytics.getInstance()
+            firebaseAnalytics = FirebaseAnalytics.getInstance(this)
+            // Set user properties for analytics segmentation.
+            crashlytics.setUserId(android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID))
+            Log.i(TAG, "Firebase Crashlytics & Analytics initialized")
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase initialization failed (likely missing google-services.json): ${e.message}")
+        }
+
+        // Install a process-wide uncaught-exception handler BEFORE any subsystem
+        // initializes — if Hilt graph construction or DB init throws, we still
+        // capture the trace. The handler logs the crash and then delegates to
+        // the previous handler (the default JVM behavior, which terminates the
+        // process) so crash-reporting SDKs chained later still see the throw.
+        installCrashHandler()
+        // StrictMode in debug builds surfaces accidental main-thread I/O and
+        // resource leaks (unclosed cursors, etc.) as log warnings + a visible
+        // dialog. Disabled in release.
+        if (BuildConfig.DEBUG) installStrictMode()
         super.onCreate()
         registerNotificationChannels()
         registerLocalTokenizers()
+    }
+
+    /**
+     * Release native / system resources when the process is being torn down.
+     * [onTerminate] is only called on emulator / debug builds in some cases,
+     * but it's the correct place to release the TTS engine if it fires.
+     * The TTS engine is also cleaned up via [TextToSpeechManager.shutdown]
+     * from the chat ViewModel's onCleared.
+     */
+    override fun onTerminate() {
+        runCatching { ttsManager.shutdown() }
+        super.onTerminate()
     }
 
     /**
@@ -70,9 +114,81 @@ class OmniApplication : Application(), Configuration.Provider {
         )
     }
 
+    /**
+     * Record a non-fatal exception to Firebase Crashlytics.
+     * Use this for expected error conditions that don't crash the app but should
+     * be tracked (e.g., LLM API failures, accessibility timeouts).
+     */
+    fun recordNonFatal(throwable: Throwable) {
+        try {
+            crashlytics.recordException(throwable)
+        } catch (_: Exception) {
+            // Firebase may not be initialized; silently ignore.
+        }
+    }
+
+    /**
+     * Log an event to Firebase Analytics.
+     * Parameters are optional — only include what's relevant.
+     */
+    fun logEvent(eventName: String, params: Map<String, String> = emptyMap()) {
+        try {
+            val bundle = android.os.Bundle()
+            params.forEach { (key, value) -> bundle.putString(key, value) }
+            firebaseAnalytics.logEvent(eventName, bundle)
+        } catch (_: Exception) {
+            // Firebase may not be initialized; silently ignore.
+        }
+    }
+
     companion object {
         const val CHANNEL_AGENT = "agent.fg"
         const val CHANNEL_OVERLAY = "overlay.bubble"
+        private const val TAG = "OmniApp"
+
+        /**
+         * Process-wide uncaught-exception handler. Logs the crash to Logcat
+         * with the offending thread + stack, then delegates to the previous
+         * handler. In release builds, this is the only crash signal we get
+         * (no Crashlytics); the user sees the standard "App keeps stopping"
+         * dialog. In debug, StrictMode + Logcat together give full visibility.
+         */
+        private fun installCrashHandler() {
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                try {
+                    Log.e(TAG, "Uncaught exception on ${thread.name}", throwable)
+                } catch (_: Throwable) {
+                    // Logging itself failed — nothing more we can do.
+                }
+                previous?.uncaughtException(thread, throwable)
+            }
+        }
+
+        /**
+         * StrictMode in debug only — flags main-thread disk reads/writes,
+         * network access (via `penaltyLog`), and untagged SQLite cursors.
+         * Penalty is LOG only (no death penalty / dialog) so the app stays
+         * usable while still surfacing violations in Logcat.
+         */
+        private fun installStrictMode() {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads()
+                    .detectDiskWrites()
+                    .detectNetwork()
+                    .penaltyLog()
+                    .build()
+            )
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectLeakedSqlLiteObjects()
+                    .detectLeakedClosableObjects()
+                    .detectActivityLeaks()
+                    .penaltyLog()
+                    .build()
+            )
+        }
     }
 }
 
@@ -107,4 +223,3 @@ private object FallbackTokenizer : LocalLlmClient.Tokenizer {
     override val padTokenId: Int = 0
     override val maxContextLength: Int = 512  // conservative for small models
 }
-

@@ -13,8 +13,11 @@ import com.omniclaw.app.logging.AgentLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -35,15 +38,12 @@ import javax.inject.Singleton
  *     Reddit home feed opens the search bar — use it to type queries"), which
  *     are persisted to the lesson store.
  *
- *  3. **Lesson reinforcement** — [recordDirectLesson] is called for each step
- *     immediately after verification, so we capture concrete (fingerprint,
- *     action, outcome) tuples even before the LLM reflection runs. If the same
- *     tuple is seen again, its confidence is incremented instead of creating
- *     a duplicate.
+ *  3. **Auto-skill creation** — on successful multi-step episodes, [maybeAutoCreateSkill]
+ *     asks the LLM to summarize the trajectory as a reusable SKILL.md.
  *
- * The reflection step (2) is what makes this "self-learning" rather than just
- * "logging": the agent actively reasons about its experience and writes its own
- * guidance for future runs.
+ * Thread safety: [reflectOnEpisode] and [maybeAutoCreateSkill] MUST NOT run
+ * concurrently on the same episode because both read and clear [EpisodeRecorder].
+ * A per-session Mutex serializes them via [runPostSessionPipeline].
  */
 @Singleton
 class LearningEngine @Inject constructor(
@@ -54,6 +54,14 @@ class LearningEngine @Inject constructor(
     private val logger: AgentLogger,
     private val recorder: EpisodeRecorder,
 ) {
+    // Per-session mutex to serialize reflectOnEpisode + maybeAutoCreateSkill.
+    // Without this, both coroutines launch by AgentLoop.triggerReflection() can
+    // race: whichever runs first clears the episode, causing the other to
+    // silently skip (no episode found). The mutex ensures reflection always
+    // runs first, then auto-skill creation, using a snapshot of the episode.
+    private val sessionMutexes = ConcurrentHashMap<String, Mutex>()
+    private fun mutexFor(id: String): Mutex =
+        sessionMutexes.computeIfAbsent(id) { Mutex() }
 
     /**
      * Query lessons relevant to the current screen and format them for
@@ -63,11 +71,11 @@ class LearningEngine @Inject constructor(
      * recorded for this screen yet). The AgentLoop appends the result to the
      * system prompt's "Constraints" section.
      */
-    suspend fun lessonsForPrompt(screenFingerprint: String): String? = withContext(Dispatchers.IO) {
-        val lessons = runCatching { lessonDao.forScreen(screenFingerprint, limit = 5) }
+    suspend fun lessonsForPrompt(screenFingerprint: String, minConfidence: Int = 2): String? = withContext(Dispatchers.IO) {
+        val lessons = runCatching { lessonDao.forScreen(screenFingerprint, limit = 5, minConfidence = minConfidence) }
             .getOrDefault(emptyList())
         if (lessons.isEmpty()) return@withContext null
-
+    
         buildString {
             appendLine()
             appendLine("Learned lessons for this screen (from past sessions):")
@@ -88,7 +96,7 @@ class LearningEngine @Inject constructor(
      * Record a direct (fingerprint, action, outcome) lesson immediately after
      * a step is verified. This captures concrete experience without waiting
      * for LLM reflection. If the same tuple already exists, increment its
-     * confidence instead of duplicating.
+     * confidence instead of creating a duplicate.
      */
     suspend fun recordDirectLesson(
         sessionId: String,
@@ -130,6 +138,40 @@ class LearningEngine @Inject constructor(
     }
 
     /**
+     * Run the complete post-session learning pipeline sequentially:
+     *   1. reflectOnEpisode — extract lessons via LLM
+     *   2. maybeAutoCreateSkill — draft a SKILL.md from successful trajectories
+     *   3. pruneStale — clean up old low-confidence lessons
+     *   4. clear the in-memory episode
+     *
+     * The mutex prevents reflectOnEpisode and maybeAutoCreateSkill from racing
+     * on the same episode recorder state. Previously, concurrent scope.launch
+     * calls meant one could finish and clear the episode before the other read
+     * it, silently dropping either lessons extraction or auto-skill creation.
+     */
+    suspend fun runPostSessionPipeline(sessionId: String) {
+        mutexFor(sessionId).withLock {
+            try {
+                reflectOnEpisode(sessionId)
+            } catch (e: Exception) {
+                Log.w(TAG, "Reflection failed for session $sessionId: ${e.message}")
+            }
+            try {
+                maybeAutoCreateSkill(sessionId)
+            } catch (e: Exception) {
+                Log.w(TAG, "Auto-skill creation failed for session $sessionId: ${e.message}")
+            }
+            try {
+                pruneStaleLessons()
+            } catch (e: Exception) {
+                Log.w(TAG, "Pruning stale lessons failed: ${e.message}")
+            } finally {
+                recorder.clear(sessionId)
+            }
+        }
+    }
+
+    /**
      * Reflect on a completed episode and extract lessons using the LLM.
      *
      * Called by AgentLoop when a session reaches DONE / FAILED / max-steps.
@@ -140,54 +182,51 @@ class LearningEngine @Inject constructor(
      * and writes natural-language guidance for future runs.
      */
     suspend fun reflectOnEpisode(sessionId: String) = withContext(Dispatchers.IO) {
-        val steps = recorder.getEpisode(sessionId) ?: return@withContext
-        if (steps.size < 2) return@withContext  // nothing to learn from a 1-step session
-        val userPrompt = recorder.getUserPrompt(sessionId) ?: ""
-        val finalStatus = recorder.getFinalStatus(sessionId) ?: "UNKNOWN"
+        try {
+            val steps = recorder.getEpisode(sessionId) ?: return@withContext
+            if (steps.size < 2) return@withContext  // nothing to learn from a 1-step session
+            val userPrompt = recorder.getUserPrompt(sessionId) ?: ""
+            val finalStatus = recorder.getFinalStatus(sessionId) ?: "UNKNOWN"
 
-        val cfg = runCatching { settings.modelConfig.first() }.getOrNull() ?: return@withContext
-        // Skip reflection if no API key is configured (e.g. first run, or LiteRT
-        // without a working model — reflection needs a capable LLM).
-        if (cfg.provider != com.omniclaw.app.data.prefs.LlmProvider.LITERT &&
-            cfg.apiKey.isBlank()) return@withContext
+            val cfg = runCatching { settings.modelConfig.first() }.getOrNull() ?: return@withContext
+            // Skip reflection if no API key is configured (e.g. first run, or LiteRT
+            // without a working model — reflection needs a capable LLM).
+            if (cfg.provider != com.omniclaw.app.data.prefs.LlmProvider.LITERT &&
+                cfg.apiKey.isBlank()) return@withContext
 
-        val trajectory = formatTrajectoryForReflection(steps, userPrompt, finalStatus)
-        val reflectionPrompt = buildReflectionPrompt(trajectory, finalStatus)
+            val trajectory = formatTrajectoryForReflection(steps, userPrompt, finalStatus)
+            val reflectionPrompt = buildReflectionPrompt(trajectory, finalStatus)
 
-        runCatching {
-            val result = llm.complete(
-                provider = cfg.provider,
-                baseUrl = cfg.baseUrl,
-                apiKey = cfg.apiKey,
-                model = cfg.model,
-                messages = listOf(
-                    LlmClient.Message(
-                        "system",
-                        "You are a reflection engine. Analyze the agent's episode and extract " +
-                            "concise, actionable lessons. Output one lesson per line, prefixed " +
-                            "with [AVOID] or [USE]. Be specific about screen context and actions. " +
-                            "Maximum 3 lessons. No preamble."
+            runCatching {
+                val result = llm.complete(
+                    provider = cfg.provider,
+                    baseUrl = cfg.baseUrl,
+                    apiKey = cfg.apiKey,
+                    model = cfg.model,
+                    messages = listOf(
+                        LlmClient.Message(
+                            "system",
+                            "You are a reflection engine. Analyze the agent's episode and extract " +
+                                "concise, actionable lessons. Output one lesson per line, prefixed " +
+                                "with [AVOID] or [USE]. Be specific about screen context and actions. " +
+                                "Maximum 3 lessons. No preamble."
+                        ),
+                        LlmClient.Message("user", reflectionPrompt),
                     ),
-                    LlmClient.Message("user", reflectionPrompt),
-                ),
-                temperature = 0.1f,
-                maxTokens = 300,
-            )
-            parseAndPersistLessons(result.text, sessionId, steps)
-            logger.logInfo(sessionId, 0, "reflection: extracted lessons from ${steps.size}-step episode ($finalStatus)")
-        }.onFailure { e ->
-            Log.w(TAG, "Reflection failed for session $sessionId: ${e.message}")
-            // Even if LLM reflection fails, the direct lessons recorded during
-            // the session are already persisted — the agent still learns.
-        }
-
-        // Clean up the in-memory episode after reflection.
-        recorder.clear(sessionId)
-
-        // Periodically prune stale low-confidence lessons to prevent unbounded growth.
-        runCatching {
-            val cutoff = System.currentTimeMillis() - 30L * 24 * 3600 * 1000  // 30 days ago
-            lessonDao.pruneStale(minConfidence = 2, before = cutoff)
+                    temperature = 0.1f,
+                    maxTokens = 300,
+                )
+                parseAndPersistLessons(result.text, sessionId, steps)
+                logger.logInfo(sessionId, 0, "reflection: extracted lessons from ${steps.size}-step episode ($finalStatus)")
+            }.onFailure { e ->
+                Log.w(TAG, "Reflection failed for session $sessionId: ${e.message}")
+                // Even if LLM reflection fails, the direct lessons recorded during
+                // the session are already persisted — the agent still learns.
+            }
+        } finally {
+            // NOTE: recorder.clear() has been moved to runPostSessionPipeline's
+            // finally block so it runs AFTER maybeAutoCreateSkill also finishes.
+            // Do NOT clear here — that would defeat the serialization fix.
         }
     }
 
@@ -198,6 +237,9 @@ class LearningEngine @Inject constructor(
      * reusable. We ask the LLM to summarize it as a SKILL.md and persist it
      * under filesDir/skills/auto-<hash>/SKILL.md. The skill becomes available
      * on the next Skills screen refresh.
+     *
+     * Runs AFTER reflectOnEpisode in the serialized pipeline, so it reads the
+     * episode while it still exists in memory.
      */
     suspend fun maybeAutoCreateSkill(sessionId: String) = withContext(Dispatchers.IO) {
         val steps = recorder.getEpisode(sessionId) ?: return@withContext
@@ -238,6 +280,12 @@ class LearningEngine @Inject constructor(
         }.onFailure { e ->
             Log.w(TAG, "Auto-skill creation failed for session $sessionId: ${e.message}")
         }
+    }
+
+    /** Periodically prune stale low-confidence lessons to prevent unbounded growth. */
+    private suspend fun pruneStaleLessons() = withContext(Dispatchers.IO) {
+        val cutoff = System.currentTimeMillis() - 30L * 24 * 3600 * 1000  // 30 days ago
+        lessonDao.pruneStale(minConfidence = 2, before = cutoff)
     }
 
     // ------------------------------------------------------------------

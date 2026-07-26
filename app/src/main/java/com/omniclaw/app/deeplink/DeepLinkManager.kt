@@ -91,7 +91,12 @@ class DeepLinkManager @Inject constructor(
         if (all.isEmpty()) return false
         // Find bookmarks whose name appears as a whole word in the phrase.
         val matches = all.mapNotNull { b ->
-            val pattern = Regex("\\b${Regex.escape(b.name)}\\b", RegexOption.IGNORE_CASE)
+            val firstChar = b.name.firstOrNull()
+            val lastChar = b.name.lastOrNull()
+            val isWordChar: (Char) -> Boolean = { it.isLetterOrDigit() || it == '_' }
+            val prefix = if (firstChar != null && isWordChar(firstChar)) "(?<!\\w)" else ""
+            val suffix = if (lastChar != null && isWordChar(lastChar)) "(?!\\w)" else ""
+            val pattern = Regex("$prefix${Regex.escape(b.name)}$suffix", RegexOption.IGNORE_CASE)
             if (pattern.containsMatchIn(phrase)) b to b.name.length else null
         }
         if (matches.isEmpty()) return false
@@ -116,18 +121,20 @@ class DeepLinkManager @Inject constructor(
         return dir.listFiles().orEmpty()
             .filter { it.isFile && it.name.endsWith(".md") }
             .mapNotNull { f ->
-                val text = f.readText()
-                val name = Regex("(?m)^#\\s+(.+)$").find(text)?.groupValues?.getOrNull(1)?.trim()
-                    ?: f.nameWithoutExtension
-                val url = Regex("(?m)^```\\s*\n(.+?)\n```", RegexOption.DOT_MATCHES_ALL)
-                    .find(text)?.groupValues?.getOrNull(1)?.trim()
-                    ?: return@mapNotNull null
-                Bookmark(
-                    id = f.nameWithoutExtension,
-                    name = name,
-                    uri = url,
-                    createdAt = f.lastModified(),
-                )
+                runCatching {
+                    val text = f.readText()
+                    val name = Regex("(?m)^#\\s+(.+)$").find(text)?.groupValues?.getOrNull(1)?.trim()
+                        ?: f.nameWithoutExtension
+                    val url = Regex("(?m)^```\\s*\n(.+?)\n```", RegexOption.DOT_MATCHES_ALL)
+                        .find(text)?.groupValues?.getOrNull(1)?.trim()
+                        ?: return@mapNotNull null
+                    Bookmark(
+                        id = f.nameWithoutExtension,
+                        name = name,
+                        uri = url,
+                        createdAt = f.lastModified(),
+                    )
+                }.getOrNull()
             }
     }
 }

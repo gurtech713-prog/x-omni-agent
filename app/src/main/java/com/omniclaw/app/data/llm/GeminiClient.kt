@@ -1,11 +1,17 @@
 package com.omniclaw.app.data.llm
 
 import android.util.Log
+import com.omniclaw.app.core.retry
 import com.omniclaw.app.data.model.LlmUsage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -18,10 +24,16 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Native Google Gemini API client.
@@ -33,7 +45,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   - temperature / maxOutputTokens are nested under `generationConfig` (required by API)
  *   - convertMessages() merges consecutive same-role turns to satisfy Gemini's
  *     strict alternating user/model requirement (violating it causes HTTP 400)
- *   - Better error logging: full body included in exception message
+ *   - Streaming now uses callbackFlow + OkHttp async enqueue → cancellable.
+ *   - SSE parsing buffers brace depth to handle multi-line JSON objects.
+ *   - Removed duplicate executeWithRetry in favor of core.retry (which correctly
+ *     re-throws CancellationException).
+ *   - HTTP 429 surfaces [RateLimitException] carrying `Retry-After`.
  */
 class GeminiClient(
     private val http: OkHttpClient,
@@ -45,7 +61,7 @@ class GeminiClient(
 
     /**
      * Non-streaming completion. Mirrors [LlmClient.complete] signature so
-     * callers can swap implementations transparently.
+     * callers can swap implementations transparently. Cancellable.
      */
     suspend fun complete(
         baseUrl: String,
@@ -58,8 +74,6 @@ class GeminiClient(
         val (systemInstruction, contents) = convertMessages(messages)
         val payload = buildJsonObject {
             // generationConfig is the correct nesting for these parameters.
-            // Placing temperature/maxOutputTokens at the top level is ignored by
-            // the Gemini REST API and causes responses to use default values.
             putJsonObject("generationConfig") {
                 put("temperature", temperature.toDouble())
                 put("maxOutputTokens", maxTokens)
@@ -90,22 +104,70 @@ class GeminiClient(
             }
         }
         // URL format: /v1beta/models/<model>:generateContent
-        val url = baseUrl.trimEnd('/') + "/models/$model:generateContent"
-        Log.w(TAG, "Gemini request URL: $url")
-        Log.w(TAG, "Gemini request payload: $payload")
-        val resp = http.newCall(buildRequest(url, apiKey, payload.toString())).execute()
-        val body = resp.use { it.body?.string().orEmpty() }
-        if (!resp.isSuccessful) {
-            Log.e(TAG, "Gemini complete error ${resp.code}: $body")
-            throw LlmException("Gemini HTTP ${resp.code}: ${body.take(500)}")
+        val cleanModel = model.trim().removePrefix("models/").ifBlank { "gemini-2.0-flash" }
+        val url = baseUrl.trimEnd('/') + "/models/$cleanModel:generateContent"
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "Gemini request URL: $url")
         }
-        Log.d(TAG, "complete ← ${body.take(200)}")
+        // NOTE: We deliberately do NOT log the full request payload — it
+        // contains the user's prompt + conversation history, which is user-
+        // private content. Logging it at WARN (as the previous version did)
+        // would surface prompts in Logcat on production builds where anyone
+        // with adb access could read them. Only the URL is logged, and only
+        // at VERBOSE (which must be explicitly enabled via `adb shell
+        // setprop log.tag.GeminiClient VERBOSE`).
 
-        val obj = json.parseToJsonElement(body).jsonObject
+        val body = retry(
+            maxAttempts = 3,
+            baseDelayMs = 1000,
+            maxDelayMs = 8000,
+            retryable = { e ->
+                when (e) {
+                    is LlmException -> {
+                        val msg = e.message.orEmpty()
+                        msg.contains("HTTP 503") ||
+                            msg.contains("HTTP 502") ||
+                            msg.contains("HTTP 504") ||
+                            msg.contains("HTTP 429")
+                    }
+                    is java.io.IOException -> true
+                    is RateLimitException -> true
+                    else -> false
+                }
+            },
+        ) {
+            val resp = executeCancellable(buildRequest(url, apiKey, payload.toString()))
+            val b = resp.use { it.body?.string().orEmpty() }
+            if (!resp.isSuccessful) {
+                if (resp.code == 429) {
+                    throw RateLimitException(
+                        retryAfterSeconds = resp.header("Retry-After")?.toIntOrNull(),
+                        body = b,
+                    )
+                }
+                if (Log.isLoggable(TAG, Log.ERROR)) {
+                    Log.e(TAG, "Gemini complete error ${resp.code}: ${b.take(300)}")
+                }
+                throw LlmException("Gemini HTTP ${resp.code}: ${b.take(500)}")
+            }
+            b
+        }
+        if (Log.isLoggable(TAG, Log.DEBUG)) {
+            Log.d(TAG, "complete ← ${body.take(200)}")
+        }
+
+        val obj = runCatching { json.parseToJsonElement(body).jsonObject }.getOrElse {
+            throw LlmException("Malformed Gemini response (not JSON): ${body.take(200)}")
+        }
         val candidate = obj["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
         val text = candidate
             ?.get("content")?.jsonObject?.get("parts")?.jsonArray
-            ?.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+            ?.joinToString("") { partObj ->
+                val p = partObj.jsonObject
+                val txt = p["text"]?.jsonPrimitive?.contentOrNull
+                val tht = p["thought"]?.jsonPrimitive?.contentOrNull
+                txt ?: tht ?: ""
+            }
             .orEmpty()
         val finishReason = candidate?.get("finishReason")?.jsonPrimitive?.contentOrNull.orEmpty()
         val usageObj = obj["usageMetadata"]?.jsonObject
@@ -114,12 +176,21 @@ class GeminiClient(
             completionTokens = usageObj?.get("candidatesTokenCount")?.jsonPrimitive?.intOrNull?.toLong() ?: 0L,
             totalTokens = usageObj?.get("totalTokenCount")?.jsonPrimitive?.intOrNull?.toLong() ?: 0L,
         )
-        Log.d(TAG, "complete done: ${text.take(80)} | finish=$finishReason | tokens=${usage.totalTokens}")
+        if (Log.isLoggable(TAG, Log.DEBUG)) {
+            Log.d(TAG, "complete done: ${text.take(80)} | finish=$finishReason | tokens=${usage.totalTokens}")
+        }
         LlmClient.CompletionResult(text, usage, finishReason)
     }
 
     /**
      * Streaming completion — emits one text delta per generated token group.
+     * Cancellable: coroutine cancellation cancels the underlying OkHttp call.
+     *
+     * NOTE: streaming is non-idempotent — if a stream emits N tokens then fails,
+     * retrying would emit those N tokens again, producing duplicated text in the
+     * agent's accumulated thought. We deliberately do NOT retry streaming here;
+     * callers should fall back to the (idempotent) non-streaming [complete]
+     * path on stream failure.
      */
     fun stream(
         baseUrl: String,
@@ -128,7 +199,7 @@ class GeminiClient(
         messages: List<LlmClient.Message>,
         temperature: Float = 0.2f,
         maxTokens: Int = 2048,
-    ): Flow<String> = flow {
+    ): Flow<String> = callbackFlow {
         val (systemInstruction, contents) = convertMessages(messages)
         val payload = buildJsonObject {
             putJsonObject("generationConfig") {
@@ -157,31 +228,127 @@ class GeminiClient(
                 }
             }
         }
-        val url = baseUrl.trimEnd('/') + "/models/$model:streamGenerateContent"
-        Log.w(TAG, "Gemini stream request URL: $url")
-        Log.w(TAG, "Gemini stream request payload: $payload")
-        val resp = http.newCall(buildRequest(url, apiKey, payload.toString())).execute()
-        resp.use { r ->
-            if (!r.isSuccessful) {
-                val errBody = r.body?.string().orEmpty()
-                Log.e(TAG, "Gemini stream error ${r.code}: $errBody")
-                throw LlmException("Gemini HTTP ${r.code}: ${errBody.take(500)}")
-            }
-            val src = r.body?.source() ?: return@use
-            while (!src.exhausted()) {
-                val line = src.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val data = line.removePrefix("data:").trim()
-                if (data.isEmpty() || data == "[DONE]") continue
-                val obj = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
-                val delta = obj["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
-                    ?.get("content")?.jsonObject?.get("parts")?.jsonArray
-                    ?.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
-                    .orEmpty()
-                if (delta.isNotEmpty()) emit(delta)
-            }
+        val cleanModel = model.trim().removePrefix("models/").ifBlank { "gemini-2.0-flash" }
+        val url = baseUrl.trimEnd('/') + "/models/$cleanModel:streamGenerateContent"
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "Gemini stream request URL: $url")
         }
-    }.flowOn(Dispatchers.IO)
+        val call = http.newCall(buildRequest(url, apiKey, payload.toString()))
+
+        // Coroutine cancellation → cancel the OkHttp call.
+        awaitClose { runCatching { call.cancel() } }
+
+        call.enqueue(object : Callback {
+            override fun onFailure(c: Call, e: IOException) {
+                if (channel.isClosedForSend) return
+                channel.close(
+                    if (c.isCanceled()) CancellationException("Gemini stream cancelled")
+                    else e
+                )
+            }
+
+            override fun onResponse(c: Call, r: Response) {
+                r.use { resp ->
+                    if (!resp.isSuccessful) {
+                        val errBody = resp.body?.string().orEmpty()
+                        if (resp.code == 429) {
+                            channel.close(RateLimitException(
+                                resp.header("Retry-After")?.toIntOrNull(), errBody
+                            ))
+                            return
+                        }
+                        if (Log.isLoggable(TAG, Log.ERROR)) {
+                            Log.e(TAG, "Gemini stream error ${resp.code}: $errBody")
+                        }
+                        channel.close(LlmException("Gemini HTTP ${resp.code}: ${errBody.take(500)}"))
+                        return
+                    }
+                    val src = resp.body?.source()
+                    if (src == null) {
+                        channel.close(LlmException("Empty stream body"))
+                        return
+                    }
+                    // Buffer-based SSE parser: Gemini streams a chunked JSON
+                    // array, but a single JSON object can span multiple lines
+                    // (newlines inside string values). Track brace depth so we
+                    // only parse when we have a complete top-level object.
+                    val buf = StringBuilder()
+                    try {
+                        while (!src.exhausted()) {
+                            if (channel.isClosedForSend) return
+                            val line = src.readUtf8Line() ?: break
+                            if (line.isBlank()) continue
+                            buf.append(line)
+                            // Try to parse every complete top-level object in buf.
+                            while (true) {
+                                val obj = extractNextObject(buf) ?: break
+                                emitDelta(obj)?.let { delta ->
+                                    if (delta.isNotEmpty() && !channel.trySend(delta).isSuccess) return
+                                }
+                            }
+                        }
+                        // Flush any trailing object.
+                        if (buf.isNotBlank()) {
+                            extractNextObject(buf)?.let { obj ->
+                                emitDelta(obj)?.let { delta ->
+                                    if (delta.isNotEmpty()) channel.trySend(delta)
+                                }
+                            }
+                        }
+                        channel.close()
+                    } catch (e: IOException) {
+                        channel.close(e)
+                    }
+                }
+            }
+
+            /** Extract the first complete top-level JSON object from [buf], removing it. */
+            fun extractNextObject(buf: StringBuilder): JsonObject? {
+                var depth = 0
+                var inStr = false
+                var escape = false
+                var startIdx = -1
+                for (i in 0 until buf.length) {
+                    val c = buf[i]
+                    if (inStr) {
+                        if (escape) escape = false
+                        else if (c == '\\') escape = true
+                        else if (c == '"') inStr = false
+                        continue
+                    }
+                    when (c) {
+                        '"' -> inStr = true
+                        '{' -> {
+                            if (depth == 0) startIdx = i
+                            depth++
+                        }
+                        '}' -> {
+                            depth--
+                            if (depth == 0 && startIdx >= 0) {
+                                val piece = buf.substring(startIdx, i + 1)
+                                buf.delete(0, i + 1)
+                                return runCatching { json.parseToJsonElement(piece).jsonObject }.getOrNull()
+                            }
+                        }
+                    }
+                }
+                return null
+            }
+
+            fun emitDelta(obj: JsonObject): String? {
+                val candidate = obj["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
+                val delta = candidate?.get("content")?.jsonObject?.get("parts")?.jsonArray
+                    ?.joinToString("") { partObj ->
+                        val p = partObj.jsonObject
+                        val txt = p["text"]?.jsonPrimitive?.contentOrNull
+                        val tht = p["thought"]?.jsonPrimitive?.contentOrNull
+                        txt ?: tht ?: ""
+                    }
+                    .orEmpty()
+                return delta
+            }
+        })
+    }.buffer(Channel.UNLIMITED).flowOn(Dispatchers.IO)
 
     // ------------------------------------------------------------------
     // Internal
@@ -204,7 +371,6 @@ class GeminiClient(
      */
     private fun convertMessages(messages: List<LlmClient.Message>): Pair<String?, List<JsonObject>> {
         val systemParts = mutableListOf<String>()
-        // Raw role+text pairs before merging
         val raw = mutableListOf<Pair<String, String>>() // (geminiRole, text)
 
         messages.forEach { m ->
@@ -221,22 +387,17 @@ class GeminiClient(
         val merged = mutableListOf<Pair<String, String>>()
         for ((role, text) in raw) {
             if (merged.isNotEmpty() && merged.last().first == role) {
-                // Same role as previous — merge by concatenating text
-                val prev = merged.removeLast()
+                val prev = merged.removeAt(merged.lastIndex)
                 merged.add(role to "${prev.second}\n\n$text")
             } else {
                 merged.add(role to text)
             }
         }
 
-        // Gemini requires the first turn to be "user". If somehow the history
-        // starts with a model turn, prepend a minimal user turn.
+        // Gemini requires the first turn to be "user".
         if (merged.isNotEmpty() && merged.first().first == "model") {
             merged.add(0, "user" to "(start)")
         }
-
-        // If contents is empty (only system messages), add a placeholder user turn
-        // so the API has something to respond to.
         if (merged.isEmpty()) {
             merged.add("user" to "(no message)")
         }
@@ -245,7 +406,8 @@ class GeminiClient(
             buildJsonObject {
                 put("role", role)
                 putJsonArray("parts") {
-                    add(buildJsonObject { put("text", text) })
+                    val safeText = if (text.isBlank()) "(empty)" else text
+                    add(buildJsonObject { put("text", safeText) })
                 }
             }
         }
@@ -253,6 +415,21 @@ class GeminiClient(
         val sys = systemParts.joinToString("\n\n").takeIf { it.isNotBlank() }
         return Pair(sys, contents)
     }
+
+    /** Execute an OkHttp call as a cancellable coroutine. */
+    private suspend fun executeCancellable(req: Request): Response =
+        suspendCancellableCoroutine { cont ->
+            val call = http.newCall(req)
+            cont.invokeOnCancellation { runCatching { call.cancel() } }
+            call.enqueue(object : Callback {
+                override fun onFailure(c: Call, e: IOException) {
+                    if (cont.isActive) cont.resumeWithException(e)
+                }
+                override fun onResponse(c: Call, r: Response) {
+                    if (cont.isActive) cont.resume(r)
+                }
+            })
+        }
 
     private fun buildRequest(url: String, apiKey: String, jsonBody: String): Request {
         return Request.Builder()

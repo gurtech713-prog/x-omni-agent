@@ -1,6 +1,7 @@
 package com.omniclaw.app.ui.schedule
 
 import android.content.Context
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omniclaw.app.cron.ScheduledTaskWorker
@@ -33,25 +34,41 @@ class ScheduleViewModel @Inject constructor(
     val tasks: StateFlow<List<ScheduledTask>> = _tasks.asStateFlow()
 
     fun create(task: ScheduledTask) {
+        Log.i(TAG, "Creating new scheduled task: ID=${task.id}, title='${task.title}'")
         _tasks.value = listOf(task) + _tasks.value
         persist()
-        if (task.enabled) schedule(task)
+        if (task.enabled) {
+            Log.d(TAG, "Task ${task.id} is enabled; scheduling now")
+            schedule(task)
+        }
     }
 
     /** Update an existing task in-place (title, prompt, schedule, enabled). */
     fun update(updated: ScheduledTask) {
+        Log.i(TAG, "Updating scheduled task: ID=${updated.id}, title='${updated.title}'")
         _tasks.value = _tasks.value.map { if (it.id == updated.id) updated else it }
         persist()
         // Reschedule if enabled, cancel if newly disabled.
-        if (updated.enabled) schedule(updated)
-        else ScheduledTaskWorker.cancel(ctx, updated.id)
+        if (updated.enabled) {
+            Log.d(TAG, "Task ${updated.id} is enabled; scheduling/updating schedule")
+            schedule(updated)
+        } else {
+            Log.d(TAG, "Task ${updated.id} is disabled; cancelling schedule")
+            ScheduledTaskWorker.cancel(ctx, updated.id)
+        }
     }
 
     fun toggle(id: String) {
+        Log.i(TAG, "Toggling scheduled task: ID=$id")
         _tasks.value = _tasks.value.map {
             if (it.id == id) {
                 val updated = it.copy(enabled = !it.enabled)
-                if (updated.enabled) schedule(updated) else ScheduledTaskWorker.cancel(ctx, updated.id)
+                Log.d(TAG, "Task $id toggled state. New enabled: ${updated.enabled}")
+                if (updated.enabled) {
+                    schedule(updated)
+                } else {
+                    ScheduledTaskWorker.cancel(ctx, updated.id)
+                }
                 updated
             } else it
         }
@@ -59,6 +76,7 @@ class ScheduleViewModel @Inject constructor(
     }
 
     fun delete(id: String) {
+        Log.i(TAG, "Deleting scheduled task: ID=$id")
         ScheduledTaskWorker.cancel(ctx, id)
         _tasks.value = _tasks.value.filterNot { it.id == id }
         persist()
@@ -70,6 +88,7 @@ class ScheduleViewModel @Inject constructor(
      * stats survive app restarts.
      */
     fun recordRun(id: String, nextRunAt: Long?) {
+        Log.i(TAG, "Recording execution run for task ID=$id. Next run scheduled at $nextRunAt")
         _tasks.value = _tasks.value.map {
             if (it.id == id) it.copy(
                 lastRunAt = System.currentTimeMillis(),
@@ -81,6 +100,7 @@ class ScheduleViewModel @Inject constructor(
     }
 
     private fun schedule(t: ScheduledTask) {
+        Log.d(TAG, "Scheduling task ${t.id} (kind: ${t.scheduleKind})")
         when (t.scheduleKind) {
             ScheduleKind.INTERVAL -> {
                 val minutes = (t.intervalMinutes ?: 60).toLong().coerceAtLeast(15)
@@ -104,20 +124,36 @@ class ScheduleViewModel @Inject constructor(
 
     private fun loadOrSeed(): List<ScheduledTask> {
         val file = storeFile
-        if (!file.exists()) return seed()
+        if (!file.exists()) {
+            Log.d(TAG, "Durable task storage file not found. Seeding initial scheduled tasks.")
+            return seed()
+        }
         return runCatching {
-            json.decodeFromString(serializer, file.readText())
-        }.getOrDefault(seed())
+            val content = file.readText()
+            val tasks = json.decodeFromString(serializer, content)
+            Log.d(TAG, "Successfully loaded ${tasks.size} tasks from storage file.")
+            tasks
+        }.getOrElse {
+            Log.e(TAG, "Error loading tasks from file, seeding defaults instead: ${it.message}", it)
+            seed()
+        }
     }
 
     private fun persist() {
+        // Capture the list snapshot BEFORE launching the IO write — otherwise
+        // a rapid sequence of edits (create, update, delete) could each read
+        // a different _tasks.value by the time the IO dispatcher runs the
+        // write, and the last writer would win with a stale view. The
+        // StateFlow is already updated synchronously, so the UI is immediate;
+        // this file is just the durable backup.
+        val snapshot = _tasks.value
         val file = storeFile
-        // Offload the disk write to IO so we never block the UI thread on
-        // an edit. The StateFlow is already updated synchronously, so the
-        // UI is immediate; the file is just the durable backup.
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                file.writeText(json.encodeToString(serializer, _tasks.value))
+                file.writeText(json.encodeToString(serializer, snapshot))
+                Log.d(TAG, "Persisted ${snapshot.size} tasks to storage file.")
+            }.onFailure {
+                Log.e(TAG, "Failed to persist tasks to storage file: ${it.message}", it)
             }
         }
     }
@@ -158,5 +194,9 @@ class ScheduleViewModel @Inject constructor(
                 runCount = 38,
             ),
         )
+    }
+
+    companion object {
+        private const val TAG = "ScheduleViewModel"
     }
 }

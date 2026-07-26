@@ -13,7 +13,11 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityEvent
+import com.omniclaw.app.accessibility.AccessibilityDiagnostics
+import com.omniclaw.app.accessibility.AccessibilityExecutor
+import com.omniclaw.app.accessibility.WindowTracker
 import com.omniclaw.app.agent.tools.DeviceScheduler
+import com.omniclaw.app.logging.AgentLogger
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -28,94 +32,183 @@ import javax.inject.Inject
  *   perceive -> plan -> act -> verify
  *
  * The agent loop dispatches all device actions (taps, swipes, text entry,
- * app launches, back/home) through this service via [DeviceScheduler].
+ * app launches, back/home) through this service via [DeviceScheduler],
+ * which delegates to [AccessibilityExecutor].
+ *
+ * The service itself is intentionally thin — it owns the platform lifecycle
+ * (connect/disconnect/event delivery) and exposes raw capabilities (root
+ * node, screenshot). All higher-level logic (gesture retry, node search,
+ * window tracking, metrics) lives in the executor + its collaborators.
  */
 @AndroidEntryPoint
-class OmniAccessibilityService : AccessibilityService() {
+class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.OmniA11yLike {
 
     @Inject lateinit var scheduler: DeviceScheduler
     @Inject lateinit var agentLogger: com.omniclaw.app.logging.AgentLogger
+    @Inject lateinit var diagnostics: AccessibilityDiagnostics
+    @Inject lateinit var windowTracker: WindowTracker
 
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         scheduler.boundService = this
+        diagnostics.setState(AccessibilityDiagnostics.ServiceState.CONNECTED)
         Log.i(TAG, "OmniAccessibilityService connected.")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // The agent loop pulls the tree on demand — we don't need to react to every event.
-        // Future: cache the latest event for cheap snapshots.
+        // Feed every event to the window tracker so it can maintain an
+        // accurate picture of dialogs, keyboard, shade, and foreground package.
+        windowTracker.onEvent(event)
     }
 
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility interrupted.")
+        diagnostics.log("lifecycle", "onInterrupt() called", AccessibilityDiagnostics.DiagnosticEvent.Severity.WARN)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         if (scheduler.boundService === this) scheduler.boundService = null
+        diagnostics.setState(AccessibilityDiagnostics.ServiceState.DISCONNECTED)
         // Shut down the screenshot background executor so its daemon thread
-        // doesn't leak for the life of the process. Previously the executor
-        // was created in onCreate but never shut down — repeated bind/unbind
-        // cycles (e.g. user toggling the accessibility service) leaked a
-        // thread each time.
+        // doesn't leak for the life of the process.
         runCatching { screenshotExecutor.shutdown() }
         return super.onUnbind(intent)
     }
 
-    // ---- Public API used by the agent loop via DeviceScheduler ----
+    // ---- Raw capabilities exposed to AccessibilityExecutor ----
+    // The executor calls these via the OmniA11yLike interface + direct casts.
 
     /** Build a flat text representation of the current accessibility tree. */
     fun snapshotTree(): String? {
         val root = rootInActiveWindow ?: return null
-        val sb = StringBuilder()
-        appendNode(sb, root, 0)
-        return sb.toString()
+        // Note: the executor owns recycling for snapshots taken via its own
+        // snapshot() method. This legacy entry point is kept for backward
+        // compatibility with BehaviorRecorder / SuccessMonitor which call
+        // it directly. We recycle the root after building the string.
+        try {
+            val sb = StringBuilder()
+            appendNode(sb, root, 0)
+            return sb.toString()
+        } finally {
+            runCatching { root.recycle() }
+        }
     }
 
     private fun appendNode(sb: StringBuilder, node: AccessibilityNodeInfo?, depth: Int) {
-        if (node == null) return
+        if (node == null || depth > 50) return
+        
+        // OPTIMIZATION: Prune non-interactive nodes early to reduce tree size
+        // and improve performance on complex layouts.
+        val isInteractive = runCatching {
+            node.isClickable || node.isScrollable || node.isEditable ||
+            node.isFocusable || node.isLongClickable
+        }.getOrDefault(false)
+        
+        // Skip deep non-interactive nodes (depth > 30) unless they're interactive
+        if (depth > 30 && !isInteractive) return
+        
+        // Stale-node guard: every AccessibilityNodeInfo field access can throw
+        // NPE / IllegalStateException if the underlying window changes mid-
+        // traversal (common during animations). Wrap each access in runCatching
+        // and bail out gracefully if the node is gone.
         val pad = "  ".repeat(depth.coerceAtMost(8))
-        val cls = node.className?.toString()?.substringAfterLast('.') ?: "?"
-        val text = node.text?.toString().orEmpty().take(80)
-        // Cross-package ref rebinding: if the viewIdResourceName references
-        // another package's namespace (com.foo:id/x), rewrite it to the current
-        // package's namespace (com.bar:id/x) so the agent can reuse the ref.
-        val rawId = node.viewIdResourceName
+        val cls = runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "?"
+        val rawText = runCatching { node.text?.toString().orEmpty() }.getOrNull().orEmpty()
+        // PRIVACY: Filter sensitive fields before including in accessibility tree.
+        // Password inputs, OTP fields, and other security-sensitive UI elements
+        // should not be exposed to the agent or logged.
+        val text = filterSensitiveText(rawText, node)
+        val rawId = runCatching { node.viewIdResourceName }.getOrNull()
         val id = if (rawId != null) agentLogger.rebindRef(rawId, packageName) ?: rawId else ""
         sb.append("$pad- $cls")
         if (id.isNotBlank()) sb.append(" id=$id")
         if (text.isNotBlank()) sb.append(" text=\"$text\"")
-        if (node.isClickable) sb.append(" [clickable]")
-        if (node.isScrollable) sb.append(" [scrollable]")
-        // Include screen bounds for clickable/scrollable nodes so the LLM can
-        // reason about spatial layout and pick tap coordinates directly from
-        // the tree (instead of always falling back to VLM).
-        if (node.isClickable || node.isScrollable) {
+        val clickable = runCatching { node.isClickable }.getOrDefault(false)
+        val scrollable = runCatching { node.isScrollable }.getOrDefault(false)
+        if (clickable) sb.append(" [clickable]")
+        if (scrollable) sb.append(" [scrollable]")
+        if (clickable || scrollable) {
             val rect = Rect()
-            node.getBoundsInScreen(rect)
+            runCatching { node.getBoundsInScreen(rect) }
             sb.append(" bounds=[${rect.left},${rect.top},${rect.right},${rect.bottom}]")
         }
         sb.appendLine()
-        // Iterate children without leaking node objects. getChild(i) allocates
-        // a new AccessibilityNodeInfo each call; on older Android these must
-        // be recycled to avoid native memory pressure. We collect children
-        // first so we can recycle them after recursion.
-        val children = ArrayList<AccessibilityNodeInfo>(node.childCount)
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { children.add(it) }
+        
+        // OPTIMIZATION: Adaptive child capping based on depth and interactivity
+        // shallower nodes get full treatment, deeper nodes get capped earlier
+        val childCap = if (depth < 10) 200 else if (depth < 20) 100 else 50
+        val childCount = runCatching { node.childCount }.getOrDefault(0)
+        val children = ArrayList<AccessibilityNodeInfo>(minOf(childCount, childCap))
+        for (i in 0 until childCount) {
+            if (children.size >= childCap) {
+                sb.append("$pad  ... (${childCount - childCap} more children truncated)\n")
+                break
+            }
+            runCatching { node.getChild(i) }.getOrNull()?.let { children.add(it) }
         }
         children.forEach { appendNode(sb, it, depth + 1) }
+        children.forEach { runCatching { it.recycle() } }
     }
 
     /**
-     * Dispatch a tap gesture at (x, y).
+     * Filter sensitive text from accessibility nodes.
      *
-     * Uses the GestureResultCallback overload (instead of passing null) so we
-     * can distinguish "gesture scheduled" from "gesture actually executed".
-     * Previously, dispatchGesture returned true for scheduled-but-cancelled
-     * gestures, causing the agent to think a tap landed when it didn't.
+     * Detects password fields, OTP inputs, and other security-sensitive UI
+     * elements by checking:
+     * 1. Node class name (e.g., "AppCompatEditText" with password input type)
+     * 2. View ID resource names containing "password", "pin", "otp", "secret"
+     * 3. Content description hints like "password", "confirm", "verification"
+     *
+     * Returns "[FILTERED]" for sensitive content, preserving the tree structure
+     * without exposing credentials to the agent or logs.
+     */
+    private fun filterSensitiveText(rawText: String, node: AccessibilityNodeInfo): String {
+        if (rawText.isBlank()) return rawText
+
+        try {
+            // Check if this is a password/secret input field
+            val isPasswordField = runCatching {
+                val className = node.className?.toString().orEmpty()
+                val viewId = node.viewIdResourceName.orEmpty()
+                val contentDesc = node.contentDescription?.toString().orEmpty()
+
+                // Direct password/secret indicators in view ID or content description
+                val sensitiveKeywords = listOf("password", "passwd", "pin", "otp",
+                    "secret", "credential", "auth", "token", "verification", "confirm")
+
+                val hasSensitiveId = sensitiveKeywords.any { keyword ->
+                    viewId.contains(keyword, ignoreCase = true) ||
+                    contentDesc.lowercase().contains(keyword)
+                }
+
+                // EditText with password input type
+                val isEditText = className.contains("EditText", ignoreCase = true) ||
+                    className.contains("TextInput", ignoreCase = true)
+
+                val isPasswordField = isEditText && (
+                    hasSensitiveId ||
+                    runCatching { node.isPassword }.getOrDefault(false)
+                )
+
+                isPasswordField
+            }.getOrNull() ?: false
+
+            if (isPasswordField) {
+                return "[FILTERED]"
+            }
+        } catch (_: Exception) {
+            // If we can't determine sensitivity, preserve the text
+        }
+
+        return rawText.take(80)
+    }
+
+    /**
+     * Synchronous tap — retained for BehaviorRecorder.replay() which dispatches
+     * via DeviceAction without coroutine scope. New code should prefer
+     * AccessibilityExecutor.dispatch() (suspend, with retry + stabilization).
      */
     fun tap(x: Int, y: Int): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
@@ -127,10 +220,6 @@ class OmniAccessibilityService : AccessibilityService() {
             override fun onCompleted(gesture: GestureDescription?) { success = true; latch.countDown() }
             override fun onCancelled(gesture: GestureDescription?) { success = false; latch.countDown() }
         }, handler)
-        // Wait up to 500ms for the gesture to complete — dispatchGesture is
-        // async but completes quickly (stroke duration is 60ms). Blocking the
-        // caller here is acceptable because tap() is called from the agent
-        // loop's Dispatchers.Default, not the main thread.
         latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
         return success
     }
@@ -152,44 +241,40 @@ class OmniAccessibilityService : AccessibilityService() {
         return success
     }
 
-    /**
-     * Type text into the currently focused input field.
-     *
-     * If no field is focused (common right after a tap that landed on an input
-     * but didn't explicitly request focus), search the tree for the first
-     * EditText-like node and focus it before setting text. This fixes the
-     * silent-failure case where the agent tapped a search bar, then tried to
-     * type — the tap landed but focus wasn't set, so ACTION_SET_TEXT had no
-     * target and returned false.
-     */
     fun type(text: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        // Try the focused node first.
         var focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         if (focused == null) {
-            // No focus — find the first editable node and focus it.
             focused = findFirstEditable(root)
             if (focused != null) {
                 focused.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             }
         }
         if (focused == null) {
-            Log.w(TAG, "type(\"$text\") failed: no focused input and no editable node found in tree")
+            runCatching { root.recycle() }
             return false
         }
         val args = android.os.Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        return focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        val ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        runCatching { focused.recycle() }
+        runCatching { root.recycle() }
+        return ok
     }
 
-    /** Recursively find the first node that accepts text input (EditText-like). */
-    private fun findFirstEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
+    private fun findFirstEditable(node: AccessibilityNodeInfo?, depth: Int = 0): AccessibilityNodeInfo? {
+        if (node == null || depth > 50) return null
         if (node.isEditable) return node
         for (i in 0 until node.childCount) {
-            val found = findFirstEditable(node.getChild(i))
-            if (found != null) return found
+            val child = node.getChild(i) ?: continue
+            val found = findFirstEditable(child, depth + 1)
+            if (found != null) {
+                // Recycle the child if it's not the found node.
+                if (found !== child) runCatching { child.recycle() }
+                return found
+            }
+            runCatching { child.recycle() }
         }
         return null
     }
@@ -213,19 +298,20 @@ class OmniAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Capture a screenshot as PNG bytes.
-     *
-     * Uses suspendCancellableCoroutine instead of a CountDownLatch so the
-     * calling coroutine doesn't block a Dispatchers.IO thread for up to 2s.
-     * The callback resumes the coroutine as soon as the screenshot completes
-     * or fails — no thread is parked waiting.
+     * Capture a screenshot as PNG bytes (suspend, via the a11y API).
+     * Implements [AccessibilityExecutor.OmniA11yLike].
      */
-    suspend fun screenshot(): ByteArray? = withContext(Dispatchers.IO) {
+    override suspend fun screenshot(): ByteArray? = withContext(Dispatchers.IO) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext null
         suspendCancellableCoroutine { cont ->
             takeScreenshot(DisplayId, screenshotExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
                     try {
+                        // Guard: caller may have cancelled the coroutine before
+                        // the callback fires. Resume only if still active.
+                        if (!cont.isActive) {
+                            return
+                        }
                         val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
                         if (hw != null) {
                             val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
@@ -234,33 +320,24 @@ class OmniAccessibilityService : AccessibilityService() {
                                 val out = java.io.ByteArrayOutputStream()
                                 sw.compress(Bitmap.CompressFormat.PNG, 100, out)
                                 sw.recycle()
-                                cont.resume(out.toByteArray())
+                                if (cont.isActive) cont.resume(out.toByteArray())
                                 return@onSuccess
                             }
                         }
-                        cont.resume(null)
+                        if (cont.isActive) cont.resume(null)
                     } finally {
                         screenshot.hardwareBuffer.close()
                     }
                 }
                 override fun onFailure(errorCode: Int) {
                     Log.w(TAG, "takeScreenshot failed: errorCode=$errorCode")
-                    cont.resume(null)
+                    if (cont.isActive) cont.resume(null)
                 }
             })
-            // If the coroutine is cancelled (e.g. session stopped), we can't
-            // cancel the in-flight takeScreenshot call, but we can stop waiting.
-            cont.invokeOnCancellation { /* nothing to clean up */ }
+            cont.invokeOnCancellation { /* nothing to clean up — the callback handles resources */ }
         }
     }
 
-    // Use a background single-thread executor for takeScreenshot's callback
-    // instead of posting to the main-looper handler. The callback does
-    // Bitmap.wrapHardwareBuffer + copy(ARGB_8888) + PNG compression, which
-    // takes 100-500ms for a full-screen capture. Running that on the main
-    // thread caused visible jank and ANR risk. The callback contract only
-    // requires an Executor — it does NOT require the main thread.
-    // Named screenshotExecutor so onUnbind can shut it down.
     private val screenshotExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "OmniA11yScreenshot").apply { isDaemon = true }
     }

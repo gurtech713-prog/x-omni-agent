@@ -3,6 +3,7 @@ package com.omniclaw.app.agent.learning
 import com.omniclaw.app.data.model.Lesson
 import com.omniclaw.app.data.model.ToolCall
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,8 +20,9 @@ import javax.inject.Singleton
  * On session end, [LearningEngine.reflectOnEpisode] reads the recorded steps,
  * extracts lessons, and persists them via [com.omniclaw.app.data.local.LessonDao].
  *
- * Design: the recorder is cheap to construct (just an ArrayDeque) so we don't
- * need a pool — one instance per session, held by the AgentLoop.
+ * Design: thread-safe via ConcurrentHashMap. The recorder is held by the
+ * singleton AgentLoop scope, so multiple sessions can record concurrently
+ * without corrupting each other's episodes.
  */
 @Singleton
 class EpisodeRecorder @Inject constructor() {
@@ -45,14 +47,30 @@ class EpisodeRecorder @Inject constructor() {
         var finalStatus: String = "RUNNING",
     )
 
-    private val episodes = mutableMapOf<String, Episode>()
-    private val lock = Any()
+    // ConcurrentHashMap with synchronized mutation for compound operations.
+    // Using ConcurrentHashMap avoids blocking the agent loop during reflection
+    // while still providing thread-safe access for hot-path recordAction calls.
+    private val episodes = ConcurrentHashMap<String, Episode>()
+
+    /**
+     * Hard cap on the number of concurrent in-memory episodes. Reached only
+     * if many sessions are abandoned (user kills the app mid-session) without
+     * [clear] being called. When exceeded, the oldest episode (by insertion
+     * order on the underlying LinkedHashMap semantics — we approximate by
+     * scanning keys in declaration order) is evicted to bound memory use.
+     */
+    private val maxEpisodes = 50
 
     /** Start recording a new episode for [sessionId]. */
     fun start(sessionId: String, userPrompt: String) {
-        synchronized(lock) {
-            episodes[sessionId] = Episode(sessionId, userPrompt)
+        // Evict oldest if we're at capacity before adding the new episode.
+        while (episodes.size >= maxEpisodes && !episodes.containsKey(sessionId)) {
+            val oldest = episodes.keys.firstOrNull() ?: break
+            episodes.remove(oldest)
         }
+        // putIfAbsent ensures re-starting the same session doesn't overwrite
+        // an existing episode that may already have recorded steps.
+        episodes.putIfAbsent(sessionId, Episode(sessionId, userPrompt))
     }
 
     /** Record one step. Called by AgentLoop after each action is verified. */
@@ -71,67 +89,68 @@ class EpisodeRecorder @Inject constructor() {
             !verifyOk -> Lesson.LessonOutcome.FAILURE
             else -> Lesson.LessonOutcome.SUCCESS
         }
-        synchronized(lock) {
-            val ep = episodes.getOrPut(sessionId) { Episode(sessionId, "") }
-            ep.steps.add(
-                EpisodeStep(
-                    stepIndex = stepIndex,
-                    observation = observation.take(500),  // truncate for storage
-                    screenFingerprint = fingerprint,
-                    action = action,
-                    actionSignature = actionSig,
-                    outcome = outcome,
-                    toolCallId = call.id,
-                    timestamp = System.currentTimeMillis(),
-                )
-            )
+        val ep = episodes.getOrPut(sessionId) { Episode(sessionId, "") }
+        val step = EpisodeStep(
+            stepIndex = stepIndex,
+            observation = observation.take(500),  // truncate for storage
+            screenFingerprint = fingerprint,
+            action = action,
+            actionSignature = actionSig,
+            outcome = outcome,
+            toolCallId = call.id,
+            timestamp = System.currentTimeMillis(),
+        )
+        // Synchronized on the episode itself — the map access is safe via
+        // ConcurrentHashMap, but the internal MutableList is not.
+        synchronized(ep.steps) {
+            ep.steps.add(step)
         }
     }
 
     /** Mark a loop-detected step (agent repeated the same action). */
     fun recordLoop(sessionId: String, stepIndex: Int, observation: String, action: String) {
-        synchronized(lock) {
-            val ep = episodes.getOrPut(sessionId) { Episode(sessionId, "") }
-            ep.steps.add(
-                EpisodeStep(
-                    stepIndex = stepIndex,
-                    observation = observation.take(500),
-                    screenFingerprint = fingerprint(observation),
-                    action = action,
-                    actionSignature = normalizeAction(action),
-                    outcome = Lesson.LessonOutcome.LOOP,
-                    toolCallId = null,
-                    timestamp = System.currentTimeMillis(),
-                )
-            )
+        val ep = episodes.getOrPut(sessionId) { Episode(sessionId, "") }
+        val step = EpisodeStep(
+            stepIndex = stepIndex,
+            observation = observation.take(500),
+            screenFingerprint = fingerprint(observation),
+            action = action,
+            actionSignature = normalizeAction(action),
+            outcome = Lesson.LessonOutcome.LOOP,
+            toolCallId = null,
+            timestamp = System.currentTimeMillis(),
+        )
+        synchronized(ep.steps) {
+            ep.steps.add(step)
         }
     }
 
     /** Mark the episode as completed (DONE / FAILED / STOPPED). */
     fun finish(sessionId: String, finalStatus: String) {
-        synchronized(lock) {
-            episodes[sessionId]?.let { it.finalStatus = finalStatus }
+        episodes[sessionId]?.let {
+            it.finalStatus = finalStatus
         }
     }
 
     /** Get the full episode for reflection. Returns null if no episode was recorded. */
-    fun getEpisode(sessionId: String): List<EpisodeStep>? = synchronized(lock) {
-        episodes[sessionId]?.steps?.toList()
+    fun getEpisode(sessionId: String): List<EpisodeStep>? {
+        val ep = episodes[sessionId] ?: return null
+        synchronized(ep.steps) {
+            return ep.steps.toList()
+        }
     }
 
     /** Get the user prompt that started this episode. */
-    fun getUserPrompt(sessionId: String): String? = synchronized(lock) {
+    fun getUserPrompt(sessionId: String): String? =
         episodes[sessionId]?.userPrompt
-    }
 
     /** Get the final status of the episode. */
-    fun getFinalStatus(sessionId: String): String? = synchronized(lock) {
+    fun getFinalStatus(sessionId: String): String? =
         episodes[sessionId]?.finalStatus
-    }
 
     /** Clear the episode for [sessionId] from memory after reflection is done. */
     fun clear(sessionId: String) {
-        synchronized(lock) { episodes.remove(sessionId) }
+        episodes.remove(sessionId)
     }
 
     /**

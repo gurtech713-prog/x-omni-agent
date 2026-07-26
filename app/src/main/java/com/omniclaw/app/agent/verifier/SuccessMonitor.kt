@@ -50,7 +50,7 @@ class SuccessMonitor @Inject constructor(
             return@synchronized false
         }
 
-        val snap = scheduler.snapshot()
+        val snap = scheduler.snapshotBlocking()
 
         if (snap.contains("Error launching", ignoreCase = true) ||
             snap.contains("not responding", ignoreCase = true) ||

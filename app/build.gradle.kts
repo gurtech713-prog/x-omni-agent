@@ -6,6 +6,8 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+    id("com.google.gms.google-services")
+    id("com.google.firebase.crashlytics")
 }
 
 android {
@@ -13,7 +15,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.omniclaw.app"
+        applicationId = "com.aistudio.xomniclaw.mgypws"
         minSdk = 26
         targetSdk = 36
         versionCode = 2
@@ -21,6 +23,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+    }
+
+    signingConfigs {
+        // Debug builds use AGP's auto-generated debug keystore (default behavior).
+        // Release builds read signing config from a gitignored `keystore.properties`
+        // at the project root — see the `release` block below.
     }
 
     buildTypes {
@@ -73,34 +81,10 @@ android {
     }
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
-        // LiteRT ships native libs (.so) for multiple ABIs; pick the ones we
-        // actually need and let AGP handle ABI splits if needed.
-        jniLibs { useLegacyPackaging = true }
-    }
-
-    // ---- Product flavors for LiteRT model distribution ----
-    // LiteRT models (Gemma 2B = 1.4GB) can't ship in a normal debug APK without
-    // exploding the 150MB Play Store limit. Two flavors:
-    //   - bundledModel: packages a specific .tflite into assets (large APK,
-    //     works offline immediately). Use for enterprise/forked builds.
-    //   - downloadable: fetches the model on first run via a download URL.
-    //     Small APK, requires network on first launch. Default for Play Store.
-    flavorDimensions += "modelDistribution"
-    productFlavors {
-        create("downloadable") {
-            dimension = "modelDistribution"
-            // Default flavor — no model bundled. The app fetches the .tflite
-            // from a configurable URL on first LiteRT use.
-            buildConfigField("String", "LITERT_MODEL_URL", "\"\"")
-            buildConfigField("boolean", "BUNDLED_LITERT_MODEL", "false")
-        }
-        create("bundledModel") {
-            dimension = "modelDistribution"
-            // Ships a specific .tflite in assets/models/. Set the path in
-            // gradle.properties: omniclaw.bundledModelPath=models/gemma-2b.tflite
-            buildConfigField("String", "LITERT_MODEL_URL", "\"\"")
-            buildConfigField("boolean", "BUNDLED_LITERT_MODEL", "true")
-        }
+        // LiteRT ships native libs (.so) for multiple ABIs.
+        // Modern Android (API 23+, our minSdk is 26) loads .so directly from the
+        // APK via mmap — no need for `useLegacyPackaging = true`, which would
+        // extract them to /data/app at install time and bloat install size.
     }
 
     // ---- ABI splits — halve the APK size by building per-ABI APKs ----
@@ -163,13 +147,14 @@ dependencies {
     // ---- LiteRT (on-device ML runtime, formerly TensorFlow Lite) ----
     // Pure on-device inference for the local-LLM fallback path. Models live
     // in app/src/main/assets/models/ and are loaded via LiteRtEngine.
-    //   - litert: core interpreter (CPU + NNAPI delegate)
-    //   - litert-support: Task Library helpers (tokenizer, pre/post-processing)
+    //   - litert:     core interpreter (CPU + NNAPI delegate)
     //   - litert-gpu: GPU delegate (optional — improves throughput on Adreno/Mali)
-    // Versions must be aligned across all three artifacts. 1.4.2 is the latest
-    // stable 1.x release; 2.x is alpha/beta and not production-ready.
-    implementation("com.google.ai.edge.litert:litert:1.4.2")
-    implementation("com.google.ai.edge.litert:litert-gpu:1.4.2")
+    // Both artifacts must use the SAME version. `litert-support` (Task Library)
+    // is intentionally NOT pulled in — `LocalLlmClient` implements its own
+    // `Tokenizer` interface.
+    // Versions are centralized in libs.versions.toml under `liteRt`.
+    implementation(libs.litert)
+    implementation(libs.litert.gpu)
 
     // ---- Google GenAI (Gemini) SDK ----
     // Native Gemini API client for cloud inference. Used when the user picks
@@ -178,6 +163,13 @@ dependencies {
     // Implementation-only (we wrap the REST API directly via OkHttp), so we
     // don't pull in the full google-genai client to keep the APK small.
     // The GeminiClient class implements the wire protocol itself.
+
+    // ---- Firebase Crashlytics ----
+    // Production crash reporting. Automatically captures uncaught exceptions,
+    // ANRs, and can be extended with custom non-fatal error logging.
+    implementation(platform("com.google.firebase:firebase-bom:33.16.0"))
+    implementation("com.google.firebase:firebase-crashlytics")
+    implementation("com.google.firebase:firebase-analytics")
 
     // ---- Test dependencies ----
     testImplementation("junit:junit:4.13.2")

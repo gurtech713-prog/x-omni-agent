@@ -1,5 +1,8 @@
 package com.omniclaw.app.data.session
 
+import android.util.Log
+import com.omniclaw.app.data.local.ChatMessageDao
+import com.omniclaw.app.data.local.ChatMessageEntity
 import com.omniclaw.app.data.local.SessionDao
 import com.omniclaw.app.data.local.SessionEntity
 import com.omniclaw.app.data.model.ChatMessage
@@ -13,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -34,10 +38,14 @@ interface SessionRepository {
     fun getByIdSnapshot(id: String): Session?
 
     fun create(title: String): Session
-    fun appendMessage(id: String, message: ChatMessage)
+    suspend fun appendMessage(id: String, message: ChatMessage)
     fun setStatus(id: String, status: SessionStatus)
     fun incSteps(id: String, by: Int = 1)
     fun addTokens(id: String, n: Long)
+    /** Update the session title. Used by AgentLoop to set the title from the
+     *  first user prompt, so the Sessions list shows meaningful titles instead
+     *  of "New session" for every chat. */
+    fun setTitle(id: String, title: String)
     fun stop(id: String)
     fun delete(id: String)
     fun clearAll()
@@ -45,9 +53,14 @@ interface SessionRepository {
 
 @Singleton
 class SessionRepositoryImpl @Inject constructor(
-    private val dao: SessionDao,
+    private val sessionDao: SessionDao,
+    private val chatMessageDao: ChatMessageDao,
     private val json: Json,
 ) : SessionRepository {
+
+    companion object {
+        private const val TAG = "SessionRepository"
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val msgSerializer = ListSerializer(ChatMessage.serializer())
@@ -70,14 +83,32 @@ class SessionRepositoryImpl @Inject constructor(
 
     init {
         scope.launch {
-            dao.observeAll().map { entities -> entities.map { it.toDomain() } }
-                .collect { list -> _sessions.value = list }
+            sessionDao.observeAll().collect { entities ->
+                val dbSessions = entities.map { entity ->
+                    val msgs = chatMessageDao.getBySession(entity.id).map { it.toDomain() }
+                    entity.toDomain().copy(messages = msgs)
+                }
+                _sessions.update { currentList ->
+                    dbSessions.map { dbSession ->
+                        val currentSession = currentList.firstOrNull { it.id == dbSession.id }
+                        if (currentSession != null) {
+                            val combined = (currentSession.messages + dbSession.messages).distinctBy { m -> m.id }
+                            dbSession.copy(messages = combined)
+                        } else {
+                            dbSession
+                        }
+                    }
+                }
+            }
         }
     }
 
     override suspend fun getById(id: String): Session? {
-        val entity = dao.getById(id) ?: return null
-        return entity.toDomain()
+        val cached = getByIdSnapshot(id)
+        if (cached != null && cached.messages.isNotEmpty()) return cached
+        val entity = sessionDao.getById(id) ?: return null
+        val msgs = chatMessageDao.getBySession(id).map { it.toDomain() }
+        return entity.toDomain().copy(messages = msgs)
     }
 
     override fun getByIdSnapshot(id: String): Session? =
@@ -96,8 +127,12 @@ class SessionRepositoryImpl @Inject constructor(
             messages = emptyList(),
         )
         // Immediately add to the in-memory StateFlow so getByIdSnapshot() works right after.
-        _sessions.value = _sessions.value + session
-        scope.launch { dao.upsert(session.toEntity()) }
+        // Use the atomic `update` extension (CAS loop) instead of a non-atomic
+        // read-then-write — under concurrent mutators for different session
+        // IDs the non-atomic form silently clobbered the slower write, dropping
+        // a session from the UI-visible state.
+        _sessions.update { list -> list + session }
+        scope.launch { sessionDao.upsert(session.toEntity()) }
         return session
     }
 
@@ -106,58 +141,123 @@ class SessionRepositoryImpl @Inject constructor(
      * to prevent the read-modify-write race that previously dropped messages
      * when multiple appends landed in quick succession (e.g. assistant message
      * immediately followed by tool-call message in the same step).
+     *
+     * With the new schema, messages are stored in a separate chat_messages table.
+     * The in-memory StateFlow is updated immediately for UI responsiveness,
+     * while the database write is performed asynchronously.
+     *
+     * RACE CONDITION DIAGNOSIS:
+     * - In-memory update is synchronous and atomic (_sessions.update uses CAS loop)
+     * - DB write is asynchronous and may fail silently
+     * - If app crashes between UI update and DB write, messages are lost on restart
+     * - Multiple rapid appends could have DB writes complete out of order
      */
-    override fun appendMessage(id: String, message: ChatMessage) {
-        _sessions.value = _sessions.value.map { s ->
-            if (s.id == id) s.copy(messages = s.messages + message, lastActiveAt = System.currentTimeMillis()) else s
-        }
-        scope.launch {
-            mutexFor(id).withLock {
-                val entity = dao.getById(id) ?: return@withLock
-                val msgs = deserializeMessages(entity.messagesJson) + message
-                dao.upsert(entity.copy(
-                    messagesJson = serializeMessages(msgs),
-                    lastActiveAt = System.currentTimeMillis(),
-                ))
+    override suspend fun appendMessage(id: String, message: ChatMessage) {
+        Log.d(TAG, "appendMessage START: sessionId=$id, messageId=${message.id}, role=${message.role}, timestamp=${message.timestamp}")
+        
+        // Step 1: Update in-memory StateFlow (synchronous, atomic)
+        _sessions.update { list ->
+            val session = list.firstOrNull { it.id == id }
+            if (session == null) {
+                Log.w(TAG, "appendMessage WARNING: session $id not found in memory!")
+                list
+            } else {
+                val updated = session.copy(
+                    messages = session.messages + message,
+                    lastActiveAt = System.currentTimeMillis()
+                )
+                Log.d(TAG, "appendMessage UI UPDATED: sessionId=$id, messageCount=${updated.messages.size}")
+                list.map { if (it.id == id) updated else it }
             }
+        }
+        
+        // Step 2: Update database synchronously within same critical section
+        try {
+            mutexFor(id).withLock {
+                if (sessionDao.getById(id) == null) {
+                    val memSession = getByIdSnapshot(id)
+                    if (memSession != null) {
+                        sessionDao.upsert(memSession.toEntity())
+                    }
+                }
+                val chatMessageEntity = message.toEntity(id)
+                chatMessageDao.insert(chatMessageEntity)
+                sessionDao.updateTimestamp(id, System.currentTimeMillis())
+                Log.d(TAG, "appendMessage DB WRITE COMPLETED: sessionId=$id, messageId=${message.id}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "appendMessage DB WRITE FAILED: sessionId=$id, messageId=${message.id}", e)
+            throw e  // Re-throw to let caller handle the failure
         }
     }
 
     override fun setStatus(id: String, status: SessionStatus) {
-        _sessions.value = _sessions.value.map { s ->
-            if (s.id == id) s.copy(status = status, lastActiveAt = System.currentTimeMillis()) else s
+        _sessions.update { list ->
+            list.map { s ->
+                if (s.id == id) s.copy(status = status, lastActiveAt = System.currentTimeMillis()) else s
+            }
         }
         scope.launch {
-            dao.updateStatus(id, status.name, System.currentTimeMillis())
+            sessionDao.updateStatus(id, status.name, System.currentTimeMillis())
         }
     }
 
     override fun incSteps(id: String, by: Int) {
-        _sessions.value = _sessions.value.map { s ->
-            if (s.id == id) s.copy(stepCount = s.stepCount + by) else s
+        _sessions.update { list ->
+            list.map { s ->
+                if (s.id == id) s.copy(stepCount = s.stepCount + by) else s
+            }
         }
-        scope.launch { dao.incSteps(id, by) }
+        scope.launch { sessionDao.incSteps(id, by) }
     }
 
     override fun addTokens(id: String, n: Long) {
-        _sessions.value = _sessions.value.map { s ->
-            if (s.id == id) s.copy(tokenUsage = s.tokenUsage + n) else s
+        _sessions.update { list ->
+            list.map { s ->
+                if (s.id == id) s.copy(tokenUsage = s.tokenUsage + n) else s
+            }
         }
-        scope.launch { dao.addTokens(id, n) }
+        scope.launch { sessionDao.addTokens(id, n) }
+    }
+
+    /**
+     * Update the session title. Called by [AgentLoop.start] to set the title
+     * from the first user prompt (truncated to 60 chars), so the Sessions list
+     * shows meaningful titles like "Open Reddit and search budget..." instead
+     * of "New session" for every chat.
+     *
+     * CHAT-9 FIX: previously there was no setTitle — every session created by
+     * ChatViewModel.newSession() kept the "New session" placeholder title
+     * forever, making the Sessions list unusable for finding past conversations.
+     */
+    override fun setTitle(id: String, title: String) {
+        val truncated = title.trim().take(80).ifBlank { "Untitled session" }
+        _sessions.update { list ->
+            list.map { s ->
+                if (s.id == id) s.copy(title = truncated, lastActiveAt = System.currentTimeMillis()) else s
+            }
+        }
+        scope.launch { sessionDao.updateTitle(id, truncated, System.currentTimeMillis()) }
     }
 
     override fun stop(id: String) = setStatus(id, SessionStatus.STOPPED)
 
     override fun delete(id: String) {
         sessionMutexes.remove(id)
-        _sessions.value = _sessions.value.filter { it.id != id }
-        scope.launch { dao.delete(id) }
+        _sessions.update { list -> list.filter { it.id != id } }
+        scope.launch {
+            sessionDao.delete(id)
+            chatMessageDao.deleteBySession(id)
+        }
     }
 
     override fun clearAll() {
         sessionMutexes.clear()
-        _sessions.value = emptyList()
-        scope.launch { dao.clearAll() }
+        _sessions.update { emptyList() }
+        scope.launch {
+            sessionDao.clearAll()
+            chatMessageDao.clearAll()
+        }
     }
 
     private fun serializeMessages(msgs: List<ChatMessage>): String =
@@ -175,7 +275,7 @@ class SessionRepositoryImpl @Inject constructor(
         status = runCatching { SessionStatus.valueOf(status) }.getOrDefault(SessionStatus.IDLE),
         stepCount = stepCount,
         tokenUsage = tokenUsage,
-        messages = deserializeMessages(messagesJson),
+        messages = deserializeMessages(messagesJson.orEmpty()),
     )
 
     private fun Session.toEntity(): SessionEntity = SessionEntity(
@@ -186,6 +286,23 @@ class SessionRepositoryImpl @Inject constructor(
         status = status.name,
         stepCount = stepCount,
         tokenUsage = tokenUsage,
-        messagesJson = serializeMessages(messages),
+        messagesJson = null, // No longer storing messages in session entity
+    )
+
+    private fun ChatMessage.toEntity(sessionId: String): ChatMessageEntity = ChatMessageEntity(
+        id = id,
+        sessionId = sessionId,
+        role = role.name,
+        content = content,
+        timestamp = timestamp,
+        toolCallId = toolCalls?.firstOrNull()?.id,
+    )
+
+    private fun ChatMessageEntity.toDomain(): ChatMessage = ChatMessage(
+        id = id,
+        role = runCatching { ChatMessage.Role.valueOf(role) }.getOrDefault(ChatMessage.Role.SYSTEM),
+        content = content,
+        timestamp = timestamp,
+        toolCallId = toolCallId,
     )
 }

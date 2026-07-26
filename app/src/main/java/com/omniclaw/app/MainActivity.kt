@@ -14,13 +14,17 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -29,6 +33,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,6 +56,9 @@ import com.omniclaw.app.service.ScreenCaptureService
 import com.omniclaw.app.ui.settings.SettingsViewModel
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+import android.util.Log
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -69,29 +77,47 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        WindowCompat.setDecorFitsSystemWindows(window, false)
+        try {
+            enableEdgeToEdge()
+            WindowCompat.setDecorFitsSystemWindows(window, false)
 
-        onScreenCaptureRequested = {
-            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
-        }
-        ScreenCaptureRequestHolder.activity = this
+            onScreenCaptureRequested = {
+                val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
+            }
+            ScreenCaptureRequestHolder.activity = this
 
-        setContent {
-            // Read the user's dark-mode preference so the Settings → Dark mode
-            // toggle actually takes effect. On first launch (before the user
-            // has toggled anything), fall back to the system theme so the app
-            // respects the device's dark-mode setting out of the box.
-            val settingsVm: SettingsViewModel = hiltViewModel()
-            val ui by settingsVm.uiPrefs.collectAsStateWithLifecycle()
-            OmniTheme(darkTheme = ui.darkMode) {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    SplashScreen { showSplash ->
-                        if (!showSplash) OmniApp()
+            setContent {
+                val settingsVm: SettingsViewModel = hiltViewModel()
+                val ui by settingsVm.uiPrefs.collectAsStateWithLifecycle()
+                val privacyAccepted by settingsVm.privacyAccepted.collectAsStateWithLifecycle()
+                OmniTheme(darkTheme = ui.darkMode) {
+                    Surface(modifier = Modifier.fillMaxSize()) {
+                        when (privacyAccepted) {
+                            null -> {
+                                // Loading preferences from disk — render theme background to prevent screen flash
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.background)
+                                )
+                            }
+                            false -> {
+                                PrivacyDisclosureScreen {
+                                    // User accepted
+                                }
+                            }
+                            true -> {
+                                SplashScreen { showSplash ->
+                                    if (!showSplash) OmniApp()
+                                }
+                            }
+                        }
                     }
                 }
             }
+        } catch (e: Throwable) {
+            Log.e("MainActivity", "Error in onCreate", e)
         }
     }
 
@@ -104,6 +130,63 @@ class MainActivity : ComponentActivity() {
 
     fun requestScreenCapture() {
         onScreenCaptureRequested?.invoke()
+    }
+}
+
+/**
+ * Privacy disclosure screen — shown on first launch before the main app.
+ *
+ * Explains that cloud LLM calls send prompts and agent decisions to external
+ * servers. Local/on-device models (LiteRT) do NOT send data externally.
+ * The user must accept before proceeding.
+ */
+@Composable
+private fun PrivacyDisclosureScreen(onAccept: () -> Unit) {
+    val ctx = LocalContext.current
+    val vm: SettingsViewModel = hiltViewModel()
+    val scope = rememberCoroutineScope()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = "Privacy Notice",
+            fontFamily = OmniMono,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = """
+                This app connects to cloud LLM providers (OpenAI, Gemini, OpenRouter, etc.).
+                
+                When enabled, your prompts and the agent's reasoning steps are sent to those servers for processing.
+                
+                Local/on-device models (LiteRT) do NOT send data externally.
+                
+                Do you accept?
+            """.trimIndent(),
+            fontFamily = OmniMono,
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(32.dp))
+        Button(
+            onClick = {
+                scope.launch {
+                    vm.acceptPrivacy()
+                    onAccept()
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("I Understand — Accept")
+        }
     }
 }
 

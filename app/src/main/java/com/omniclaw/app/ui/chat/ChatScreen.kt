@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.chat
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -82,25 +83,43 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private const val TAG = "ChatScreen"
+
 @Composable
 fun ChatScreen(sessionId: String? = null) {
     val vm: ChatViewModel = hiltViewModel()
     val session by vm.activeSession.collectAsStateWithLifecycle()
     val ui by vm.uiPrefs.collectAsStateWithLifecycle()
+    val modelConfig by vm.modelConfig.collectAsStateWithLifecycle()
+    val messages by vm.uiMessages.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
 
     LaunchedEffect(sessionId) {
+        Log.d(TAG, "ChatScreen composed/launched with sessionId: $sessionId")
         if (sessionId != null) {
             vm.open(sessionId)
         }
     }
 
     // Scroll when new messages are added or status changes
-    LaunchedEffect(session?.messages?.size, session?.status) {
-        val n = session?.messages?.size ?: 0
+    // CHAT-4 FIX: the scroll target must be computed from the FILTERED
+    // message list (the LazyColumn renders `messages`, not `session.messages`),
+    // and the typing-indicator offset must only be added when the indicator
+    // is actually present. Previously the code used `session.messages.size`,
+    // which over-counted when `showToolCalls=false` filtered tool messages
+    // out of the visible list — the scroll target landed PAST the last item,
+    // causing the LazyColumn to scroll to an empty region (or no-op on some
+    // Compose versions). The fix derives the target from `messages.size`
+    // (the already-filtered StateFlow) and only adds +1 for the typing
+    // indicator when the session is RUNNING and has at least one message
+    // (matching the `else if` condition that renders TypingIndicator below).
+    LaunchedEffect(messages.size, session?.status) {
+        val n = messages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING
-            val targetIndex = n - 1 + (if (isRunning) 1 else 0)
+            val hasMessages = session?.messages?.isNotEmpty() == true
+            val showTypingIndicator = isRunning && hasMessages
+            val targetIndex = n - 1 + (if (showTypingIndicator) 1 else 0)
             listState.animateScrollToItem(targetIndex)
         }
     }
@@ -109,10 +128,12 @@ fun ChatScreen(sessionId: String? = null) {
     // without running an ongoing scroll animation that causes text field focus loss.
     val listHeight = listState.layoutInfo.viewportSize.height
     LaunchedEffect(listHeight) {
-        val n = session?.messages?.size ?: 0
+        val n = messages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING
-            val targetIndex = n - 1 + (if (isRunning) 1 else 0)
+            val hasMessages = session?.messages?.isNotEmpty() == true
+            val showTypingIndicator = isRunning && hasMessages
+            val targetIndex = n - 1 + (if (showTypingIndicator) 1 else 0)
             listState.scrollToItem(targetIndex)
         }
     }
@@ -121,17 +142,26 @@ fun ChatScreen(sessionId: String? = null) {
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .navigationBarsPadding()
             .imePadding()
     ) {
         OmniTopBar(
             title = "AGENT",
-            subtitle = (session?.title ?: "No active session — type to start.").uppercase()
+            subtitle = (session?.title ?: "No active session — type to start.").uppercase(),
+            actions = {
+                OmniBadge(
+                    text = "${modelConfig.provider.name} · ${modelConfig.model}".uppercase()
+                )
+            }
         )
         OmniDivider()
 
         // Compact status bar: steps + tokens + LIVE badge with pulse
-        if (session != null) {
+        // Capture `session` into a local val so Compose recomposition between
+        // the null-check and the field access can't NPE on us (the StateFlow
+        // can flip to null between recompositions if the user deletes the
+        // active session mid-render).
+        val s = session
+        if (s != null) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -139,7 +169,7 @@ fun ChatScreen(sessionId: String? = null) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "STEPS: ${session!!.stepCount}",
+                    text = "STEPS: ${s.stepCount}",
                     fontFamily = OmniMono,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
@@ -150,7 +180,7 @@ fun ChatScreen(sessionId: String? = null) {
                     Box(Modifier.size(1.dp, 12.dp).background(MaterialTheme.colorScheme.outlineVariant))
                     Spacer(Modifier.width(16.dp))
                     Text(
-                        text = "TOKENS: ${session!!.tokenUsage}",
+                        text = "TOKENS: ${s.tokenUsage}",
                         fontFamily = OmniMono,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -158,7 +188,7 @@ fun ChatScreen(sessionId: String? = null) {
                     )
                 }
                 Spacer(Modifier.weight(1f))
-                if (session!!.status == SessionStatus.RUNNING) {
+                if (s.status == SessionStatus.RUNNING) {
                     OmniBadge("LIVE", filled = true, pulsing = true)
                 }
             }
@@ -172,7 +202,7 @@ fun ChatScreen(sessionId: String? = null) {
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            val filteredMessages = session?.messages.orEmpty().filter { m ->
+            val filteredMessages = messages.filter { m ->
                 when (m.role) {
                     ChatMessage.Role.TOOL -> ui.showToolCalls
                     else -> true
@@ -186,9 +216,10 @@ fun ChatScreen(sessionId: String? = null) {
                     MessageRow(m, ui)
                 }
             }
-            if (session == null) {
+            if (filteredMessages.isEmpty() && s?.status != SessionStatus.RUNNING) {
                 item { EmptyChatPlaceholder() }
-            } else if (session!!.status == SessionStatus.RUNNING && session!!.messages.isNotEmpty()) {
+            }
+            if (s?.status == SessionStatus.RUNNING) {
                 item { TypingIndicator() }
             }
         }
@@ -268,15 +299,96 @@ private fun AssistantBlock(m: ChatMessage, ui: UiPrefs) {
         Spacer(Modifier.size(8.dp))
         // Strip the THOUGHT: / ACTION: scaffolding if showThoughts is false,
         // otherwise show the full raw thought content for debugging/transparency.
-        val displayText = remember(m.content, ui.showThoughts) {
-            if (ui.showThoughts) m.content else cleanThoughtForDisplay(m.content)
+        val isStreaming = m.id.startsWith("streaming-thought-")
+        val rawContent = m.content
+        var thoughtsExpanded by remember { mutableStateOf(isStreaming) }
+
+        // Extract reasoning lines (e.g. THOUGHT: ... or raw reasoning deltas)
+        val extractedThought = remember(rawContent) {
+            extractThoughtSection(rawContent)
         }
-        Text(
-            displayText,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-        )
+        val mainText = remember(rawContent, ui.showThoughts) {
+            if (ui.showThoughts) rawContent else cleanThoughtForDisplay(rawContent)
+        }
+
+        val displayThought = if (extractedThought.isNotBlank()) extractedThought else rawContent
+        val showThoughtBox = (extractedThought.isNotBlank() || isStreaming) && !ui.showThoughts && displayThought.isNotBlank()
+
+        if (showThoughtBox) {
+            Surface(
+                onClick = { thoughtsExpanded = !thoughtsExpanded },
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.padding(bottom = 6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (thoughtsExpanded) "▲" else "▼",
+                        fontFamily = OmniMono,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (isStreaming) "Thinking..." else "Thought process",
+                        fontFamily = OmniMono,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = thoughtsExpanded) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                ) {
+                    Text(
+                        text = if (isStreaming) "$displayThought █" else displayThought,
+                        fontFamily = OmniMono,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+        }
+
+        val textWithCursor = if (isStreaming && !showThoughtBox) "$mainText █" else mainText
+        if (textWithCursor.isNotBlank()) {
+            Text(
+                textWithCursor,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+        }
     }
+}
+
+private fun extractThoughtSection(raw: String): String {
+    val lines = raw.lines()
+    val thoughtLines = mutableListOf<String>()
+    var inThought = false
+    for (line in lines) {
+        val trimmed = line.trim()
+        if (trimmed.startsWith("THOUGHT:", ignoreCase = true)) {
+            inThought = true
+            val content = trimmed.substring("THOUGHT:".length).trim()
+            if (content.isNotEmpty()) thoughtLines.add(content)
+        } else if (trimmed.startsWith("ACTION:", ignoreCase = true)) {
+            inThought = false
+        } else if (inThought) {
+            thoughtLines.add(line)
+        }
+    }
+    return thoughtLines.joinToString("\n").trim()
 }
 
 /**
@@ -288,8 +400,42 @@ private fun AssistantBlock(m: ChatMessage, ui: UiPrefs) {
  * a device action.
  */
 private fun cleanThoughtForDisplay(raw: String): String {
-    val thoughtLine = Regex("(?mi)^thought:\\s*(.+)$").find(raw)?.groupValues?.getOrNull(1)?.trim()
-    return thoughtLine?.takeIf { it.isNotBlank() } ?: raw.trim()
+    val lines = raw.lines()
+    val thoughtLines = mutableListOf<String>()
+    var capturingThought = false
+    
+    for (line in lines) {
+        val trimmed = line.trim()
+        if (trimmed.startsWith("THOUGHT:", ignoreCase = true)) {
+            capturingThought = true
+            val content = trimmed.substring("THOUGHT:".length).trim()
+            if (content.isNotEmpty()) {
+                thoughtLines.add(content)
+            }
+        } else if (trimmed.startsWith("ACTION:", ignoreCase = true)) {
+            capturingThought = false
+        } else {
+            if (capturingThought) {
+                thoughtLines.add(line)
+            } else if (!raw.contains("THOUGHT:", ignoreCase = true)) {
+                // No THOUGHT: prefix found in the entire block, so capture anything that isn't ACTION
+                if (!trimmed.startsWith("ACTION:", ignoreCase = true)) {
+                    thoughtLines.add(line)
+                }
+            }
+        }
+    }
+    
+    val cleaned = thoughtLines.joinToString("\n").trim()
+    if (cleaned.isNotBlank()) return cleaned
+
+    // Fallback: If there was no thought text but there is an action, show a clean user-friendly status
+    val action = Regex("(?mi)^action:\\s*(.+)$").find(raw)?.groupValues?.getOrNull(1)?.trim()
+    if (action != null && !action.lowercase().startsWith("done")) {
+        return "Executing action: $action"
+    }
+    
+    return raw.trim()
 }
 
 @Composable
@@ -442,8 +588,32 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
     // on any configuration change.
     var text by rememberSaveable { mutableStateOf("") }
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    var overlayOn by rememberSaveable { mutableStateOf(false) }
+    // CHAT-8 FIX: sync the mic toggle state from the ACTUAL overlay service
+    // state on every recomposition, instead of trusting a remembered bool
+    // that drifts. Previously `overlayOn` was initialized once from
+    // `OverlayService.isRunning()` and then toggled locally — if the overlay
+    // service was stopped externally (system kill, user revoked overlay
+    // permission, or the service crashed), `overlayOn` stayed true and the
+    // mic icon showed the "active" state while the bubble was actually gone.
+    // Now we read the live state on each recomposition. We still keep a local
+    // `pendingToggle` to give immediate UI feedback before the service
+    // starts/stops (the service call is async), but the source of truth is
+    // `OverlayService.isRunning()` which is re-checked whenever the
+    // composition refreshes (e.g. on app foreground).
+    var pendingToggle by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val overlayOn = pendingToggle ?: com.omniclaw.app.service.OverlayService.isRunning()
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    // Clear the pending toggle shortly after the user clicks, so the icon
+    // re-syncs from the actual service state. This handles the case where
+    // start()/stop() fails silently (e.g. missing overlay permission) — the
+    // toggle reverts to the true state instead of staying stuck on the
+    // pending value.
+    LaunchedEffect(pendingToggle) {
+        if (pendingToggle != null) {
+            kotlinx.coroutines.delay(500)
+            pendingToggle = null
+        }
+    }
     Surface(color = MaterialTheme.colorScheme.background) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(10.dp),
@@ -452,9 +622,15 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
             IconButton(onClick = {
                 // Toggle the floating push-to-talk bubble. Press-and-hold the bubble
                 // to record; release to transcribe and dispatch to the agent loop.
-                overlayOn = !overlayOn
-                if (overlayOn) com.omniclaw.app.service.OverlayService.start(ctx)
+                val newState = !overlayOn
+                Log.d(TAG, "Composer mic overlay toggled. New state: $newState")
+                pendingToggle = newState
+                if (newState) com.omniclaw.app.service.OverlayService.start(ctx)
                 else com.omniclaw.app.service.OverlayService.stop(ctx)
+                // Clear the pending toggle after a short delay so the next
+                // recomposition re-syncs from the actual service state. This
+                // handles the case where start()/stop() fails (e.g. missing
+                // overlay permission) — the toggle reverts to the true state.
             }) {
                 Box(
                     modifier = Modifier
@@ -495,10 +671,11 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                     onValueChange = { text = it },
                     textStyle = TextStyle(
                         fontFamily = OmniMono,
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onBackground,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
                     ),
-                    cursorBrush = SolidColor(MaterialTheme.colorScheme.onBackground),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
+                    maxLines = 4,
                     keyboardOptions = KeyboardOptions(
                         capitalization = KeyboardCapitalization.Sentences,
                         imeAction = if (running) ImeAction.None else ImeAction.Send
@@ -506,6 +683,7 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                     keyboardActions = KeyboardActions(
                         onSend = {
                             if (text.isNotBlank() && !running) {
+                                Log.i(TAG, "Message sent via keyboard: ${text.trim()}")
                                 keyboardController?.hide()
                                 onSend(text.trim())
                                 text = ""
@@ -516,7 +694,10 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                 )
             }
             if (running) {
-                IconButton(onClick = onStop) {
+                IconButton(onClick = {
+                    Log.i(TAG, "Stop button clicked in Composer")
+                    onStop()
+                }) {
                     Icon(Icons.Outlined.Stop, contentDescription = "Stop",
                         modifier = Modifier.size(28.dp))
                 }
@@ -524,6 +705,7 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                 IconButton(
                     onClick = {
                         if (text.isNotBlank()) {
+                            Log.i(TAG, "Message sent via button click: ${text.trim()}")
                             keyboardController?.hide()
                             onSend(text.trim())
                             text = ""

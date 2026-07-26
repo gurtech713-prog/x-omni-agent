@@ -1,7 +1,7 @@
 package com.omniclaw.app.ui.settings
 
 import android.content.Context
-import android.os.Environment
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omniclaw.app.data.prefs.ChannelConfig
@@ -13,8 +13,10 @@ import com.omniclaw.app.gateway.ChannelSender
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -30,9 +32,10 @@ import javax.inject.Inject
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
-    @ApplicationContext private val ctx: Context,
+    @param:ApplicationContext private val ctx: Context,
     private val repo: SettingsRepository,
     private val channels: ChannelSender,
+    private val secureStorage: com.omniclaw.app.data.prefs.SecureStorage,
 ) : ViewModel() {
 
     val modelConfig: StateFlow<ModelConfig> = repo.modelConfig
@@ -47,22 +50,127 @@ class SettingsViewModel @Inject constructor(
     val permissions: StateFlow<PermissionsState> = repo.permissions
         .stateIn(viewModelScope, SharingStarted.Eagerly, PermissionsState())
 
-    suspend fun setModel(cfg: ModelConfig) = repo.setModelConfig(cfg)
-    suspend fun setChannel(cfg: ChannelConfig) = repo.setChannelConfig(cfg)
-    suspend fun setUi(prefs: UiPrefs) = repo.setUiPrefs(prefs)
-    suspend fun setPermissions(state: PermissionsState) = repo.setPermissions(state)
+    val privacyAccepted: StateFlow<Boolean?> = repo.privacyAccepted
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    val storageState: StateFlow<com.omniclaw.app.data.prefs.SecureStorage.StorageState> =
+        MutableStateFlow(secureStorage.state).asStateFlow()
+
+    suspend fun setModel(cfg: ModelConfig) {
+        Log.i(TAG, "Updating model config: $cfg")
+        repo.setModelConfig(cfg)
+    }
+    
+    suspend fun changeProvider(provider: com.omniclaw.app.data.prefs.LlmProvider, baseUrl: String, model: String) {
+        Log.i(TAG, "Changing provider: provider=$provider, baseUrl=$baseUrl, model=$model")
+        val current = repo.modelConfig.first()
+        val newKey = repo.getApiKeyForProvider(provider, baseUrl)
+        repo.setModelConfig(current.copy(
+            provider = provider,
+            baseUrl = baseUrl,
+            model = model,
+            apiKey = newKey
+        ))
+    }
+    suspend fun setChannel(cfg: ChannelConfig) {
+        Log.i(TAG, "Updating channel config: $cfg")
+        repo.setChannelConfig(cfg)
+    }
+    suspend fun setUi(prefs: UiPrefs) {
+        Log.d(TAG, "Updating UI preferences: $prefs")
+        repo.setUiPrefs(prefs)
+    }
+    suspend fun setPermissions(state: PermissionsState) {
+        Log.d(TAG, "Updating permissions state: $state")
+        repo.setPermissions(state)
+    }
+
+    /** Mark the cloud LLM privacy disclosure as accepted. */
+    suspend fun acceptPrivacy() {
+        Log.i(TAG, "User accepted cloud LLM privacy disclosure")
+        repo.acceptPrivacyDisclosure()
+    }
 
     /** Test-send a message to all configured channels. Returns true if at least one send succeeded. */
     suspend fun testChannels(message: String): Boolean {
-        val feishuOk = channels.sendToFeishu(message)
-        val discordOk = channels.sendToDiscord(message)
-        return feishuOk || discordOk
+        Log.i(TAG, "Testing notification channels with message: $message")
+        return channels.sendToDiscord(message)
+    }
+
+    /** Rotate an API key's metadata. Returns success status and message. */
+    suspend fun rotateApiKey(keyName: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        when (keyName) {
+            "agent" -> {
+                val version = secureStorage.rotateKey(com.omniclaw.app.data.prefs.SecureStorage.KEY_AGENT_API_KEY)
+                if (version != null) {
+                    Log.i(TAG, "Agent API key rotated to $version")
+                    Pair(true, "Agent API key rotated successfully")
+                } else {
+                    Pair(false, "Failed to rotate agent API key")
+                }
+            }
+            "gemini" -> {
+                val version = secureStorage.rotateKey(com.omniclaw.app.data.prefs.SecureStorage.KEY_GEMINI_API_KEY)
+                if (version != null) {
+                    Log.i(TAG, "Gemini API key rotated to $version")
+                    Pair(true, "Gemini API key rotated successfully")
+                } else {
+                    Pair(false, "Failed to rotate Gemini API key")
+                }
+            }
+            "stt" -> {
+                val version = secureStorage.rotateKey(com.omniclaw.app.data.prefs.SecureStorage.KEY_STT_API_KEY)
+                if (version != null) {
+                    Log.i(TAG, "STT API key rotated to $version")
+                    Pair(true, "STT API key rotated successfully")
+                } else {
+                    Pair(false, "Failed to rotate STT API key")
+                }
+            }
+            "vlm" -> {
+                val version = secureStorage.rotateKey(com.omniclaw.app.data.prefs.SecureStorage.KEY_VLM_API_KEY)
+                if (version != null) {
+                    Log.i(TAG, "VLM API key rotated to $version")
+                    Pair(true, "VLM API key rotated successfully")
+                } else {
+                    Pair(false, "Failed to rotate VLM API key")
+                }
+            }
+            else -> Pair(false, "Unknown key: $keyName")
+        }
+    }
+
+    /** Get last rotation time for a key, or null if never rotated. */
+    fun getLastRotationTime(keyName: String): Long? = when (keyName) {
+        "agent" -> secureStorage.getLastRotationTime(com.omniclaw.app.data.prefs.SecureStorage.KEY_AGENT_API_KEY)
+        "gemini" -> secureStorage.getLastRotationTime(com.omniclaw.app.data.prefs.SecureStorage.KEY_GEMINI_API_KEY)
+        "stt" -> secureStorage.getLastRotationTime(com.omniclaw.app.data.prefs.SecureStorage.KEY_STT_API_KEY)
+        "vlm" -> secureStorage.getLastRotationTime(com.omniclaw.app.data.prefs.SecureStorage.KEY_VLM_API_KEY)
+        else -> null
+    }
+
+    /** Check if a key needs rotation based on 90-day default. */
+    fun needsRotation(keyName: String): Boolean = when (keyName) {
+        "agent" -> secureStorage.needsRotation(com.omniclaw.app.data.prefs.SecureStorage.KEY_AGENT_API_KEY)
+        "gemini" -> secureStorage.needsRotation(com.omniclaw.app.data.prefs.SecureStorage.KEY_GEMINI_API_KEY)
+        "stt" -> secureStorage.needsRotation(com.omniclaw.app.data.prefs.SecureStorage.KEY_STT_API_KEY)
+        "vlm" -> secureStorage.needsRotation(com.omniclaw.app.data.prefs.SecureStorage.KEY_VLM_API_KEY)
+        else -> false
     }
 
     /**
      * Export the full config (model + channels + UI prefs) to
-     * /sdcard/.xomniclaw/xomniclaw.json — mirrors the original X-OmniClaw
-     * config-file location for backup, migration, and debugging.
+     * `getExternalFilesDir(null)/.xomniclaw/xomniclaw.json` — app-specific
+     * external storage that requires no runtime permission and survives app
+     * uninstall until the user manually clears it.
+     *
+     * Previously this wrote to `Environment.getExternalStorageDirectory()`
+     * (the public `/sdcard`), which is:
+     *   - Deprecated since API 29 (throws on targetSdk 30+ without MANAGE_EXTERNAL_STORAGE)
+     *   - A privacy concern (any app with READ_EXTERNAL_STORAGE could read the
+     *     masked-but-still-sensitive config file)
+     * App-specific external storage is the correct location per Android docs:
+     * https://developer.android.com/training/data-storage/app-specific
      */
     suspend fun exportConfig(): File? = withContext(Dispatchers.IO) {
         val m = repo.modelConfig.first()
@@ -104,22 +212,34 @@ class SettingsViewModel @Inject constructor(
                 put("showTokens", u.showTokens)
             }
         }
-        val dir = File(Environment.getExternalStorageDirectory(), ".xomniclaw")
-        dir.mkdirs()
+        // App-specific external storage — no permission required, scoped to
+        // this app, removed on uninstall.
+        val baseDir = ctx.getExternalFilesDir(null)
+            ?: File(ctx.filesDir, "external").apply { mkdirs() }
+        val dir = File(baseDir, ".xomniclaw").apply { mkdirs() }
         val file = File(dir, "xomniclaw.json")
         runCatching {
             file.writeText(json.toString())
+            Log.i(TAG, "Config successfully exported to ${file.absolutePath}")
             file
+        }.onFailure {
+            Log.e(TAG, "Failed to export config: ${it.message}", it)
         }.getOrNull()
     }
 
-    /** Import config from /sdcard/.xomniclaw/xomniclaw.json (best-effort). */
+    companion object {
+        private const val TAG = "SettingsViewModel"
+        private val jsonParser = Json { ignoreUnknownKeys = true }
+    }
+
+    /** Import config from `getExternalFilesDir(null)/.xomniclaw/xomniclaw.json` (best-effort). */
     suspend fun importConfig(): Boolean = withContext(Dispatchers.IO) {
-        val file = File(Environment.getExternalStorageDirectory(), ".xomniclaw/xomniclaw.json")
+        val baseDir = ctx.getExternalFilesDir(null) ?: File(ctx.filesDir, "external")
+        val file = File(baseDir, ".xomniclaw/xomniclaw.json")
         if (!file.exists()) return@withContext false
         runCatching {
             val text = file.readText()
-            val root = Json { ignoreUnknownKeys = true }.parseToJsonElement(text).jsonObject
+            val root = jsonParser.parseToJsonElement(text).jsonObject
             // Restore model config (agent + STT + VLM).
             // Secrets are masked on export — skip any value containing '*' so we
             // don't overwrite the user's real key with the masked placeholder.
@@ -173,7 +293,10 @@ class SettingsViewModel @Inject constructor(
                     )
                 )
             }
+            Log.i(TAG, "Config successfully imported from ${file.absolutePath}")
             true
+        }.onFailure {
+            Log.e(TAG, "Failed to import config: ${it.message}", it)
         }.getOrDefault(false)
     }
 }

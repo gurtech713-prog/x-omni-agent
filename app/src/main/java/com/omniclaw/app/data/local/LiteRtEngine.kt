@@ -2,6 +2,7 @@ package com.omniclaw.app.data.local
 
 import android.content.Context
 import android.util.Log
+import com.omniclaw.app.litert.InferenceScheduler
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -19,52 +20,24 @@ import javax.inject.Singleton
 /**
  * LiteRT (formerly TensorFlow Lite) on-device inference engine.
  *
- * Powers the local-LLM fallback path: when the user picks a "local-*" model
- * (e.g. a Gemma / TinyLlama .tflite flatbuffer), this engine loads it onto
- * the device and runs inference without any network call.
+ * This class is a **facade** over the [InferenceScheduler] production pipeline.
+ * The single-input float/int paths ([runFloatSingle] / [runIntSingle]) delegate
+ * to the scheduler; the multi-input [run] + [inputShape] / [outputShape] +
+ * [unload] / [unloadAll] paths use a small in-house cache (they exercise APIs
+ * the scheduler doesn't yet expose). Both paths share the [DelegateManager]
+ * fallback policy (GPU → NNAPI → CPU) via the scheduler.
  *
- * Design:
- *   - One [Interpreter] per loaded model file; cached by file path.
- *   - Inference is serialized per-engine via a Mutex — the LiteRT interpreter
- *     is not thread-safe, and concurrent run() calls corrupt the I/O buffers.
- *   - NNAPI delegate is preferred (Android 8.1+); GPU delegate is opt-in.
- *   - Models in /assets are extracted to filesDir on first load (LiteRT
- *     requires a seekable File — AssetManager fds break mmap on some devices).
- *
- * Uses the stable `org.tensorflow.lite.Interpreter` API (LiteRT 1.x). The
- * newer `com.google.ai.edge.litert.Model` API is 2.x-alpha and not
- * production-ready.
+ * Uses the stable `org.tensorflow.lite.Interpreter` API (LiteRT 1.x).
  */
 @Singleton
 class LiteRtEngine @Inject constructor(
     @ApplicationContext private val ctx: Context,
+    private val scheduler: InferenceScheduler,
 ) {
-
-    /** A loaded model + its interpreter + optional delegates. */
-    private class LoadedModel(
-        val modelFile: File,
-        val interpreter: Interpreter,
-        val gpuDelegate: GpuDelegate?,
-        val nnApiDelegate: NnApiDelegate?,
-    ) {
-        val mutex = Mutex()
-    }
-
-    private val cache = mutableMapOf<String, LoadedModel>()
-    private val cacheMutex = Mutex()
 
     /**
      * Run inference on a model with a single float[] input → single float[] output.
-     *
-     * The caller must know the model's input/output tensor shapes and size the
-     * arrays accordingly. The output array is allocated by the caller and
-     * filled by the interpreter.
-     *
-     * @param modelPath  Absolute path, "assets://path", or bare filename under "models/"
-     * @param input      Pre-sized float array matching the input tensor
-     * @param outputSize Expected output array size
-     * @param useGpu     Enable GPU delegate (opt-in; some int8 models fail GPU)
-     * @param useNnapi   Enable NNAPI delegate (default true; safe cross-vendor)
+     * Delegates to [InferenceScheduler.runFloatSingle].
      */
     suspend fun runFloatSingle(
         modelPath: String,
@@ -72,32 +45,11 @@ class LiteRtEngine @Inject constructor(
         outputSize: Int,
         useGpu: Boolean = false,
         useNnapi: Boolean = true,
-    ): FloatArray = withContext(Dispatchers.IO) {
-        val loaded = getOrLoad(modelPath, useGpu, useNnapi)
-        loaded.mutex.withLock {
-            val output = FloatArray(outputSize)
-            // Interpreter.run takes (input, output) where both are arrays or
-            // multi-dimensional arrays matching the tensor shapes. For a 1-D
-            // float input/output, pass the arrays directly.
-            loaded.interpreter.run(input, output)
-            output
-        }
-    }
+    ): FloatArray = scheduler.runFloatSingle(modelPath, input, outputSize, useGpu, useNnapi)
 
     /**
      * Run inference on a model with a single int[] input → single float[] output.
-     *
-     * This is the correct entry point for causal-LM token-ID inputs: TFLite LLM
-     * models declare their input tensor as int32 (token IDs), NOT float.
-     * Passing a FloatArray to an int32 input tensor throws
-     * IllegalArgumentException at interpreter.run(). Use this method for any
-     * model whose input tensor dtype is int32.
-     *
-     * @param modelPath  Absolute path, "assets://path", or bare filename under "models/"
-     * @param input      Pre-sized int array (token IDs) matching the input tensor
-     * @param outputSize Expected output array size (vocab size for an LM head)
-     * @param useGpu     Enable GPU delegate (opt-in; some int8 models fail GPU)
-     * @param useNnapi   Enable NNAPI delegate (default true; safe cross-vendor)
+     * Delegates to [InferenceScheduler.runIntSingle].
      */
     suspend fun runIntSingle(
         modelPath: String,
@@ -105,19 +57,14 @@ class LiteRtEngine @Inject constructor(
         outputSize: Int,
         useGpu: Boolean = false,
         useNnapi: Boolean = true,
-    ): FloatArray = withContext(Dispatchers.IO) {
-        val loaded = getOrLoad(modelPath, useGpu, useNnapi)
-        loaded.mutex.withLock {
-            val output = FloatArray(outputSize)
-            loaded.interpreter.run(input, output)
-            output
-        }
-    }
+    ): FloatArray = scheduler.runIntSingle(modelPath, input, outputSize, useGpu, useNnapi)
 
     /**
-     * Run inference with arbitrary input/output. The caller provides a map of
-     * input-index → array and a map of output-index → array; both are passed
-     * directly to the interpreter.
+     * Run inference with arbitrary input/output. Uses the local interpreter
+     * cache (the scheduler doesn't yet expose a multi-input API).
+     *
+     * Throws [LiteRtException] if any input index is missing — this is a
+     * caller-programmer error, not a user-triggerable condition.
      */
     suspend fun run(
         modelPath: String,
@@ -128,18 +75,17 @@ class LiteRtEngine @Inject constructor(
     ) = withContext(Dispatchers.IO) {
         val loaded = getOrLoad(modelPath, useGpu, useNnapi)
         loaded.mutex.withLock {
-            // Sort input keys so sparse maps (e.g. {0, 2}) don't NPE on the
-            // missing middle index. Previously Array(inputs.size) indexed by
-            // 0..size-1, which NPE'd when a key was missing.
             val sortedKeys = inputs.keys.sorted()
-            val inputsArray = Array(sortedKeys.size) { inputs[sortedKeys[it]] ?: error("missing input ${sortedKeys[it]}") }
+            val inputsArray = Array(sortedKeys.size) { idx ->
+                inputs[sortedKeys[idx]]
+                    ?: throw LiteRtException("Missing input tensor at index ${sortedKeys[idx]} for model $modelPath")
+            }
             loaded.interpreter.runForMultipleInputsOutputs(inputsArray, outputs)
         }
     }
 
     /**
-     * Get the input tensor shape (as int array) for a model. Useful for
-     * callers that need to size their input buffers.
+     * Get the input tensor shape (as int array) for a model.
      */
     suspend fun inputShape(modelPath: String, index: Int = 0): IntArray? =
         withContext(Dispatchers.IO) {
@@ -160,7 +106,7 @@ class LiteRtEngine @Inject constructor(
             }.getOrNull()
         }
 
-    /** Release all cached variants of a model (any delegate combination). Safe to call multiple times. */
+    /** Release all cached variants of a model. */
     suspend fun unload(modelPath: String) {
         val pathPrefix = modelPath.removePrefix("assets://").lowercase()
         val removed = cacheMutex.withLock {
@@ -174,7 +120,7 @@ class LiteRtEngine @Inject constructor(
         }
     }
 
-    /** Release all cached models (e.g. on app background / low memory). */
+    /** Release all cached models. */
     suspend fun unloadAll() {
         val all = cacheMutex.withLock {
             val copy = cache.values.toList()
@@ -186,6 +132,7 @@ class LiteRtEngine @Inject constructor(
             it.gpuDelegate?.close()
             it.nnApiDelegate?.close()
         }
+        runCatching { scheduler.shutdown() }
     }
 
     /** True if LiteRT native libs loaded successfully. */
@@ -200,28 +147,36 @@ class LiteRtEngine @Inject constructor(
     }
 
     // ------------------------------------------------------------------
-    // Internal
+    // Internal — retained for the multi-input run() + inputShape()/outputShape()
+    // paths which the scheduler doesn't yet cover. Will be migrated in a
+    // future iteration.
     // ------------------------------------------------------------------
 
+    private class LoadedModel(
+        val modelFile: File,
+        val interpreter: Interpreter,
+        val gpuDelegate: GpuDelegate?,
+        val nnApiDelegate: NnApiDelegate?,
+    ) {
+        val mutex = Mutex()
+    }
+
+    private val cache = mutableMapOf<String, LoadedModel>()
+    private val cacheMutex = Mutex()
+
     private suspend fun getOrLoad(modelPath: String, useGpu: Boolean, useNnapi: Boolean): LoadedModel {
-        // Cache key MUST include useGpu/useNnapi so a model first loaded with
-        // NNAPI isn't returned for a later GPU request (wrong delegate). The
-        // interpreter is built once with a fixed delegate set; swapping
-        // delegates requires rebuilding the interpreter.
         val key = normalizeKey(modelPath, useGpu, useNnapi)
         cacheMutex.withLock { cache[key]?.let { return it } }
         val file = resolveToFile(modelPath)
         val options = Interpreter.Options()
         var gpuDelegate: GpuDelegate? = null
         var nnApiDelegate: NnApiDelegate? = null
-        // NNAPI is the safest cross-vendor accelerator.
         if (useNnapi) {
             runCatching {
                 nnApiDelegate = NnApiDelegate()
                 options.addDelegate(nnApiDelegate)
             }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
         }
-        // GPU delegate is opt-in — some quantized (int8) models fail GPU compilation.
         if (useGpu) {
             runCatching {
                 gpuDelegate = GpuDelegate()
@@ -260,13 +215,27 @@ class LiteRtEngine @Inject constructor(
         }
         val outDir = File(ctx.filesDir, "litert_models").apply { mkdirs() }
         val outFile = File(outDir, assetPath.replace('/', '_'))
-        if (outFile.exists() && outFile.length() > 0) return outFile
+        // Validate the extracted file is non-empty AND its size matches the
+        // asset's size — a partial extract (e.g. crash during copy, full disk)
+        // would otherwise produce a corrupt interpreter.
+        val assetSize = runCatching { ctx.assets.openFd(assetPath).length }.getOrDefault(-1L)
+        if (outFile.exists() && outFile.length() > 0 && (assetSize < 0 || outFile.length() == assetSize)) {
+            return outFile
+        }
+        if (outFile.exists()) {
+            // Stale / partial — delete and re-extract.
+            runCatching { outFile.delete() }
+        }
 
         ctx.assets.open(assetPath).use { input ->
             FileOutputStream(outFile).use { output -> input.copyTo(output) }
         }
         if (outFile.length() == 0L) {
             throw LiteRtException("Asset '$assetPath' extracted as empty file — model not found in APK")
+        }
+        if (assetSize > 0 && outFile.length() != assetSize) {
+            runCatching { outFile.delete() }
+            throw LiteRtException("Asset '$assetPath' extract size mismatch (asset=$assetSize, extracted=${outFile.length()}) — possibly corrupt APK")
         }
         Log.i(TAG, "Extracted LiteRT model '$assetPath' -> ${outFile.absolutePath} (${outFile.length()} bytes)")
         return outFile

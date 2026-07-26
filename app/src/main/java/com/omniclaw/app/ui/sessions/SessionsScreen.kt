@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.sessions
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -36,6 +37,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,6 +66,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private const val TAG = "SessionsScreen"
+
 private enum class SessionsTab(val label: String) {
     ACTIVE_SESSIONS("Sessions"),
     BEHAVIORS("Behaviors")
@@ -81,10 +85,26 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
     var pendingDeleteId by remember { mutableStateOf<String?>(null) }
     var activeTab by rememberSaveable { mutableStateOf(SessionsTab.ACTIVE_SESSIONS) }
 
+    LaunchedEffect(Unit) {
+        Log.d(TAG, "SessionsScreen composed")
+    }
+
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         OmniTopBar(
             title = "Sessions",
-            subtitle = "${list.size} total · ${list.count { it.status == SessionStatus.RUNNING }} running"
+            subtitle = "${list.size} total · ${list.count { it.status == SessionStatus.RUNNING }} running",
+            actions = {
+                OmniButton(
+                    text = "NEW",
+                    onClick = { 
+                        Log.i(TAG, "New Session button clicked")
+                        val newId = vm.newSession()
+                        onSelectSession(newId)
+                    },
+                    leadingIcon = Icons.Outlined.Add,
+                    modifier = Modifier.padding(start = 8.dp)
+                )
+            }
         )
         OmniDivider()
 
@@ -95,12 +115,15 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                 .background(MaterialTheme.colorScheme.surface),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            SessionsTab.values().forEach { tab ->
+            SessionsTab.entries.forEach { tab ->
                 val selected = activeTab == tab
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { activeTab = tab }
+                        .clickable { 
+                            Log.d(TAG, "Tab switched to: $tab")
+                            activeTab = tab 
+                        }
                         .padding(vertical = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -126,21 +149,6 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
 
         when (activeTab) {
             SessionsTab.ACTIVE_SESSIONS -> {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OmniButton(
-                        text = "NEW SESSION",
-                        onClick = { vm.newSession() },
-                        leadingIcon = Icons.Outlined.Add
-                    )
-                }
-                OmniDivider()
-
                 if (list.isEmpty()) {
                     OmniEmptyState(
                         title = "No sessions yet",
@@ -202,11 +210,17 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                             )
                             OmniButton(
                                 text = "STOP & SAVE",
-                                onClick = { showSaveDialog = true },
+                                onClick = {
+                                    Log.i(TAG, "Stop & Save button clicked for behavior recording")
+                                    showSaveDialog = true
+                                },
                                 leadingIcon = Icons.Outlined.Stop
                             )
                             Spacer(Modifier.width(6.dp))
-                            IconButton(onClick = { vm.cancelRecording() }) {
+                            IconButton(onClick = {
+                                Log.i(TAG, "Cancel behavior recording button clicked")
+                                vm.cancelRecording()
+                            }) {
                                 Icon(Icons.Outlined.Close, contentDescription = "Cancel")
                             }
                         } else {
@@ -218,7 +232,10 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                             )
                             OmniButton(
                                 text = "RECORD",
-                                onClick = { vm.startRecording() },
+                                onClick = {
+                                    Log.i(TAG, "Start recording button clicked")
+                                    vm.startRecording()
+                                },
                                 leadingIcon = Icons.Outlined.FiberManualRecord
                             )
                         }
@@ -248,7 +265,10 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                                     )
                                 },
                                 trailing = {
-                                    IconButton(onClick = { vm.replay(skill.id) }) {
+                                    IconButton(onClick = {
+                                        Log.i(TAG, "Replay button clicked for behavior skill: ${skill.id} (${skill.name})")
+                                        vm.replay(skill.id)
+                                    }) {
                                         Icon(Icons.Outlined.PlayArrow, contentDescription = "Replay")
                                     }
                                 },
@@ -265,7 +285,10 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
     // Delete confirmation dialog
     pendingDeleteId?.let { id ->
         AlertDialog(
-            onDismissRequest = { pendingDeleteId = null },
+            onDismissRequest = {
+                Log.d(TAG, "Delete session dialog dismissed")
+                pendingDeleteId = null
+            },
             shape = RoundedCornerShape(0.dp),
             containerColor = MaterialTheme.colorScheme.background,
             modifier = Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
@@ -289,6 +312,7 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                 OmniButton(
                     text = "DELETE",
                     onClick = {
+                        Log.i(TAG, "Delete session confirmed for: $id")
                         vm.delete(id)
                         pendingDeleteId = null
                     },
@@ -298,7 +322,10 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
             dismissButton = {
                 OmniButton(
                     text = "CANCEL",
-                    onClick = { pendingDeleteId = null },
+                    onClick = {
+                        Log.d(TAG, "Delete session cancelled")
+                        pendingDeleteId = null
+                    },
                     primary = false
                 )
             },
@@ -308,6 +335,7 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
     if (showSaveDialog) {
         AlertDialog(
             onDismissRequest = {
+                Log.d(TAG, "Save behavior skill dialog dismissed")
                 showSaveDialog = false
                 saveName = ""
                 saveTrigger = ""
@@ -350,7 +378,9 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                     text = "SAVE",
                     onClick = {
                         val savedName = saveName.ifBlank { "Untitled" }
-                        vm.stopAndSaveRecording(savedName, saveTrigger.ifBlank { "Open $savedName" })
+                        val savedTrigger = saveTrigger.ifBlank { "Open $savedName" }
+                        Log.i(TAG, "Save behavior skill confirmed: name='$savedName', trigger='$savedTrigger'")
+                        vm.stopAndSaveRecording(savedName, savedTrigger)
                         showSaveDialog = false
                         saveName = ""
                         saveTrigger = ""
@@ -362,6 +392,7 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
                 OmniButton(
                     text = "CANCEL",
                     onClick = {
+                        Log.d(TAG, "Save behavior skill cancelled")
                         showSaveDialog = false
                         saveName = ""
                         saveTrigger = ""

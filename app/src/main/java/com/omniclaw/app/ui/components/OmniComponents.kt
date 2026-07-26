@@ -7,15 +7,18 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -69,62 +72,45 @@ fun OmniDivider(modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun OmniTopBar(title: String, subtitle: String? = null, modifier: Modifier = Modifier) {
-    Column(modifier = modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp)) {
-        Text(
-            title,
-            style = MaterialTheme.typography.headlineLarge,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onBackground,
-        )
-        if (subtitle != null) {
-            Spacer(Modifier.size(4.dp))
+fun OmniTopBar(
+    title: String,
+    subtitle: String? = null,
+    modifier: Modifier = Modifier,
+    actions: @Composable RowScope.() -> Unit = {}
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                title,
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground,
             )
+            if (subtitle != null) {
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End
+        ) {
+            actions()
         }
     }
 }
 
-/**
- * Enhanced card with subtle press feedback (alpha dims on press).
- * Set [onClick] to make it tappable.
- */
-@Composable
-fun OmniCard(
-    modifier: Modifier = Modifier,
-    onClick: (() -> Unit)? = null,
-    raised: Boolean = false,
-    content: @Composable () -> Unit,
-) {
-    val shape = RoundedCornerShape(0.dp)
-    val borderColor = if (raised) MaterialTheme.colorScheme.onBackground
-                      else MaterialTheme.colorScheme.outlineVariant
-    val borderWidth = if (raised) 1.dp else 0.5.dp
-    if (onClick == null) {
-        Surface(
-            modifier = modifier.fillMaxWidth(),
-            shape = shape,
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(borderWidth, borderColor),
-            content = { Box(Modifier.padding(16.dp)) { content() } },
-        )
-    } else {
-        val interaction = remember { MutableInteractionSource() }
-        val pressed by interaction.collectIsPressedAsState()
-        Surface(
-            onClick = onClick,
-            interactionSource = interaction,
-            modifier = modifier.fillMaxWidth().alpha(if (pressed) 0.7f else 1.0f),
-            shape = shape,
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(borderWidth, borderColor),
-            content = { Box(Modifier.padding(16.dp)) { content() } },
-        )
-    }
-}
 
 @Composable
 fun OmniButton(
@@ -286,23 +272,6 @@ fun OmniRow(
     }
 }
 
-/**
- * Fade-in container — wraps content and fades it in on first composition.
- * Used for screen-level transitions and lazy-list item appearances.
- */
-@Composable
-fun OmniFadeIn(
-    visible: Boolean = true,
-    modifier: Modifier = Modifier,
-    content: @Composable () -> Unit,
-) {
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn(tween(Motion.DurationMedium, easing = Motion.StandardEasing)),
-        exit = fadeOut(tween(Motion.DurationFast)),
-        modifier = modifier,
-    ) { content() }
-}
 
 /**
  * Empty-state placeholder — large monospace label + optional subtitle.

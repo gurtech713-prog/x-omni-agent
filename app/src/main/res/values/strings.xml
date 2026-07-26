@@ -14,13 +14,14 @@
 
     <!-- Accessibility service -->
     <string name="accessibility_service_label">X-OmniClaw Agent</string>
-    <string name="accessibility_service_description">Allows X-OmniClaw to read the on-screen UI tree and dispatch taps, swipes, and text input on your behalf. Required for the agent loop to execute device actions.</string>
+    <string name="accessibility_service_description">X-OmniClaw uses the accessibility service to (1) inspect the on-screen UI tree, (2) dispatch taps, swipes, and text input on your behalf, and (3) capture screenshots of the current screen as a vision fallback when the UI tree is not parseable. Screenshots may be sent to the third-party vision-language model (VLM) endpoint you configure in Settings (default: OpenRouter) so the agent can interpret complex UIs. Configure or disable the VLM in Settings → AI Provider at any time. The service does not upload accessibility tree content to any server except your configured LLM/VLM endpoint.</string>
 
     <!-- Foreground service -->
     <string name="fg_service_channel_name">Agent execution</string>
     <string name="fg_service_channel_desc">Runs the on-device agent loop in the background so long tasks can complete without the app staying open.</string>
     <string name="fg_service_notification_title">X-OmniClaw running</string>
     <string name="fg_service_notification_text">Agent is executing a task on your device.</string>
+    <string name="fg_service_running">Scheduled task running</string>
 
     <!-- Screen capture service -->
     <string name="capture_notification_title">Screen capture active</string>

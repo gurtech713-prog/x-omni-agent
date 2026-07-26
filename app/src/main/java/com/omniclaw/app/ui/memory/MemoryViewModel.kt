@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.memory
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omniclaw.app.data.memory.MemoryRepository
@@ -31,10 +32,27 @@ class MemoryViewModel @Inject constructor(
 
     init { viewModelScope.launch { skillRepo.reload() } }
 
-    fun pin(id: String, pinned: Boolean) = repo.pin(id, pinned)
-    fun forget(id: String) = repo.forget(id)
-    fun clearWorking() = repo.clearWorking()
+    fun pin(id: String, pinned: Boolean) {
+        Log.i(TAG, "Toggling pin state for memory $id to $pinned")
+        repo.pin(id, pinned)
+    }
+
+    fun forget(id: String) {
+        Log.i(TAG, "Forgetting/deleting memory entry $id")
+        repo.forget(id)
+    }
+
+    fun clearWorking() {
+        Log.i(TAG, "Clearing all working memory entries")
+        repo.clearWorking()
+    }
+
     fun toggleSkill(id: String, enabled: Boolean) {
+        Log.i(TAG, "Toggling skill $id enabled state to $enabled")
         viewModelScope.launch { skillRepo.setEnabled(id, enabled) }
+    }
+
+    companion object {
+        private const val TAG = "MemoryViewModel"
     }
 }

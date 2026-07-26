@@ -1,14 +1,13 @@
 # channel-config
 
-Configure an external messaging channel (Feishu, DingTalk, etc.).
+Configure an external messaging channel (Discord).
 
-- Configure Feishu channel: app id xxx, secret xxx.
-- Set Feishu webhook to https://open.feishu.cn/open-apis/bot/v2/hook/xxx.
+- Configure Discord notifications to webhook https://discord.com/api/webhooks/xxx/xxx.
 
 ## Behavior
-- Persists feishu_app_id, feishu_app_secret, feishu_webhook to DataStore
+- Persists discord_webhook to DataStore
 - Validates the webhook with a test ping
-- Saves a LONG_TERM memory entry: "Feishu channel configured"
+- Saves a LONG_TERM memory entry: "Discord channel configured"
 
 ## Tools
 - SettingsRepository.setChannelConfig

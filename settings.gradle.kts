@@ -1,3 +1,5 @@
+rootProject.name = "XOmniClaw"
+
 pluginManagement {
     repositories {
         google {
@@ -20,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "XOmniClaw"
 include(":app")
+

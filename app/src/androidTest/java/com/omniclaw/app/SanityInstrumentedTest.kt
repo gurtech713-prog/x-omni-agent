@@ -16,6 +16,8 @@ class SanityInstrumentedTest {
     @Test
     fun packageName_isCorrect() {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("com.omniclaw.app.debug", ctx.packageName)
+        // applicationId from build.gradle.kts = "com.aistudio.xomniclaw.mgypws"
+        // + ".debug" suffix in debug buildType → "com.aistudio.xomniclaw.mgypws.debug"
+        assertEquals("com.aistudio.xomniclaw.mgypws.debug", ctx.packageName)
     }
 }

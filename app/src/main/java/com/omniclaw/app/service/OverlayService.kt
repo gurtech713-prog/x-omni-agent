@@ -51,18 +51,20 @@ class OverlayService : Service() {
 
     @Inject lateinit var audioRecorder: AudioRecorder
     @Inject lateinit var sttClient: SttClient
+    @Inject lateinit var streamingStt: com.omniclaw.app.voice.StreamingSttClient
     @Inject lateinit var agentLoop: AgentLoop
     @Inject lateinit var sessions: SessionRepository
 
     private var windowManager: WindowManager? = null
     private var bubble: View? = null
     private val handler = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
         bubble = buildBubble()
         val params = WindowManager.LayoutParams(
@@ -88,6 +90,7 @@ class OverlayService : Service() {
         runCatching { if (audioRecorder.isRecording()) audioRecorder.stop() }
         runCatching { bubble?.let { windowManager?.removeView(it) } }
         bubble = null
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
@@ -184,10 +187,58 @@ class OverlayService : Service() {
     private fun transcribeAndDispatch(audioFile: File) {
         scope.launch {
             (bubble as? TextView)?.text = "…"
-            val transcript = sttClient.transcribe(audioFile)
+            // Use the production-grade StreamingSttClient with structured results.
+            val result = streamingStt.transcribeStructured(audioFile)
             // Clean up the temp file regardless of outcome.
             runCatching { audioFile.delete() }
-            if (transcript.isNullOrBlank()) {
+            val transcript = when (result) {
+                is com.omniclaw.app.voice.SttResult.Success -> result.text
+                is com.omniclaw.app.voice.SttResult.Cancelled -> {
+                    (bubble as? TextView)?.text = "PUSH"
+                    return@launch
+                }
+                is com.omniclaw.app.voice.SttResult.AuthenticationFailure -> {
+                    android.widget.Toast.makeText(
+                        this@OverlayService,
+                        "STT auth failed: ${result.message}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                    (bubble as? TextView)?.text = "PUSH"
+                    return@launch
+                }
+                is com.omniclaw.app.voice.SttResult.NetworkFailure -> {
+                    android.widget.Toast.makeText(
+                        this@OverlayService,
+                        "STT network error: ${result.message}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                    (bubble as? TextView)?.text = "PUSH"
+                    return@launch
+                }
+                is com.omniclaw.app.voice.SttResult.Timeout -> {
+                    android.widget.Toast.makeText(
+                        this@OverlayService,
+                        "STT timed out. Try again.",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    (bubble as? TextView)?.text = "PUSH"
+                    return@launch
+                }
+                is com.omniclaw.app.voice.SttResult.UnknownFailure -> {
+                    Log.w(TAG, "STT unknown failure: ${result.message}", result.cause)
+                    android.widget.Toast.makeText(
+                        this@OverlayService,
+                        "STT failed: ${result.message}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                    (bubble as? TextView)?.text = "PUSH"
+                    return@launch
+                }
+                is com.omniclaw.app.voice.SttResult.Segment -> {
+                    return@launch
+                }
+            }
+            if (transcript.isBlank()) {
                 Log.w(TAG, "STT returned empty transcript")
                 android.widget.Toast.makeText(
                     this@OverlayService,
@@ -219,7 +270,25 @@ class OverlayService : Service() {
 
     companion object {
         private const val TAG = "OverlayService"
+        @Volatile private var instance: OverlayService? = null
+        fun isRunning(): Boolean = instance != null
+
         fun start(ctx: android.content.Context) {
+            if (!android.provider.Settings.canDrawOverlays(ctx)) {
+                android.widget.Toast.makeText(
+                    ctx,
+                    "Please grant 'Display over other apps' permission in Settings first.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                val intent = Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:${ctx.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { ctx.startActivity(intent) }
+                return
+            }
             val i = Intent(ctx, OverlayService::class.java)
             runCatching { ctx.startService(i) }
         }

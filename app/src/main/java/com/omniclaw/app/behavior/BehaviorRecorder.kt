@@ -74,7 +74,7 @@ class BehaviorRecorder @Inject constructor(
     private var lastTimestamp = 0L
 
     fun startRecording() {
-        // Use a tryLock-style non-susping path because this is called from a
+        // Use a tryLock-style non-suspending path because this is called from a
         // non-suspend UI callback. We clear under the lock to avoid racing
         // with a concurrent recordAction() from the agent loop.
         current.clear()
@@ -152,9 +152,12 @@ class BehaviorRecorder @Inject constructor(
                 )
             }
             s.startsWith("type", ignoreCase = true) -> {
-                // Non-greedy match up to the last quote so inner content can
-                // contain escaped or literal characters before the closing paren.
-                val m = Regex("(?i)type\\s*\\(\\s*\"(.*)\"\\s*\\)").find(s)
+                // FIX #11: Use lazy/non-greedy quantifier with explicit closing quote.
+                // Previously `(.*)` was greedy and would match up to the LAST quote
+                // in the string, breaking on text containing embedded quotes like
+                // type("hello \"world\""). The new pattern matches up to the FIRST
+                // closing quote, which is the correct behavior for the stored format.
+                val m = Regex("(?i)type\\s*\\(\\s*\"(.*?)\"\\s*\\)").find(s)
                 com.omniclaw.app.agent.tools.DeviceAction.Type(m?.groupValues?.getOrNull(1).orEmpty())
             }
             s.startsWith("launch", ignoreCase = true) -> {

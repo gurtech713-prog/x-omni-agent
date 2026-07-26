@@ -6,59 +6,98 @@ import com.omniclaw.app.behavior.BehaviorRecorder
 import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.session.SessionRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
 class SessionsViewModel @Inject constructor(
-    private val sessionRepository: SessionRepository,
+    private val sessionRepo: SessionRepository,
     private val behaviorRecorder: BehaviorRecorder,
 ) : ViewModel() {
 
-    val sessions: StateFlow<List<Session>> = sessionRepository.sessions
-        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    private val _sessions = MutableStateFlow<List<Session>>(emptyList())
+    val sessions: StateFlow<List<Session>> = _sessions.asStateFlow()
 
-    val isRecording = behaviorRecorder.isRecording
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
-    // Private mutable, public read-only — prevents external mutation.
-    private val _savedBehaviors = MutableStateFlow(behaviorRecorder.listSaved())
+    val isRecording: StateFlow<Boolean> = behaviorRecorder.isRecording
+
+    private val _savedBehaviors = MutableStateFlow<List<BehaviorRecorder.RecordedSkill>>(emptyList())
     val savedBehaviors: StateFlow<List<BehaviorRecorder.RecordedSkill>> = _savedBehaviors.asStateFlow()
 
-    fun stop(id: String) = sessionRepository.stop(id)
-    fun delete(id: String) = sessionRepository.delete(id)
-    fun newSession(): String = sessionRepository.create("New session").id
+    init {
+        loadSessions()
+        refreshBehaviors()
+    }
 
-    /** Refresh the saved-behaviors list from disk. Call on app foreground or after
-     *  the agent loop creates a skill via skill:skill-creator / skill:behavior-replay. */
+    fun loadSessions() {
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                sessionRepo.sessions.collectLatest { sessionList ->
+                    _sessions.value = sessionList
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
     fun refreshBehaviors() {
         _savedBehaviors.value = behaviorRecorder.listSaved()
     }
 
-    /** Start recording device actions for behavior cloning. */
+    fun newSession(): String {
+        return sessionRepo.create("New session").id
+    }
+
+    fun stop(sessionId: String) {
+        sessionRepo.stop(sessionId)
+    }
+
+    fun delete(sessionId: String) {
+        viewModelScope.launch {
+            sessionRepo.delete(sessionId)
+        }
+    }
+
+    fun deleteSession(sessionId: String) = delete(sessionId)
+
+    fun clearAllSessions() {
+        viewModelScope.launch {
+            sessionRepo.clearAll()
+        }
+    }
+
     fun startRecording() {
         behaviorRecorder.startRecording()
+    }
+
+    fun stopAndSaveRecording(name: String, triggerPhrase: String) {
+        behaviorRecorder.stopAndSave(name, triggerPhrase)
         refreshBehaviors()
     }
 
-    /** Stop recording and save as a reusable skill. Returns the new skill ID, or null. */
-    fun stopAndSaveRecording(name: String, triggerPhrase: String): String? {
-        val id = behaviorRecorder.stopAndSave(name, triggerPhrase)
-        refreshBehaviors()
-        return id
-    }
-
-    /** Cancel an in-progress recording without saving. */
     fun cancelRecording() {
         behaviorRecorder.cancel()
     }
 
-    /** Replay a previously-recorded behavior skill. */
     fun replay(skillId: String) {
-        viewModelScope.launch { behaviorRecorder.replay(skillId) }
+        viewModelScope.launch {
+            behaviorRecorder.replay(skillId)
+        }
+    }
+
+    fun refresh() {
+        loadSessions()
+        refreshBehaviors()
+    }
+
+    companion object {
+        private const val TAG = "SessionsViewModel"
     }
 }

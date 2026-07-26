@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.schedule
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.core.tween
@@ -40,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,32 +64,43 @@ import com.omniclaw.app.ui.components.OmniDivider
 import com.omniclaw.app.ui.components.OmniEmptyState
 import com.omniclaw.app.ui.components.OmniTopBar
 
+private const val TAG = "ScheduleScreen"
+
 @Composable
 fun ScheduleScreen() {
     val vm: ScheduleViewModel = hiltViewModel()
     val list by vm.tasks.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<ScheduledTask?>(null) }
 
-    Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        OmniTopBar(title = "SCHEDULE", subtitle = "${list.size} tasks · ${list.count { it.enabled }} enabled")
-        OmniDivider()
+    LaunchedEffect(Unit) {
+        Log.d(TAG, "ScheduleScreen composed")
+    }
 
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.End,
-        ) {
-            OmniButton(text = "NEW TASK", onClick = {
-                editing = ScheduledTask(
-                    id = java.util.UUID.randomUUID().toString().take(8),
-                    title = "Untitled task",
-                    scheduleKind = ScheduleKind.INTERVAL,
-                    intervalMinutes = 30,
-                    timeOfDay = "",
-                    enabled = false,
-                    prompt = "",
+    Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        OmniTopBar(
+            title = "SCHEDULE",
+            subtitle = "${list.size} tasks · ${list.count { it.enabled }} enabled",
+            actions = {
+                OmniButton(
+                    text = "NEW",
+                    onClick = {
+                        Log.i(TAG, "NEW scheduled task button clicked")
+                        editing = ScheduledTask(
+                            id = java.util.UUID.randomUUID().toString().take(8),
+                            title = "Untitled task",
+                            scheduleKind = ScheduleKind.INTERVAL,
+                            intervalMinutes = 30,
+                            timeOfDay = "",
+                            enabled = false,
+                            prompt = "",
+                        )
+                    },
+                    leadingIcon = Icons.Outlined.Add,
+                    modifier = Modifier.padding(start = 8.dp)
                 )
-            }, leadingIcon = Icons.Outlined.Add)
-        }
+            }
+        )
+        OmniDivider()
 
         if (list.isEmpty()) {
             OmniEmptyState(
@@ -102,9 +115,18 @@ fun ScheduleScreen() {
                 AnimatedVisibility(visible = true, enter = fadeIn(tween(Motion.DurationMedium))) {
                     ScheduleRow(
                         t,
-                        onToggle = { vm.toggle(t.id) },
-                        onDelete = { vm.delete(t.id) },
-                        onEdit = { editing = t },
+                        onToggle = {
+                            Log.i(TAG, "Toggle task clicked for: ${t.id}")
+                            vm.toggle(t.id)
+                        },
+                        onDelete = {
+                            Log.i(TAG, "Delete task clicked for: ${t.id}")
+                            vm.delete(t.id)
+                        },
+                        onEdit = {
+                            Log.i(TAG, "Edit task clicked for: ${t.id}")
+                            editing = t
+                        },
                     )
                 }
                 OmniDivider()
@@ -113,15 +135,20 @@ fun ScheduleScreen() {
     }
 
     editing?.let { task ->
+        val isNew = list.none { it.id == task.id }
         EditTaskDialog(
             task = task,
-            isNew = list.none { it.id == task.id },
+            isNew = isNew,
             onSave = { updated ->
-                if (list.none { it.id == updated.id }) vm.create(updated)
+                Log.i(TAG, "Saving task inside EditTaskDialog: ID=${updated.id}, isNew=$isNew")
+                if (isNew) vm.create(updated)
                 else vm.update(updated)
                 editing = null
             },
-            onDismiss = { editing = null },
+            onDismiss = {
+                Log.d(TAG, "EditTaskDialog dismissed/cancelled")
+                editing = null
+            },
         )
     }
 }
@@ -141,7 +168,10 @@ private fun ScheduleRow(
             .clickable { expanded = !expanded }
             .padding(horizontal = 20.dp, vertical = 16.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Icon(
                 imageVector = if (expanded) Icons.Outlined.ArrowDropUp else Icons.Outlined.ArrowDropDown,
                 contentDescription = if (expanded) "Collapse" else "Expand",
@@ -155,18 +185,33 @@ private fun ScheduleRow(
                 )
             )
             Spacer(Modifier.width(14.dp))
-            Text(
-                t.title,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.weight(1f),
-            )
-            OmniBadge(t.scheduleKind.name, filled = false)
-            if (t.enabled) {
-                Spacer(Modifier.width(6.dp))
-                OmniBadge("ON", filled = true, pulsing = false)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    t.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        scheduleDescription(t),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        fontFamily = OmniMono,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (t.enabled) {
+                        Spacer(Modifier.width(8.dp))
+                        OmniBadge("ACTIVE", filled = true, pulsing = false)
+                    }
+                }
             }
+            Spacer(Modifier.width(10.dp))
+            OmniBadge(t.scheduleKind.name, filled = false)
             Spacer(Modifier.width(10.dp))
             Switch(
                 checked = t.enabled,
@@ -180,22 +225,16 @@ private fun ScheduleRow(
                     uncheckedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
             )
-            IconButton(onClick = onEdit) {
-                Icon(Icons.Outlined.Edit, contentDescription = "Edit task")
-            }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Outlined.Close, contentDescription = "Delete task")
-            }
         }
         
         if (expanded) {
-            Spacer(Modifier.size(10.dp))
+            Spacer(Modifier.size(12.dp))
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
                     .background(MaterialTheme.colorScheme.surface)
-                    .padding(14.dp)
+                    .padding(16.dp)
             ) {
                 Text(
                     text = "FREQUENCY",
@@ -213,7 +252,7 @@ private fun ScheduleRow(
                 )
 
                 if (t.prompt.isNotBlank()) {
-                    Spacer(Modifier.size(10.dp))
+                    Spacer(Modifier.size(12.dp))
                     Text(
                         text = "PROMPT DIRECTIVE",
                         fontFamily = OmniMono,
@@ -221,16 +260,20 @@ private fun ScheduleRow(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(4.dp))
                     Text(
                         "» ${t.prompt}",
                         fontFamily = OmniMono,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
+                            .padding(8.dp)
                     )
                 }
 
-                Spacer(Modifier.size(10.dp))
+                Spacer(Modifier.size(12.dp))
                 Text(
                     text = "RUN TELEMETRY",
                     fontFamily = OmniMono,
@@ -257,6 +300,28 @@ private fun ScheduleRow(
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
+
+                Spacer(Modifier.size(16.dp))
+                OmniDivider()
+                Spacer(Modifier.size(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    OmniButton(
+                        text = "EDIT",
+                        onClick = onEdit,
+                        leadingIcon = Icons.Outlined.Edit,
+                        primary = false,
+                        modifier = Modifier.padding(end = 8.dp)
+                    )
+                    OmniButton(
+                        text = "DELETE",
+                        onClick = onDelete,
+                        leadingIcon = Icons.Outlined.Close,
+                        primary = false
+                    )
+                }
             }
         }
     }

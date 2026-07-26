@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Files exported by SettingsViewModel.exportConfig() (getExternalFilesDir). -->
+    <external-files-path
+        name="exports"
+        path=".xomniclaw/" />
+    <!-- Skills written by BehaviorRecorder.saveSkill() and SkillRepository. -->
+    <files-path
+        name="skills"
+        path="skills/" />
+    <!-- Behavior recording JSON + screenshots. -->
+    <files-path
+        name="behavior"
+        path="behavior/" />
+    <!-- LiteRT models extracted from assets (rarely shared, but possible). -->
+    <files-path
+        name="litert_models"
+        path="litert_models/" />
+    <!-- Cache for any temp files (e.g. intermediate screenshots). -->
+    <cache-path
+        name="cache"
+        path="." />
+</paths>

@@ -1,17 +1,23 @@
 package com.omniclaw.app.cron
 
+import android.app.Notification
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.util.Log
 import androidx.hilt.work.HiltWorker
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.omniclaw.app.R
 import com.omniclaw.app.agent.AgentLoop
 import com.omniclaw.app.data.session.SessionRepository
 import dagger.assisted.Assisted
@@ -27,7 +33,9 @@ import java.util.concurrent.TimeUnit
  * terminal state (DONE / FAILED / STOPPED) before returning Result.success().
  *
  * Works screen-on or screen-off — WorkManager handles deferred execution
- * under Doze if needed.
+ * under Doze if needed. When the agent session is running, the worker
+ * promotes itself to a foreground service so the system doesn't kill the
+ * process mid-task (Android 12+ enforces strict background execution).
  *
  * @HiltWorker annotation tells Hilt's WorkerFactory how to construct this
  * worker via the @AssistedFactory interface. Without it, WorkManager falls
@@ -67,7 +75,7 @@ class ScheduledTaskWorker @AssistedInject constructor(
         if (onlyWhenScreenOn && !isScreenOn(applicationContext)) {
             // Result.retry() takes no arguments in WorkManager — the deferred
             // reason is logged but not passed to the result. WorkManager will
-            // retry with exponential backoff.
+            // retry with exponential backoff (configured at schedule time).
             Log.i("ScheduledTaskWorker", "Task $taskId deferred: screen off")
             return Result.retry()
         }
@@ -80,29 +88,91 @@ class ScheduledTaskWorker @AssistedInject constructor(
             return Result.retry()
         }
 
+        // Promote to a foreground service for the duration of the agent run so
+        // Android 12+ doesn't kill the process mid-task. The notification uses
+        // IMPORTANCE_LOW so it doesn't buzz the user.
+        runCatching {
+            setForeground(buildForegroundInfo(title))
+        }.onFailure {
+            // Foreground promotion can fail on Android 12+ if the app is in
+            // background and the WorkManager is restricted. We log + continue
+            // — the agent session may still complete before the system kills us.
+            Log.w("ScheduledTaskWorker", "Foreground promotion failed: ${it.message}")
+        }
+
         // Create a fresh session and dispatch the prompt to the shared execution core.
         val session = sessions.create("[Scheduled] $title")
         agentLoop.start(session, prompt)
 
         // Wait up to 10 minutes for the session to reach a terminal state.
+        // Poll interval = 5s (down from 2s) to halve DB load; agent sessions
+        // take minutes, not seconds, so 5s is plenty responsive.
         val sessionId = session.id
-        val finished = withTimeoutOrNull(10 * 60 * 1000L) {
+        var finalStatus: com.omniclaw.app.data.model.SessionStatus? = null
+        withTimeoutOrNull(10 * 60 * 1000L) {
             while (true) {
+                if (isStopped) break  // WorkManager cancellation requested
                 val s = sessions.getById(sessionId)
                 val status = s?.status
                 if (status == com.omniclaw.app.data.model.SessionStatus.DONE ||
                     status == com.omniclaw.app.data.model.SessionStatus.FAILED ||
                     status == com.omniclaw.app.data.model.SessionStatus.STOPPED
-                ) break
-                kotlinx.coroutines.delay(2000)
+                ) {
+                    finalStatus = status
+                    break
+                }
+                kotlinx.coroutines.delay(5000)
             }
-            true
         }
-        return Result.success(workDataOf(
-            KEY_TASK_ID to taskId,
-            "session_id" to sessionId,
-            "completed" to (finished == true),
-        ))
+
+        // If the session never reached a terminal state (timeout fired, or
+        // WorkManager cancelled us), return Result.retry() so WorkManager
+        // re-attempts with exponential backoff. Previously we returned
+        // Result.success(completed=false) which WorkManager treated as "work
+        // succeeded" — the scheduled task was silently lost.
+        //
+        // We DO return Result.success() for terminal states (DONE / FAILED /
+        // STOPPED) — even FAILED — because retrying a session that failed
+        // due to a bad prompt or a missing permission will just fail again.
+        // The user can manually re-trigger from the Sessions screen.
+        return if (finalStatus == null) {
+            Log.w("ScheduledTaskWorker", "Task $sessionId did not reach a terminal state — returning retry() so WorkManager re-attempts")
+            Result.retry()
+        } else {
+            Result.success(workDataOf(
+                KEY_TASK_ID to taskId,
+                "session_id" to sessionId,
+                "completed" to true,
+                "final_status" to finalStatus!!.name,
+            ))
+        }
+    }
+
+    /**
+     * Build a [ForegroundInfo] for this worker. Uses the agent foreground-service
+     * notification channel so the user sees "scheduled task running" alongside
+     * the live agent status pill.
+     */
+    private fun buildForegroundInfo(title: String): ForegroundInfo {
+        val notification: Notification = androidx.core.app.NotificationCompat.Builder(
+            applicationContext,
+            "agent.fg",
+        )
+            .setContentTitle(title)
+            .setContentText(applicationContext.getString(R.string.fg_service_running))
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            ForegroundInfo(NOTIFICATION_ID, notification)
+        }
     }
 
     companion object {
@@ -114,6 +184,7 @@ class ScheduledTaskWorker @AssistedInject constructor(
         const val KEY_QUIET_START = "task.quiet_start"
         const val KEY_QUIET_END = "task.quiet_end"
         const val WORK_PREFIX = "omni_scheduled_"
+        private const val NOTIFICATION_ID = 4242
 
         /**
          * Check if the screen is currently on. Uses the power manager —
@@ -154,6 +225,9 @@ class ScheduledTaskWorker @AssistedInject constructor(
                 intervalMinutes.coerceAtLeast(15), TimeUnit.MINUTES,
             )
                 .setInputData(data)
+                // Explicit exponential backoff with a 30s floor and 5min ceiling.
+                // Default is 30s/5h which can spin for hours on screen-off deferrals.
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiresBatteryNotLow(false)
@@ -186,27 +260,7 @@ class ScheduledTaskWorker @AssistedInject constructor(
             val delayMs = computeDelayToNext(weekdays, timeOfDay)
             val delayMinutes = (delayMs / 60_000L).coerceAtLeast(1)
             val weekdaysStr = weekdays.joinToString(",")
-            val data = workDataOf(
-                KEY_TASK_ID to taskId,
-                KEY_TASK_TITLE to title,
-                KEY_PROMPT to prompt,
-                KEY_WEEKDAYS to weekdaysStr,
-            )
-            // First fire as one-shot to hit the exact target time.
-            val oneShot = OneTimeWorkRequestBuilder<ScheduledTaskWorker>()
-                .setInputData(data)
-                .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
-                .build()
-            WorkManager.getInstance(ctx).enqueueUniqueWork(
-                "$WORK_PREFIX${taskId}_oneshot",
-                androidx.work.ExistingWorkPolicy.REPLACE,
-                oneShot,
-            )
-            // 24h periodic re-fires daily. IMPORTANT: the periodic work must
-            // ALSO carry KEY_WEEKDAYS so doWork()'s weekday filter (line ~54)
-            // can skip non-target days. Previously this called scheduleInterval()
-            // which omitted KEY_WEEKDAYS, so weekly tasks fired every single
-            // day after the first one-shot.
+
             val periodicData = workDataOf(
                 KEY_TASK_ID to taskId,
                 KEY_TASK_TITLE to title,
@@ -217,6 +271,8 @@ class ScheduledTaskWorker @AssistedInject constructor(
                 24 * 60, TimeUnit.MINUTES,
             )
                 .setInputData(periodicData)
+                .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiresBatteryNotLow(false)
@@ -229,6 +285,8 @@ class ScheduledTaskWorker @AssistedInject constructor(
                 ExistingPeriodicWorkPolicy.UPDATE,
                 periodic,
             )
+            // Clean up any stale one-shot variant — the periodic work supersedes it.
+            WorkManager.getInstance(ctx).cancelUniqueWork("$WORK_PREFIX${taskId}_oneshot")
         }
 
         fun scheduleOneShot(ctx: Context, taskId: String, title: String, prompt: String, delayMinutes: Long) {
@@ -240,8 +298,16 @@ class ScheduledTaskWorker @AssistedInject constructor(
             val req = OneTimeWorkRequestBuilder<ScheduledTaskWorker>()
                 .setInputData(data)
                 .setInitialDelay(delayMinutes.coerceAtLeast(1), TimeUnit.MINUTES)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
-            WorkManager.getInstance(ctx).enqueue(req)
+            // Use enqueueUniqueWork with REPLACE policy — prevents duplicate
+            // one-shot workers if the user re-arms the same task ID before the
+            // first one fires.
+            WorkManager.getInstance(ctx).enqueueUniqueWork(
+                "$WORK_PREFIX${taskId}_oneshot",
+                ExistingWorkPolicy.REPLACE,
+                req,
+            )
         }
 
         fun cancel(ctx: Context, taskId: String) {

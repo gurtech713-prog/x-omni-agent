@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.memory
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.core.tween
@@ -38,6 +39,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,6 +67,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private const val TAG = "MemoryScreen"
+
 private enum class MemoryTab(val label: String) {
     MEMORIES("Memories"),
     LESSONS("Lessons"),
@@ -83,6 +87,10 @@ fun MemoryScreen() {
     var activeTab by rememberSaveable { mutableStateOf(MemoryTab.MEMORIES) }
     var selectedKindFilter by rememberSaveable { mutableStateOf<MemoryKind?>(null) }
 
+    LaunchedEffect(Unit) {
+        Log.d(TAG, "MemoryScreen composed")
+    }
+
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         OmniTopBar(
             title = "MEMORY & SKILLS",
@@ -97,12 +105,15 @@ fun MemoryScreen() {
                 .background(MaterialTheme.colorScheme.surface),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            MemoryTab.values().forEach { tab ->
+            MemoryTab.entries.forEach { tab ->
                 val selected = activeTab == tab
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { activeTab = tab }
+                        .clickable { 
+                            Log.d(TAG, "Tab switched to: $tab")
+                            activeTab = tab 
+                        }
                         .padding(vertical = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -139,13 +150,19 @@ fun MemoryScreen() {
                     Box(modifier = Modifier.weight(1f)) {
                         MemoryFilterDropdown(
                             selectedKind = selectedKindFilter,
-                            onSelect = { selectedKindFilter = it }
+                            onSelect = {
+                                Log.d(TAG, "Memory category filter changed to: $it")
+                                selectedKindFilter = it
+                            }
                         )
                     }
                     Spacer(Modifier.width(12.dp))
                     OmniButton(
                         text = "CLEAR WORKING",
-                        onClick = { pendingClear = ClearTarget.Working },
+                        onClick = {
+                            Log.i(TAG, "CLEAR WORKING button clicked")
+                            pendingClear = ClearTarget.Working
+                        },
                         primary = false
                     )
                 }
@@ -195,7 +212,10 @@ fun MemoryScreen() {
                 ) {
                     OmniButton(
                         text = "CLEAR LESSONS",
-                        onClick = { pendingClear = ClearTarget.Lessons },
+                        onClick = {
+                            Log.i(TAG, "CLEAR LESSONS button clicked")
+                            pendingClear = ClearTarget.Lessons
+                        },
                         primary = false
                     )
                 }
@@ -212,6 +232,7 @@ fun MemoryScreen() {
                         items(lessons, key = { it.id }) { l ->
                             AnimatedVisibility(visible = true, enter = fadeIn(tween(Motion.DurationMedium))) {
                                 LessonRow(l, df.format(Date(l.lastSeenAt))) {
+                                    Log.i(TAG, "Forget lesson button clicked for lesson: ${l.id}")
                                     lessonsVm.forget(l.id)
                                 }
                             }
@@ -231,7 +252,10 @@ fun MemoryScreen() {
                     LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         item { OmniSectionHeader(title = "Skills (${skills.count { it.enabled }}/${skills.size} enabled)") }
                         items(skills, key = { it.id }) { skill ->
-                            SkillRow(skill) { enabled -> vm.toggleSkill(skill.id, enabled) }
+                            SkillRow(skill) { enabled ->
+                                Log.i(TAG, "Skill ${skill.id} toggle changed to $enabled")
+                                vm.toggleSkill(skill.id, enabled)
+                            }
                             OmniDivider()
                         }
                     }
@@ -243,7 +267,10 @@ fun MemoryScreen() {
     // Confirmation dialog
     pendingClear?.let { target ->
         AlertDialog(
-            onDismissRequest = { pendingClear = null },
+            onDismissRequest = {
+                Log.d(TAG, "Confirmation dialog dismissed for ${target.label}")
+                pendingClear = null
+            },
             shape = RoundedCornerShape(0.dp),
             containerColor = MaterialTheme.colorScheme.background,
             modifier = Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
@@ -267,6 +294,7 @@ fun MemoryScreen() {
                 OmniButton(
                     text = "CLEAR",
                     onClick = {
+                        Log.i(TAG, "Confirmation dialog CLEAR confirmed for ${target.label}")
                         when (target) {
                             ClearTarget.Working -> vm.clearWorking()
                             ClearTarget.Lessons -> lessonsVm.clearAll()
@@ -279,7 +307,10 @@ fun MemoryScreen() {
             dismissButton = {
                 OmniButton(
                     text = "CANCEL",
-                    onClick = { pendingClear = null },
+                    onClick = {
+                        Log.d(TAG, "Confirmation dialog CANCEL clicked for ${target.label}")
+                        pendingClear = null
+                    },
                     primary = false
                 )
             },

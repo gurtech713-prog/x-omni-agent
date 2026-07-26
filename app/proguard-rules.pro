@@ -55,8 +55,9 @@
 
 # ─── LiteRT (on-device ML, formerly TFLite) ──────────────────────────
 # The interpreter is loaded via reflection; keep the public API surface.
+# Note: `litert-support` (Task Library) is intentionally not on the classpath —
+# only `litert` and `litert-gpu` are pulled in (see app/build.gradle.kts).
 -keep class com.google.ai.edge.litert.** { *; }
--keep class com.google.ai.edge.litert.support.** { *; }
 -keep class org.tensorflow.lite.** { *; }   # legacy package still referenced by delegates
 -keep class org.tensorflow.lite.gpu.** { *; }
 -keep class org.tensorflow.lite.nnapi.** { *; }
@@ -69,3 +70,36 @@
 }
 
 # ─── Google GenAI / Gemini REST (no SDK — pure OkHttp, no rules needed) ───
+
+# ─── App domain models (serialized to Room JSON columns + DataStore) ──
+# Keep data class field names so kotlinx.serialization + Room reflection
+# don't break when R8 renames fields in release builds.
+-keep class com.omniclaw.app.data.model.** { *; }
+
+# ─── Hilt ViewModels (constructor params resolved via reflection) ────
+-keep class * extends androidx.lifecycle.ViewModel { <init>(...); }
+
+# ─── Assisted-injected Hilt Workers (ScheduledTaskWorker) ─────────────
+-keep class * extends androidx.hilt.work.HiltWorker { <init>(...); }
+-keep @dagger.assisted.AssistedInject class * { <init>(...); }
+-keep @dagger.assisted.AssistedFactory interface * { *; }
+
+# ─── Keep enum values (Room stores them by name) ─────────────────────
+-keepclassmembers enum com.omniclaw.app.** {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+# ─── Release-build log stripping ─────────────────────────────────────
+# Strip debug and verbose log calls in release builds to prevent secrets /
+# user content from leaking to Logcat on production devices. Info/Warn/Error
+# are kept (useful for crash reporting). Calls are stripped ONLY if their
+# return value is unused — `Log.d(TAG, "x")` is removed; `val r = Log.d(...)`
+# is preserved. The `android.util.Log` class itself is preserved so callers
+# that branch on `Log.isLoggable` still work.
+-assumenosideeffects class android.util.Log {
+    public static *** v(...);
+    public static *** d(...);
+}
+-keep class android.util.Log { *; }
+

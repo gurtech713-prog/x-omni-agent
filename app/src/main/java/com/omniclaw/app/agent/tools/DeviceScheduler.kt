@@ -1,5 +1,6 @@
 package com.omniclaw.app.agent.tools
 
+import com.omniclaw.app.accessibility.AccessibilityExecutor
 import com.omniclaw.app.service.OmniAccessibilityService
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -9,28 +10,69 @@ import javax.inject.Singleton
  *   - snapshot the current screen (accessibility tree or screenshot)
  *   - dispatch atomic Android actions (tap, swipe, type, launch, back, home)
  *
- * Actual execution is delegated to [OmniAccessibilityService] when it is
- * connected. If the service is not connected, calls return gracefully so the
+ * Delegates to [AccessibilityExecutor] for all operations. The executor
+ * coordinates [com.omniclaw.app.accessibility.NodeSearchEngine],
+ * [com.omniclaw.app.accessibility.GestureManager],
+ * [com.omniclaw.app.accessibility.WindowTracker], and
+ * [com.omniclaw.app.accessibility.AccessibilityMetrics] internally.
+ *
+ * If the a11y service is not connected, calls return gracefully so the
  * agent loop can still reason about screenshots-only fallback (per the
  * X-OmniClaw "vision fallback & dual-track decisions" feature).
  */
 @Singleton
-class DeviceScheduler @Inject constructor() {
+class DeviceScheduler @Inject constructor(
+    private val executor: AccessibilityExecutor,
+) {
 
     @Volatile
     var boundService: OmniAccessibilityService? = null
+        set(value) {
+            field = value
+            // Keep the executor's service reference in sync so it can
+            // dispatch gestures + read the tree.
+            executor.service = value
+        }
+
+    init {
+        // Register this scheduler with the executor so the executor can read
+        // the bound service via the back-reference (handles the case where
+        // the service connects before the executor is wired up).
+        executor.deviceScheduler = this
+    }
 
     /** Returns a flat text representation of the current UI tree. */
-    fun snapshot(): String {
+    suspend fun snapshot(): String {
         val svc = boundService ?: return "(accessibility service not connected)"
-        val tree = svc.snapshotTree() ?: return "(empty tree)"
-        return tree
+        return executor.snapshot()
+    }
+
+    /**
+     * Synchronous snapshot for non-suspend callers (e.g. [SuccessMonitor.verifyLast]).
+     *
+     * Runs the snapshot on the accessibility service's main looper via
+     * [OmniAccessibilityService.snapshotTree], which is already synchronous.
+     * Does NOT benefit from the executor's retry / root-recovery logic —
+     * callers that need those guarantees should use the suspend [snapshot].
+     */
+    fun snapshotBlocking(): String {
+        val svc = boundService ?: return "(accessibility service not connected)"
+        return svc.snapshotTree() ?: "(empty tree)"
     }
 
     /** Returns the raw bitmap bytes of the latest screenshot, or null. */
-    suspend fun screenshot(): ByteArray? = boundService?.screenshot()
+    suspend fun screenshot(): ByteArray? = executor.screenshot()
 
-    fun dispatch(action: DeviceAction): Boolean {
+    suspend fun dispatch(action: DeviceAction): Boolean {
+        val svc = boundService ?: return false
+        return executor.dispatch(action)
+    }
+
+    /**
+     * Synchronous dispatch for non-suspend callers (BehaviorRecorder replay
+     * legacy path). Prefer the suspend [dispatch] for new code.
+     */
+    fun dispatchBlocking(action: DeviceAction): Boolean {
         val svc = boundService ?: return false
         return when (action) {
             is DeviceAction.Tap -> svc.tap(action.x, action.y)
@@ -39,9 +81,6 @@ class DeviceScheduler @Inject constructor() {
             is DeviceAction.Launch -> svc.launch(action.packageName)
             DeviceAction.Back -> svc.back()
             DeviceAction.Home -> svc.home()
-            // Screenshot is handled by the agent loop's vision-fallback path
-            // (which is suspend). Mark as no-op here so the loop falls through
-            // to its own screenshot call.
             DeviceAction.Screenshot -> true
             DeviceAction.NoOp -> true
         }

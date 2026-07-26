@@ -19,7 +19,7 @@ suspend fun <T> retry(
     maxAttempts: Int = 3,
     baseDelayMs: Long = 500,
     maxDelayMs: Long = 8_000,
-    retryable: (Throwable) -> Boolean = { it is java.io.IOException || it is RuntimeException },
+    retryable: (Throwable) -> Boolean = { it is java.io.IOException },
     block: suspend () -> T,
 ): T {
     var lastError: Throwable? = null
@@ -27,6 +27,7 @@ suspend fun <T> retry(
         try {
             return block()
         } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             lastError = e
             if (!retryable(e)) throw e
             if (attempt < maxAttempts - 1) {

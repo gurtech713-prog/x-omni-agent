@@ -1,12 +1,12 @@
 package com.omniclaw.app.gateway
 
 import com.omniclaw.app.data.prefs.SettingsRepository
+import com.omniclaw.app.logging.AgentLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -23,24 +23,17 @@ import javax.inject.Singleton
  * Both Feishu and Discord use simple webhook POSTs with a JSON body —
  * the only difference is the field name ("text" for Feishu's bot v2 hook,
  * "content" for Discord).
+ *
+ * Security: the webhook URL contains the secret token (e.g. Discord
+ * `webhooks/<id>/<token>`). All log output is routed through [AgentLogger]
+ * which redacts webhook URLs to `https://discord.com/REDACTED`.
  */
 @Singleton
 class ChannelSender @Inject constructor(
     private val http: OkHttpClient,
     private val settings: SettingsRepository,
+    private val logger: AgentLogger,
 ) {
-
-    suspend fun sendToFeishu(text: String): Boolean = withContext(Dispatchers.IO) {
-        val cfg = settings.channelConfig.first()
-        val webhook = cfg.feishuWebhook
-        if (webhook.isBlank()) return@withContext false
-        // Feishu bot v2 webhook expects { "msg_type": "text", "content": { "text": "..." } }
-        val payload = buildJsonObject {
-            put("msg_type", "text")
-            putJsonObject("content") { put("text", text) }
-        }
-        postJson(webhook, payload.toString())
-    }
 
     suspend fun sendToDiscord(text: String): Boolean = withContext(Dispatchers.IO) {
         val cfg = settings.channelConfig.first()
@@ -59,14 +52,20 @@ class ChannelSender @Inject constructor(
             .build()
         http.newCall(req).execute().use { r ->
             if (!r.isSuccessful) {
-                android.util.Log.w(
-                    "ChannelSender",
-                    "Channel POST to ${url.take(60)}… failed: HTTP ${r.code} ${r.body?.string()?.take(200).orEmpty()}"
+                // Logger redacts the webhook URL (token is in the path).
+                logger.logInfo(
+                    sessionId = "-",
+                    step = 0,
+                    msg = "Channel POST to $url failed: HTTP ${r.code} ${r.body?.string()?.take(200).orEmpty()}"
                 )
             }
             r.isSuccessful
         }
     }.onFailure { e ->
-        android.util.Log.w("ChannelSender", "Channel POST to ${url.take(60)}… threw: ${e.message}")
+        logger.logInfo(
+            sessionId = "-",
+            step = 0,
+            msg = "Channel POST to $url threw: ${e.message}"
+        )
     }.getOrDefault(false)
 }

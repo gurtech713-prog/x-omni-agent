@@ -1,9 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Data extraction rules for Android 12+ device-to-device transfers and
+    cloud backup. Same policy as backup_rules.xml:
+      - Include non-secret settings (provider, UI prefs, permission cache).
+      - EXCLUDE the encrypted secrets store (Keystore-bound, not portable).
+      - EXCLUDE the Room database (contains session messages + memory entries
+        which may include user-private content).
+-->
 <data-extraction-rules>
     <cloud-backup>
-        <include domain="sharedpref" path="." />
+        <include domain="sharedpref" path="omni_settings.xml" />
+        <exclude domain="sharedpref" path="omni_secrets.xml" />
+        <exclude domain="sharedpref" path="omni_secrets_fallback.xml" />
+        <exclude domain="database" path="omniclaw.db" />
     </cloud-backup>
     <device-transfer>
-        <include domain="sharedpref" path="." />
+        <include domain="sharedpref" path="omni_settings.xml" />
+        <exclude domain="sharedpref" path="omni_secrets.xml" />
+        <exclude domain="sharedpref" path="omni_secrets_fallback.xml" />
+        <exclude domain="database" path="omniclaw.db" />
     </device-transfer>
 </data-extraction-rules>

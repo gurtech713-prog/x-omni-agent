@@ -25,6 +25,7 @@ data class ChatMessage(
     val timestamp: Long,
     val toolCalls: List<ToolCall> = emptyList(),
     val thoughts: List<String> = emptyList(),
+    val toolCallId: String? = null,  // ID of the primary tool call for this message
 ) {
     @Serializable
     enum class Role { USER, ASSISTANT, TOOL, SYSTEM }

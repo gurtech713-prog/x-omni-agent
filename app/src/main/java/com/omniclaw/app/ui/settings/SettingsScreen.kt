@@ -1,5 +1,6 @@
 package com.omniclaw.app.ui.settings
 
+import android.util.Log
 import android.Manifest
 import android.content.Context
 import android.content.Intent
@@ -40,6 +41,8 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Autorenew
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Save
@@ -104,6 +107,7 @@ private val ProviderModels: Map<String, List<String>> = mapOf(
     "glm" to listOf("glm-4.6", "glm-4-flash", "glm-4-plus"),
     "gemini" to GeminiModels,
     "openrouter" to listOf("qwen/qwen3.6-flash", "meta-llama/llama-3.1-70b-instruct", "google/gemini-2.5-flash", "anthropic/claude-3.5-sonnet"),
+    "nvidia" to listOf("meta/llama-3.1-70b-instruct", "nvidia/nemotron-4-340b-instruct", "mistralai/mistral-large-2-instruct"),
     "ollama" to listOf("llama3.1:8b", "gemma2:9b", "phi3", "mistral"),
     "minimax" to listOf("MiniMax-M2.5", "abab6.5g-chat"),
     "moonshot" to listOf("kimi-k2.5", "moonshot-v1-8k", "moonshot-v1-32k"),
@@ -120,6 +124,8 @@ private fun getActiveProviderId(cfg: ModelConfig): String {
     }
 }
 
+private const val TAG = "SettingsScreen"
+
 @Composable
 fun SettingsScreen() {
     val vm: SettingsViewModel = hiltViewModel()
@@ -128,8 +134,13 @@ fun SettingsScreen() {
     val channel by vm.channelConfig.collectAsStateWithLifecycle()
     val ui by vm.uiPrefs.collectAsStateWithLifecycle()
     val perms by vm.permissions.collectAsStateWithLifecycle()
+    val privacyAccepted by vm.privacyAccepted.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     var haloEnabled by remember { mutableStateOf(com.omniclaw.app.service.HaloOverlayService.isRunning()) }
+
+    LaunchedEffect(Unit) {
+        Log.d(TAG, "SettingsScreen composed")
+    }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner) {
@@ -146,11 +157,6 @@ fun SettingsScreen() {
             } else {
                 true
             }
-            val systemAllFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                Environment.isExternalStorageManager()
-            } else {
-                true
-            }
             val systemScreenCapture = com.omniclaw.app.service.ScreenCaptureService.isRunning()
 
             vm.setPermissions(
@@ -161,7 +167,6 @@ fun SettingsScreen() {
                     mic = systemMic,
                     media = systemMedia,
                     notifications = systemNotifications,
-                    allFilesAccess = systemAllFiles,
                     screenCapture = systemScreenCapture,
                 )
             )
@@ -197,12 +202,15 @@ fun SettingsScreen() {
                 .background(MaterialTheme.colorScheme.surface),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            SettingsTab.values().forEach { tab ->
+            SettingsTab.entries.forEach { tab ->
                 val selected = activeTab == tab
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { activeTab = tab }
+                        .clickable { 
+                            Log.d(TAG, "Tab switched to: $tab")
+                            activeTab = tab 
+                        }
                         .padding(vertical = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -238,6 +246,7 @@ fun SettingsScreen() {
                         ModelConfigEditor(
                             cfg = model,
                             onChange = { cfg -> scope.launch { vm.setModel(cfg) } },
+                            onProviderChanged = { p, b, m -> scope.launch { vm.changeProvider(p, b, m) } },
                             onDirty = { modelDirty = it },
                         )
                     }
@@ -258,7 +267,10 @@ fun SettingsScreen() {
                             title = "Accessibility service",
                             subtitle = "Inspect UI tree & dispatch taps/swipes/type.",
                             granted = perms.accessibility,
-                            onOpen = { OmniAccessibilityService.openSettings(ctx) },
+                            onOpen = {
+                                Log.i(TAG, "Requesting Accessibility service permission")
+                                OmniAccessibilityService.openSettings(ctx)
+                            },
                         )
                         OmniDivider()
                         PermissionRow(
@@ -266,6 +278,7 @@ fun SettingsScreen() {
                             subtitle = "Floating push-to-talk bubble.",
                             granted = perms.overlay,
                             onOpen = {
+                                Log.i(TAG, "Requesting overlay permission")
                                 val i = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}"))
                                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 ctx.startActivity(i)
@@ -277,6 +290,7 @@ fun SettingsScreen() {
                             subtitle = "Multimodal perception: real-world frames.",
                             granted = perms.camera,
                             onOpen = {
+                                Log.i(TAG, "Requesting Camera permission")
                                 if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                                     openAppSettings(ctx)
                                 } else {
@@ -290,6 +304,7 @@ fun SettingsScreen() {
                             subtitle = "Speech-to-action via ASR.",
                             granted = perms.mic,
                             onOpen = {
+                                Log.i(TAG, "Requesting Microphone permission")
                                 if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     openAppSettings(ctx)
                                 } else {
@@ -303,24 +318,8 @@ fun SettingsScreen() {
                             subtitle = "Continuous screenshot stream for vision fallback.",
                             granted = perms.screenCapture,
                             onOpen = {
+                                Log.i(TAG, "Requesting Screen capture (MediaProjection) permission")
                                 com.omniclaw.app.ScreenCaptureRequestHolder.request()
-                            },
-                        )
-                        OmniDivider()
-                        PermissionRow(
-                            title = "All files access",
-                            subtitle = "Required by gallery memory & one-tap video skill.",
-                            granted = perms.allFilesAccess,
-                            onOpen = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                    val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                        data = Uri.fromParts("package", ctx.packageName, null)
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    }
-                                    runCatching { ctx.startActivity(i) }.onFailure { openAppSettings(ctx) }
-                                } else {
-                                    openAppSettings(ctx)
-                                }
                             },
                         )
                         OmniDivider()
@@ -329,6 +328,7 @@ fun SettingsScreen() {
                             subtitle = "Gallery memory & one-tap video skill.",
                             granted = perms.media,
                             onOpen = {
+                                Log.i(TAG, "Requesting Photos & videos permission")
                                 val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                                     Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
                                 if (ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED) {
@@ -344,6 +344,7 @@ fun SettingsScreen() {
                             subtitle = "Keep the agent loop alive as foreground service.",
                             granted = perms.notifications,
                             onOpen = {
+                                Log.i(TAG, "Requesting Notifications permission")
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                     notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 } else {
@@ -360,6 +361,12 @@ fun SettingsScreen() {
                             subtitle = "Inverts the B&W palette (true black background).",
                             checked = ui.darkMode,
                         ) { v -> scope.launch { vm.setUi(ui.copy(darkMode = v)) } }
+                        OmniDivider()
+                        ToggleRow(
+                            title = "Text-To-Speech (On-Device)",
+                            subtitle = "Speak agent thoughts and responses aloud.",
+                            checked = ui.ttsEnabled,
+                        ) { v -> scope.launch { vm.setUi(ui.copy(ttsEnabled = v)) } }
                         OmniDivider()
                         ToggleRow(
                             title = "Halo (Dynamic Island)",
@@ -423,6 +430,15 @@ fun SettingsScreen() {
                         )
                     }
 
+                    SettingsCard(title = "Privacy & Security") {
+                        PrivacyDisclosureCard(
+                            accepted = privacyAccepted ?: false,
+                            onAccept = { scope.launch { vm.acceptPrivacy() } },
+                        )
+                        OmniDivider()
+                        ApiKeyRotationCard(vm = vm)
+                    }
+
                     SettingsCard(title = "About") {
                         AboutSection()
                     }
@@ -433,9 +449,178 @@ fun SettingsScreen() {
     }
 }
 
+/**
+ * Privacy disclosure card — shown in Settings → System → Privacy & Security.
+ *
+ * Notifies the user that cloud LLM calls (OpenAI, Gemini, OpenRouter, etc.)
+ * send prompts and agent decisions to external servers. Local/on-device models
+ * (LiteRT) are excluded. The user must accept before the app will use cloud
+ * providers — this satisfies basic privacy-compliance expectations.
+ */
+@Composable
+private fun PrivacyDisclosureCard(accepted: Boolean, onAccept: () -> Unit) {
+    Column(Modifier.padding(vertical = 8.dp)) {
+        Text(
+            text = "Cloud LLM Privacy Notice",
+            fontFamily = OmniMono,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = when {
+                accepted -> "✓ You have accepted the privacy notice. Cloud LLM calls send prompts to external servers. Local models (LiteRT) do not."
+                else -> "This app can connect to cloud LLM providers (OpenAI, Gemini, OpenRouter, etc.). When enabled, your prompts and the agent's reasoning steps are sent to those servers for processing. Local/on-device models do NOT send data externally.\n\nDo you accept?"
+            },
+            fontFamily = OmniMono,
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (!accepted) {
+            Spacer(Modifier.height(12.dp))
+            OmniButton(
+                text = "I Understand — Accept",
+                onClick = onAccept,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * API key rotation card — shows rotation status for each stored secret and
+ * allows the user to manually trigger rotation (updates metadata, not the key value).
+ */
+@Composable
+private fun ApiKeyRotationCard(vm: SettingsViewModel) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var loadingKey by remember { mutableStateOf<String?>(null) }
+    var lastMessage by remember { mutableStateOf<String?>(null) }
+
+    val keys = listOf("agent", "gemini", "stt", "vlm")
+    val keyLabels = mapOf(
+        "agent" to "Agent API Key",
+        "gemini" to "Gemini API Key",
+        "stt" to "STT API Key",
+        "vlm" to "VLM API Key",
+    )
+
+    Column(Modifier.padding(vertical = 8.dp)) {
+        Text(
+            text = "API Key Rotation",
+            fontFamily = OmniMono,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "Rotate marks keys as recently rotated. Cached references should be refreshed. Actual key values are unchanged.",
+            fontFamily = OmniMono,
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+
+        keys.forEach { key ->
+            RotationRow(
+                label = keyLabels[key] ?: key,
+                needsRotation = vm.needsRotation(key),
+                lastRotationTime = vm.getLastRotationTime(key),
+                onRotate = {
+                    scope.launch {
+                        loadingKey = key
+                        lastMessage = null
+                        val (success, message) = vm.rotateApiKey(key)
+                        lastMessage = message
+                        loadingKey = null
+                        if (success) {
+                            Toast.makeText(ctx, message, Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(ctx, message, Toast.LENGTH_LONG).show()
+                        }
+                    }
+                },
+                isLoading = loadingKey == key,
+            )
+            OmniDivider()
+        }
+
+        if (lastMessage != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = lastMessage.orEmpty(),
+                fontFamily = OmniMono,
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RotationRow(
+    label: String,
+    needsRotation: Boolean,
+    lastRotationTime: Long?,
+    onRotate: () -> Unit,
+    isLoading: Boolean,
+) {
+    val timeText = if (lastRotationTime != null) {
+        val daysAgo = (System.currentTimeMillis() - lastRotationTime) / (24 * 3600 * 1000)
+        "Last rotated: ${daysAgo}d ago"
+    } else {
+        "Never rotated"
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = label,
+                    fontFamily = OmniMono,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (needsRotation) {
+                    Spacer(Modifier.width(6.dp))
+                    OmniBadge("NEEDS ROTATION", filled = true)
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = timeText,
+                fontFamily = OmniMono,
+                fontSize = 9.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IconButton(onClick = onRotate, enabled = !isLoading) {
+            Icon(
+                imageVector = Icons.Filled.Autorenew,
+                contentDescription = "Rotate $label",
+                tint = if (isLoading) MaterialTheme.colorScheme.onSurfaceVariant
+                       else MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
 @OptIn(FlowPreview::class)
 @Composable
-private fun ModelConfigEditor(cfg: ModelConfig, onChange: (ModelConfig) -> Unit, onDirty: (Boolean) -> Unit = {}) {
+private fun ModelConfigEditor(
+    cfg: ModelConfig, 
+    onChange: (ModelConfig) -> Unit, 
+    onProviderChanged: (com.omniclaw.app.data.prefs.LlmProvider, String, String) -> Unit,
+    onDirty: (Boolean) -> Unit = {}
+) {
     var localBaseUrl by rememberSaveable { mutableStateOf(cfg.baseUrl) }
     var localApiKey by rememberSaveable { mutableStateOf(cfg.apiKey) }
     var localModel by rememberSaveable { mutableStateOf(cfg.model) }
@@ -496,11 +681,7 @@ private fun ModelConfigEditor(cfg: ModelConfig, onChange: (ModelConfig) -> Unit,
             cfg = cfg,
             onProviderSelected = { provider, baseUrl, exampleModel ->
                 showCustomModelInput = false
-                onChange(cfg.copy(
-                    provider = provider,
-                    baseUrl = baseUrl,
-                    model = exampleModel
-                ))
+                onProviderChanged(provider, baseUrl, exampleModel)
             }
         )
         Spacer(Modifier.height(12.dp))
@@ -537,7 +718,7 @@ private fun ModelConfigEditor(cfg: ModelConfig, onChange: (ModelConfig) -> Unit,
         when (cfg.provider) {
             com.omniclaw.app.data.prefs.LlmProvider.OPENAI_COMPAT -> {
                 // Show Base URL for Custom or non-fixed OpenAI integrations
-                if (activeProviderId == "custom" || activeProviderId == "openrouter" || activeProviderId == "ollama") {
+                if (activeProviderId == "custom" || activeProviderId == "openrouter" || activeProviderId == "ollama" || activeProviderId == "nvidia") {
                     LabeledTextField(
                         label = "BASE URL",
                         value = localBaseUrl,
@@ -758,90 +939,26 @@ private fun ChannelConfigEditor(
     val scope = rememberCoroutineScope()
     var testStatus by remember { mutableStateOf<String?>(null) }
 
-    var localFeishuAppId by rememberSaveable { mutableStateOf(cfg.feishuAppId) }
-    var localFeishuAppSecret by rememberSaveable { mutableStateOf(cfg.feishuAppSecret) }
-    var localFeishuWebhook by rememberSaveable { mutableStateOf(cfg.feishuWebhook) }
     var localDiscordWebhook by rememberSaveable { mutableStateOf(cfg.discordWebhook) }
 
-    var feishuEnabled by remember { mutableStateOf(cfg.feishuWebhook.isNotEmpty() || cfg.feishuAppId.isNotEmpty()) }
     var discordEnabled by remember { mutableStateOf(cfg.discordWebhook.isNotEmpty()) }
 
     // Synchronize local states when external config updates
     LaunchedEffect(cfg) {
-        localFeishuAppId = cfg.feishuAppId
-        localFeishuAppSecret = cfg.feishuAppSecret
-        localFeishuWebhook = cfg.feishuWebhook
         localDiscordWebhook = cfg.discordWebhook
     }
 
     fun computeDirty(): Boolean = listOf(
-        localFeishuAppId.trim() != cfg.feishuAppId.trim(),
-        localFeishuAppSecret != cfg.feishuAppSecret,
-        localFeishuWebhook.trim() != cfg.feishuWebhook.trim(),
         localDiscordWebhook.trim() != cfg.discordWebhook.trim(),
     ).any { it }
 
     LaunchedEffect(
-        localFeishuAppId, localFeishuAppSecret, localFeishuWebhook, localDiscordWebhook,
+        localDiscordWebhook,
     ) {
         onDirty(computeDirty())
     }
 
     Column(Modifier.padding(16.dp)) {
-        ToggleRow(
-            title = "Feishu Notifications",
-            subtitle = "Send notifications to a Feishu bot or webhook.",
-            checked = feishuEnabled,
-            onToggle = { enabled ->
-                feishuEnabled = enabled
-                if (!enabled) {
-                    localFeishuAppId = ""
-                    localFeishuAppSecret = ""
-                    localFeishuWebhook = ""
-                }
-            }
-        )
-
-        if (feishuEnabled) {
-            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
-                LabeledTextField(
-                    label = "FEISHU APP ID",
-                    value = localFeishuAppId,
-                    onValueChange = { localFeishuAppId = it },
-                    placeholder = "cli_xxx",
-                )
-                Spacer(Modifier.height(8.dp))
-                var secretVisible by remember { mutableStateOf(false) }
-                LabeledTextField(
-                    label = "FEISHU APP SECRET",
-                    value = localFeishuAppSecret,
-                    onValueChange = { localFeishuAppSecret = it },
-                    placeholder = "••••••••",
-                    keyboardType = KeyboardType.Password,
-                    visualTransformation = if (secretVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailing = {
-                        IconButton(onClick = { secretVisible = !secretVisible }) {
-                            Icon(
-                                if (secretVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
-                                contentDescription = "Toggle visibility"
-                            )
-                        }
-                    }
-                )
-                Spacer(Modifier.height(8.dp))
-                LabeledTextField(
-                    label = "WEBHOOK",
-                    value = localFeishuWebhook,
-                    onValueChange = { localFeishuWebhook = it },
-                    placeholder = "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
-                    keyboardType = KeyboardType.Uri,
-                )
-            }
-            Spacer(Modifier.height(12.dp))
-        }
-
-        OmniDivider()
-        Spacer(Modifier.height(8.dp))
 
         ToggleRow(
             title = "Discord Notifications",
@@ -868,7 +985,7 @@ private fun ChannelConfigEditor(
             Spacer(Modifier.height(12.dp))
         }
 
-        if (feishuEnabled || discordEnabled) {
+        if (discordEnabled) {
             Spacer(Modifier.height(8.dp))
             OmniButton(
                 text = "TEST SEND",
@@ -884,7 +1001,7 @@ private fun ChannelConfigEditor(
             )
             if (testStatus != null) {
                 Text(
-                    testStatus!!,
+                    testStatus.orEmpty(),
                     fontFamily = OmniMono,
                     fontSize = 10.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -899,9 +1016,6 @@ private fun ChannelConfigEditor(
             text = if (channelDirtyState) "SAVE CHANNELS" else "✓ SAVED",
             onClick = {
                 onChange(cfg.copy(
-                    feishuAppId = localFeishuAppId.trim(),
-                    feishuAppSecret = localFeishuAppSecret,
-                    feishuWebhook = localFeishuWebhook.trim(),
                     discordWebhook = localDiscordWebhook.trim(),
                 ))
                 onDirty(false)

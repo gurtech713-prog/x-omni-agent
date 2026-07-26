@@ -18,6 +18,7 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.omniclaw.app.agent.AgentLoop
+import com.omniclaw.app.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -199,39 +200,17 @@ class HaloOverlayService : Service() {
                 }
             })
 
-            // Touch handling: tap = expand/collapse, drag = reposition
+            // Touch handling: tap = expand/collapse, no dragging (make still)
             root.setOnTouchListener(object : View.OnTouchListener {
-                private var rawStartX = 0f
-                private var rawStartY = 0f
-                private var initialX = 0
-                private var initialY = 0
-                private var moved = false
                 private var downTime = 0L
 
                 override fun onTouch(v: View, e: MotionEvent): Boolean {
                     when (e.action) {
                         MotionEvent.ACTION_DOWN -> {
-                            rawStartX = e.rawX; rawStartY = e.rawY
-                            initialX = layoutParams.x
-                            initialY = layoutParams.y
-                            moved = false
                             downTime = System.currentTimeMillis()
                         }
-                        MotionEvent.ACTION_MOVE -> {
-                            val dx = e.rawX - rawStartX
-                            val dy = e.rawY - rawStartY
-                            if (dx * dx + dy * dy > 25 * 25) {
-                                moved = true
-                                layoutParams.x = initialX + dx.toInt()
-                                layoutParams.y = initialY + dy.toInt()
-                                // gravity stays TOP|START (set at construction);
-                                // no mid-drag gravity flip (which previously
-                                // caused a position jump on the first delta).
-                                runCatching { windowManager?.updateViewLayout(root, layoutParams) }
-                            }
-                        }
                         MotionEvent.ACTION_UP -> {
-                            if (!moved && System.currentTimeMillis() - downTime < 300) {
+                            if (System.currentTimeMillis() - downTime < 300) {
                                 v.performClick()
                                 toggleExpanded()
                             }
@@ -294,6 +273,11 @@ class HaloOverlayService : Service() {
                         setState(HaloState.IDLE, "▌▌▌", null)
                         stopPulse()
                     }
+                    is AgentLoop.Event.SkillComplete -> {
+                        if (expanded) {
+                            subtitleText?.text = "${e.skillId}: done"
+                        }
+                    }
                 }
             }
         }
@@ -313,6 +297,12 @@ class HaloOverlayService : Service() {
         }
 
         private fun toggleExpanded() {
+            // Instantly bring the app to the foreground on any click of the Halo Notch!
+            val intent = Intent(ctx, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            runCatching { ctx.startActivity(intent) }
+
             expanded = !expanded
             subtitleText?.visibility = if (expanded) View.VISIBLE else View.GONE
             if (expanded) {
@@ -320,10 +310,30 @@ class HaloOverlayService : Service() {
                 // instead of stale text from a previous state.
                 if (subtitleText?.text.isNullOrEmpty()) {
                     subtitleText?.text = when (currentState) {
-                        HaloState.IDLE -> "tap to collapse"
-                        else -> ""
+                        HaloState.IDLE -> "tap to open app"
+                        else -> "tap to open app"
                     }
                 }
+            } else {
+                subtitleText?.text = ""
+            }
+            rootView?.let { root ->
+                root.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+                    override fun onLayoutChange(
+                        v: View, left: Int, top: Int, right: Int, bottom: Int,
+                        oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int,
+                    ) {
+                        val w = right - left
+                        if (w > 0) {
+                            val dm = ctx.resources.displayMetrics
+                            layoutParams.x = ((dm.widthPixels - w) / 2).coerceAtLeast(0)
+                            runCatching { windowManager?.updateViewLayout(root, layoutParams) }
+                            root.removeOnLayoutChangeListener(this)
+                        }
+                    }
+                })
+                root.requestLayout()
+                runCatching { windowManager?.updateViewLayout(root, layoutParams) }
             }
         }
 
@@ -374,6 +384,21 @@ class HaloOverlayService : Service() {
         fun isRunning(): Boolean = instance != null
 
         fun start(ctx: Context) {
+            if (!android.provider.Settings.canDrawOverlays(ctx)) {
+                android.widget.Toast.makeText(
+                    ctx,
+                    "Please grant 'Display over other apps' permission in Settings first.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                val intent = Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:${ctx.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { ctx.startActivity(intent) }
+                return
+            }
             val i = Intent(ctx, HaloOverlayService::class.java)
             runCatching { ctx.startService(i) }
         }

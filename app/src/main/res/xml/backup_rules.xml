@@ -1,5 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backup rules for X-OmniClaw.
+
+    We EXCLUDE the encrypted secrets store (`omni_secrets`) because:
+      1. EncryptedSharedPreferences keys are wrapped by the Android Keystore,
+         which is hardware-bound (TEE/StrongBox). A restored backup on a new
+         device cannot decrypt the secrets — the master key doesn't exist there.
+      2. Including API keys / webhook URLs in cloud backup is a security risk
+         even if encrypted; defense in depth says don't back them up at all.
+
+    We INCLUDE the non-secret DataStore (`omni_settings`) so the user's
+    provider selection, UI prefs, and permission cache survive a device transfer
+    or restore. Secrets must be re-entered on the new device.
+-->
 <full-backup-content>
-    <include domain="sharedpref" path="." />
-    <exclude domain="sharedpref" path="device.xml" />
+    <include domain="sharedpref" path="omni_settings.xml" />
+    <exclude domain="sharedpref" path="omni_secrets.xml" />
+    <exclude domain="sharedpref" path="omni_secrets_fallback.xml" />
+    <exclude domain="database" path="omniclaw.db" />
 </full-backup-content>

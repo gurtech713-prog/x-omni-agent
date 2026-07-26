@@ -7,7 +7,10 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -80,20 +83,15 @@ data class ProviderPreset(
 
 /** Latest Gemini models available via the Google AI Studio REST API. */
 val GeminiModels: List<String> = listOf(
-    // ── Gemini 3.x — Current frontier (July 2026) ──
-    "gemini-3.5-flash",          // Fastest frontier-class, best for agentic tasks
-    "gemini-3.1-pro",            // Highest reasoning & multimodal capability
-    "gemini-3-flash",            // Balanced performance, lower cost than Pro
-    "gemini-3.1-flash-lite",     // Ultra-low latency, high-volume tasks
-    // ── Gemini 2.5 — Stable / production ──
+    // ── Gemini 3.x ──
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    // ── Gemini 2.5 ──
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
-    // ── Older / legacy ──
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
 )
 
 val ProviderPresets: List<ProviderPreset> = listOf(
@@ -103,6 +101,7 @@ val ProviderPresets: List<ProviderPreset> = listOf(
     ProviderPreset("moonshot",    "Moonshot",    "https://api.moonshot.cn/v1",            "kimi-k2.5"),
     ProviderPreset("minimax",     "MiniMax",     "https://api.minimax.chat/v1",           "MiniMax-M2.5"),
     ProviderPreset("ollama",      "Ollama",      "http://localhost:11434/v1",             "llama3.1:8b"),
+    ProviderPreset("nvidia",      "NVIDIA",      "https://integrate.api.nvidia.com/v1",   "meta/llama-3.1-70b-instruct"),
     ProviderPreset("glm",         "GLM / Zhipu", "https://open.bigmodel.cn/api/paas/v4",  "glm-4.6"),
     // Gemini preset — uses the native GeminiClient (not the OpenAI shim).
     // Selecting this sets provider=GEMINI + the v1beta REST base URL.
@@ -123,8 +122,9 @@ data class UiPrefs(
     val darkMode: Boolean = false,
     val monoFont: Boolean = true,
     val showToolCalls: Boolean = true,
-    val showThoughts: Boolean = true,
+    val showThoughts: Boolean = false,
     val showTokens: Boolean = true,
+    val ttsEnabled: Boolean = false,
 )
 
 data class PermissionsState(
@@ -134,7 +134,6 @@ data class PermissionsState(
     val camera: Boolean = false,
     val mic: Boolean = false,
     val media: Boolean = false,
-    val allFilesAccess: Boolean = false,
     val notifications: Boolean = false,
 )
 
@@ -143,18 +142,30 @@ interface SettingsRepository {
     val channelConfig: Flow<ChannelConfig>
     val uiPrefs: Flow<UiPrefs>
     val permissions: Flow<PermissionsState>
+    /** Emits true when the user has accepted the cloud LLM privacy disclosure, false if not accepted, or null while loading. */
+    val privacyAccepted: Flow<Boolean?>
+    /** FIX #8: Expose SecureStorage state so the UI can warn about cleartext fallback. */
+    val secureStorageState: Flow<SecureStorage.StorageState>
 
     suspend fun setModelConfig(cfg: ModelConfig)
+    
+    fun getApiKeyForProvider(provider: LlmProvider, baseUrl: String): String
     suspend fun setChannelConfig(cfg: ChannelConfig)
     suspend fun setUiPrefs(prefs: UiPrefs)
     suspend fun setPermissions(state: PermissionsState)
+    /** Mark the privacy disclosure as accepted by the user. */
+    suspend fun acceptPrivacyDisclosure()
 }
 
 @Singleton
 class SettingsRepositoryImpl @Inject constructor(
-    @ApplicationContext private val ctx: Context,
+    @param:ApplicationContext private val ctx: Context,
     private val secure: SecureStorage,
 ) : SettingsRepository {
+
+    companion object {
+        private const val TAG = "SettingsRepository"
+    }
 
     private object Keys {
         // Agent model
@@ -187,6 +198,10 @@ class SettingsRepositoryImpl @Inject constructor(
         val showToolCalls = booleanPreferencesKey("ui.show_tool_calls")
         val showThoughts = booleanPreferencesKey("ui.show_thoughts")
         val showTokens = booleanPreferencesKey("ui.show_tokens")
+        val ttsEnabled = booleanPreferencesKey("ui.tts_enabled")
+
+        // Privacy disclosure acceptance flag
+        val privacyAccepted = booleanPreferencesKey("privacy.cloud_llm_accepted")
 
         // Permissions (cached; the source of truth is the system)
         val permAccessibility = booleanPreferencesKey("perm.accessibility")
@@ -199,17 +214,32 @@ class SettingsRepositoryImpl @Inject constructor(
         val permNotifications = booleanPreferencesKey("perm.notifications")
     }
 
+    // FIX #8: Expose SecureStorage state via SettingsRepository so the UI can
+    // display a warning when secrets are stored in cleartext (DEBUG FALLBACK)
+    // or when SecureStorage has failed entirely (RELEASE FAILED). This lets the
+    // Settings screen banner alert users that their API keys may not be protected.
+    override val secureStorageState: Flow<SecureStorage.StorageState> =
+        kotlinx.coroutines.flow.flow { emit(secure.state) }
+
     // Secrets (API keys, webhooks) are read from SecureStorage (encrypted at
     // rest via Tink + Android Keystore). Non-secret fields come from DataStore.
     override val modelConfig: Flow<ModelConfig> = ctx.dataStore.data.map { p ->
         val provider = LlmProvider.fromString(p[Keys.provider])
+        val storedBaseUrl = p[Keys.baseUrl] ?: "https://open.bigmodel.cn/api/paas/v4"
         val key = when (provider) {
             LlmProvider.GEMINI -> secure.getSecret(SecureStorage.KEY_GEMINI_API_KEY)
-            else -> secure.getSecret(SecureStorage.KEY_AGENT_API_KEY)
+            LlmProvider.OPENAI_COMPAT -> {
+                // Determine the provider ID to use as a key suffix by comparing trimmed URLs
+                val trimmedStored = storedBaseUrl.trimEnd('/')
+                val presetMatch = ProviderPresets.find { it.baseUrl.trimEnd('/') == trimmedStored }
+                val providerId = presetMatch?.id ?: "custom"
+                secure.getSecret("agent.api_key.$providerId")
+            }
+            LlmProvider.LITERT -> ""
         }
         ModelConfig(
             provider = provider,
-            baseUrl = p[Keys.baseUrl] ?: "https://open.bigmodel.cn/api/paas/v4",
+            baseUrl = storedBaseUrl,
             apiKey = key,
             model = p[Keys.model] ?: "glm-4.6",
             temperature = (p[Keys.temp] ?: "0.2").toFloatOrNull() ?: 0.2f,
@@ -221,7 +251,7 @@ class SettingsRepositoryImpl @Inject constructor(
             vlmApiKey = secure.getSecret(SecureStorage.KEY_VLM_API_KEY),
             vlmModel = p[Keys.vlmModel] ?: "qwen/qwen3.6-flash",
         )
-    }
+    }.flowOn(Dispatchers.IO)
 
     override val channelConfig: Flow<ChannelConfig> = ctx.dataStore.data.map { p ->
         ChannelConfig(
@@ -230,7 +260,7 @@ class SettingsRepositoryImpl @Inject constructor(
             feishuWebhook = p[Keys.feishuWebhook].orEmpty(),
             discordWebhook = secure.getSecret(SecureStorage.KEY_DISCORD_WEBHOOK),
         )
-    }
+    }.flowOn(Dispatchers.IO)
 
     override val uiPrefs: Flow<UiPrefs> = ctx.dataStore.data.map { p ->
         val systemDark = ctx.resources.configuration.uiMode and
@@ -240,10 +270,15 @@ class SettingsRepositoryImpl @Inject constructor(
             darkMode = p[Keys.darkMode] ?: systemDark,
             monoFont = p[Keys.monoFont] ?: true,
             showToolCalls = p[Keys.showToolCalls] ?: true,
-            showThoughts = p[Keys.showThoughts] ?: true,
+            showThoughts = p[Keys.showThoughts] ?: false,
             showTokens = p[Keys.showTokens] ?: true,
+            ttsEnabled = p[Keys.ttsEnabled] ?: false,
         )
-    }
+    }.flowOn(Dispatchers.IO)
+
+    override val privacyAccepted: Flow<Boolean?> = ctx.dataStore.data.map { p ->
+        p[Keys.privacyAccepted]
+    }.flowOn(Dispatchers.IO)
 
     override val permissions: Flow<PermissionsState> = ctx.dataStore.data.map { p ->
         PermissionsState(
@@ -253,16 +288,34 @@ class SettingsRepositoryImpl @Inject constructor(
             camera = p[Keys.permCamera] ?: false,
             mic = p[Keys.permMic] ?: false,
             media = p[Keys.permMedia] ?: false,
-            allFilesAccess = p[Keys.permAllFiles] ?: false,
             notifications = p[Keys.permNotifications] ?: false,
         )
+    }.flowOn(Dispatchers.IO)
+
+    override fun getApiKeyForProvider(provider: LlmProvider, baseUrl: String): String {
+        return when (provider) {
+            LlmProvider.GEMINI -> secure.getSecret(SecureStorage.KEY_GEMINI_API_KEY)
+            LlmProvider.OPENAI_COMPAT -> {
+                val trimmedBaseUrl = baseUrl.trimEnd('/')
+                val presetMatch = ProviderPresets.find { it.baseUrl.trimEnd('/') == trimmedBaseUrl }
+                val providerId = presetMatch?.id ?: "custom"
+                secure.getSecret("agent.api_key.$providerId")
+            }
+            LlmProvider.LITERT -> ""
+        }
     }
 
     override suspend fun setModelConfig(cfg: ModelConfig) {
         // Secrets go to SecureStorage (encrypted at rest).
         when (cfg.provider) {
             LlmProvider.GEMINI -> secure.setSecret(SecureStorage.KEY_GEMINI_API_KEY, cfg.apiKey)
-            else -> secure.setSecret(SecureStorage.KEY_AGENT_API_KEY, cfg.apiKey)
+            LlmProvider.OPENAI_COMPAT -> {
+                val storedBaseUrl = cfg.baseUrl.trimEnd('/')
+                val presetMatch = ProviderPresets.find { it.baseUrl.trimEnd('/') == storedBaseUrl }
+                val providerId = presetMatch?.id ?: "custom"
+                secure.setSecret("agent.api_key.$providerId", cfg.apiKey)
+            }
+            LlmProvider.LITERT -> {} // No API key for local models
         }
         secure.setSecret(SecureStorage.KEY_STT_API_KEY, cfg.sttApiKey)
         secure.setSecret(SecureStorage.KEY_VLM_API_KEY, cfg.vlmApiKey)
@@ -296,6 +349,7 @@ class SettingsRepositoryImpl @Inject constructor(
             p[Keys.showToolCalls] = prefs.showToolCalls
             p[Keys.showThoughts] = prefs.showThoughts
             p[Keys.showTokens] = prefs.showTokens
+            p[Keys.ttsEnabled] = prefs.ttsEnabled
         }
     }
 
@@ -307,8 +361,13 @@ class SettingsRepositoryImpl @Inject constructor(
             p[Keys.permCamera] = state.camera
             p[Keys.permMic] = state.mic
             p[Keys.permMedia] = state.media
-            p[Keys.permAllFiles] = state.allFilesAccess
             p[Keys.permNotifications] = state.notifications
+        }
+    }
+
+    override suspend fun acceptPrivacyDisclosure() {
+        ctx.dataStore.edit { p ->
+            p[Keys.privacyAccepted] = true
         }
     }
 }
