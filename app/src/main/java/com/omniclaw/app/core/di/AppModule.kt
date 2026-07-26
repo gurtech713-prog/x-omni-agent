@@ -45,13 +45,17 @@ object AppModule {
 
     @Provides @Singleton
     fun provideOkHttp(): OkHttpClient {
-        val log = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
+        // PERFORMANCE: read timeout 60s (was 30s). The agent loop's step timeout
+        // is 45s — if OkHttp fires first, the LLM call fails prematurely and the
+        // retry wastes another 45s. By setting read timeout >= 60s, the step
+        // timeout always wins, giving the LLM the full budget.
+        // HttpLoggingInterceptor at BASIC level would log 2 lines per call
+        // (POST + 200 OK), adding ~0.1ms overhead. Removed since logcat is noisy.
         return OkHttpClient.Builder()
             .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
-            .addInterceptor(log)
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
     }

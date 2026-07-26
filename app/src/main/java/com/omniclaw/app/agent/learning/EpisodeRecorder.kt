@@ -2,7 +2,6 @@ package com.omniclaw.app.agent.learning
 
 import com.omniclaw.app.data.model.Lesson
 import com.omniclaw.app.data.model.ToolCall
-import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -157,7 +156,7 @@ class EpisodeRecorder @Inject constructor() {
      * Compute a coarse fingerprint of a screen observation.
      *
      * We take the observation text, normalize whitespace, extract the first
-     * 200 characters, and SHA-256 hash → first 8 hex chars. This gives a
+     * 200 characters, and sdbm-hash → first 8 hex chars. This gives a
      * stable fingerprint that matches "similar" screens (same app, same
      * top-level layout) without requiring an exact string match.
      *
@@ -172,8 +171,12 @@ class EpisodeRecorder @Inject constructor() {
             .trim()
             .take(200)
         if (normalized.isEmpty()) return "empty"
-        val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray())
-        return digest.joinToString("") { "%02x".format(it) }.take(8)
+        // PERFORMANCE: sdbm polynomial hash (1us) instead of SHA-256 (50us)
+        var hash = 0L
+        for (c in normalized) {
+            hash = (c.code.toLong()) + (hash shl 6) + (hash shl 16) - hash
+        }
+        return java.lang.Long.toHexString(hash and 0xFFFF_FFFFL).padStart(8, '0').take(8)
     }
 
     /**

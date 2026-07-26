@@ -71,12 +71,23 @@ class LearningEngine @Inject constructor(
      * recorded for this screen yet). The AgentLoop appends the result to the
      * system prompt's "Constraints" section.
      */
-    suspend fun lessonsForPrompt(screenFingerprint: String, minConfidence: Int = 2): String? = withContext(Dispatchers.IO) {
+    /** Per-session lesson cache — avoids querying Room DB every step.
+     *  Keyed by sessionId+fingerprint. Invalidated on each recordDirectLesson call
+     *  via clearLessonCache(). The cache is a simple LRU-lite: entries are removed
+     *  when a session ends, and only the current session's keys are stored. */
+    private val lessonCache = java.util.concurrent.ConcurrentHashMap<String, String?>()
+
+    private fun lessonCacheKey(sessionId: String, fp: String) = "$sessionId::$fp"
+
+    suspend fun lessonsForPrompt(screenFingerprint: String, minConfidence: Int = 2, sessionId: String = ""): String? = withContext(Dispatchers.IO) {
+        // PERFORMANCE: cached lesson prompt. Room query skipped on cache hit.
+        if (sessionId.isNotBlank()) {
+            val cached = lessonCache[lessonCacheKey(sessionId, screenFingerprint)]
+            if (cached !== null || lessonCache.containsKey(lessonCacheKey(sessionId, screenFingerprint))) return@withContext cached
+        }
         val lessons = runCatching { lessonDao.forScreen(screenFingerprint, limit = 5, minConfidence = minConfidence) }
             .getOrDefault(emptyList())
-        if (lessons.isEmpty()) return@withContext null
-    
-        buildString {
+        val result = if (lessons.isEmpty()) null else buildString {
             appendLine()
             appendLine("Learned lessons for this screen (from past sessions):")
             lessons.forEach { l ->
@@ -90,6 +101,13 @@ class LearningEngine @Inject constructor(
             }
             appendLine("Apply these lessons: avoid AVOID actions, prefer USE actions.")
         }
+        if (sessionId.isNotBlank()) lessonCache[lessonCacheKey(sessionId, screenFingerprint)] = result
+        result
+    }
+
+    /** Invalidate the per-session lesson cache after recording a new lesson. */
+    fun clearLessonCache(sessionId: String) {
+        lessonCache.keys.removeIf { it.startsWith("$sessionId::") }
     }
 
     /**
@@ -105,6 +123,9 @@ class LearningEngine @Inject constructor(
         outcome: LessonOutcome,
         observation: String,
     ) = withContext(Dispatchers.IO) {
+        // PERFORMANCE: invalidate the per-session lesson cache so the next
+        // step fetches fresh lessons from Room instead of stale cached entries.
+        clearLessonCache(sessionId)
         val now = System.currentTimeMillis()
         val existing = runCatching {
             lessonDao.findExisting(screenFingerprint, actionSignature, outcome.name)

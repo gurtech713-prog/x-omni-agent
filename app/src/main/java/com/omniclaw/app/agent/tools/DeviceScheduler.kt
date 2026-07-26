@@ -85,4 +85,17 @@ class DeviceScheduler @Inject constructor(
             DeviceAction.NoOp -> true
         }
     }
+
+    /**
+     * O(1) stabilization fingerprint — reads root.packageName:childCount
+     * from the accessibility root WITHOUT building the full tree.
+     * Called by AgentLoop.cheapStabilizationFingerprint() in the post-action
+     * stabilization polling loop, replacing the previous snapshotBlocking().take(80)
+     * which serialized the entire accessibility tree each time.
+     */
+    fun stabilizationFingerprint(): String {
+        return (boundService as? com.omniclaw.app.service.OmniAccessibilityService)
+            ?.cheapStabilizationFingerprint()
+            ?: ""
+    }
 }

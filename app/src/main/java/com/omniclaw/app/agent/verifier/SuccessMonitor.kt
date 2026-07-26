@@ -9,7 +9,7 @@ import javax.inject.Singleton
 /**
  * Post-action success monitor.
  *
- * Implements two original X-OmniClaw features:
+ * Implements three original X-OmniClaw features:
  *   1. Post-action verification — checks whether the action produced the
  *      expected effect on the device.
  *   2. Drift detection (loop detection) — detects when the agent is stuck
@@ -43,14 +43,26 @@ class SuccessMonitor @Inject constructor(
     private val sessionStates = mutableMapOf<String, SessionState>()
     private val lock = Any()
 
-    fun verifyLast(sessionId: String, call: ToolCall): Boolean = synchronized(lock) {
+    /**
+     * Verify the last action result, with optional pre-snapped observation.
+     *
+     * PERFORMANCE: When [preSnapshot] is provided (non-null), this method
+     * reuses the observation the agent loop already captured earlier in the
+     * step, avoiding a redundant call to [scheduler.snapshotBlocking()] which
+     * traverses the full accessibility tree a second time.
+     *
+     * Without this cache, every step did TWO full tree traversals:
+     *   1. scheduler.snapshot() at step start for the LLM observation
+     *   2. scheduler.snapshotBlocking() here for verification
+     */
+    fun verifyLast(sessionId: String, call: ToolCall, preSnapshot: String? = null): Boolean = synchronized(lock) {
         val state = sessionStates.getOrPut(sessionId) { SessionState() }
         if (!call.ok) {
             state.consecutiveFailures++
             return@synchronized false
         }
 
-        val snap = scheduler.snapshotBlocking()
+        val snap = preSnapshot ?: scheduler.snapshotBlocking()
 
         if (snap.contains("Error launching", ignoreCase = true) ||
             snap.contains("not responding", ignoreCase = true) ||

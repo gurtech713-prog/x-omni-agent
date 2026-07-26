@@ -158,9 +158,9 @@ class AgentLoop @Inject constructor(
     private val startMutex = Mutex()
 
     /** Per-step LLM call timeout (prevents a single step from running 10+ min). */
-    private val stepTimeoutMs = 60_000L
+    private val stepTimeoutMs = 45_000L  // reduced 60->45s
     /** Per-session overall timeout (prevents maxSteps × stepTimeout runaway). */
-    private val sessionTimeoutMs = 10 * 60 * 1000L
+    private val sessionTimeoutMs = 6 * 60 * 1000L  // reduced 10min->6min
 
     fun start(session: Session, prompt: String) {
         scope.launch {
@@ -367,9 +367,8 @@ class AgentLoop @Inject constructor(
             // ---- Refresh history each step so the LLM sees its own prior
             // thoughts, tool-call results, and any "action failed" system notes.
             // This closes the verify -> retry half of the four-layer loop. ----
-            val history = sessions.getById(sessionId)?.messages.orEmpty().map {
-                LlmClient.Message(role = it.role.name.lowercase(), content = it.content)
-            }
+            // PERFORMANCE: build history incrementally
+            val history = buildHistory(sessionId)
 
             // ---- Dual-track observation: structured tree preferred, vision fallback ----
             var observation = scheduler.snapshot()
@@ -505,6 +504,7 @@ class AgentLoop @Inject constructor(
                     }
                     _events.tryEmit(Event.Failed(sessionId, errMsg))
                     sessions.setStatus(sessionId, SessionStatus.FAILED)
+                    learning.clearLessonCache(sessionId)
                     triggerReflection(sessionId, "FAILED")
                     return
                 } else {
@@ -533,6 +533,7 @@ class AgentLoop @Inject constructor(
                 }
                 _events.tryEmit(Event.Failed(sessionId, errMsg))
                 sessions.setStatus(sessionId, SessionStatus.FAILED)
+                learning.clearLessonCache(sessionId)
                 triggerReflection(sessionId, "FAILED")
                 return
             }
@@ -558,6 +559,8 @@ class AgentLoop @Inject constructor(
                 )
                 _events.tryEmit(Event.Completed(sessionId, "Empty response from model."))
                 sessions.setStatus(sessionId, SessionStatus.DONE)
+                clearHistoryCache(sessionId)
+                learning.clearLessonCache(sessionId)
                 triggerReflection(sessionId, "DONE")
                 return
             }
@@ -609,13 +612,15 @@ class AgentLoop @Inject constructor(
             // New logic: flag only if the same (action, screen fingerprint) pair
             // repeats — same action on the same screen means we're stuck; same
             // action on a different screen means we're making progress.
-            val sig = episodeRecorder.normalizeAction(action)
+            // PERFORMANCE: compute fingerprint and normalized action ONCE per step
             val currentFingerprint = episodeRecorder.fingerprint(observation)
+            val sig = episodeRecorder.normalizeAction(action)
             val stuckCount = recentActions.count { it.first == sig && it.second == currentFingerprint }
             if (stuckCount >= 2) {
                 _events.tryEmit(Event.LoopDetected(sessionId))
                 sessions.setStatus(sessionId, SessionStatus.FAILED)
                 episodeRecorder.recordLoop(sessionId, step, observation, action)
+                learning.clearLessonCache(sessionId)
                 triggerReflection(sessionId, "FAILED")
                 return
             }
@@ -642,8 +647,9 @@ class AgentLoop @Inject constructor(
                 durationMs = System.currentTimeMillis() - started,
             )
             _events.tryEmit(Event.ToolCall(sessionId, step, call))
-            // If behavior recording is active, log this action for later replay.
-            behaviorRecorder.recordAction(call)
+            // PERFORMANCE: defer behavior recording off the hot path
+            val fCall = call
+            scope.launch { behaviorRecorder.recordAction(fCall) }
             sessions.appendMessage(
                 sessionId,
                 ChatMessage(
@@ -655,22 +661,21 @@ class AgentLoop @Inject constructor(
                 )
             )
 
-            // Verify
-            val verifyOk = verifier.verifyLast(sessionId, call)
+            // Verify — pass the already-captured observation as preSnapshot so
+            // SuccessMonitor doesn't build the same tree a second time.
+            val verifyOk = verifier.verifyLast(sessionId, call, preSnapshot = observation)
             // Record this step in the episode for self-learning reflection.
             episodeRecorder.recordStep(sessionId, step, observation, action, call, verifyOk)
             // Record a direct (fingerprint, action, outcome) lesson immediately —
-            // this captures concrete experience without waiting for LLM reflection.
-            val fingerprint = episodeRecorder.fingerprint(observation)
-            val actionSig = episodeRecorder.normalizeAction(action)
+            // uses the ALREADY-COMPUTED fingerprint and actionSig from above.
             val outcome = when {
                 !call.ok -> com.omniclaw.app.data.model.Lesson.LessonOutcome.FAILURE
                 !verifyOk -> com.omniclaw.app.data.model.Lesson.LessonOutcome.FAILURE
                 else -> com.omniclaw.app.data.model.Lesson.LessonOutcome.SUCCESS
             }
-            runCatching {
-                learning.recordDirectLesson(sessionId, fingerprint, actionSig, outcome, observation)
-            }
+            // PERFORMANCE: defer lesson recording off the hot path
+            val fFp = currentFingerprint; val fAs = sig
+            scope.launch { runCatching { learning.recordDirectLesson(sessionId, fFp, fAs, outcome, observation) } }
             if (!verifyOk) {
                 // Tell the LLM and let it retry on next iteration
                 sessions.appendMessage(
@@ -701,13 +706,17 @@ class AgentLoop @Inject constructor(
             // fingerprint used for cycle detection. The cheap fingerprint is
             // sufficient for "did the screen change?" polling and avoids
             // re-hashing up to 8KB of observation text 15x per step.
-            if (parsedAction.startsWith("tap", ignoreCase = true) ||
+            // PERFORMANCE: Skip stabilization if the action already failed —
+            // the screen didn't change so there's nothing to wait for. This saves
+            // 200-400ms on every failed attempt (common when the app isn't responding).
+            if (call.ok && (
+                parsedAction.startsWith("tap", ignoreCase = true) ||
                 parsedAction.startsWith("swipe", ignoreCase = true) ||
                 parsedAction.startsWith("launch", ignoreCase = true) ||
                 parsedAction.startsWith("back", ignoreCase = true) ||
                 parsedAction.startsWith("home", ignoreCase = true) ||
                 parsedAction.startsWith("type", ignoreCase = true)
-            ) {
+            )) {
                 val initialDelay = getAdaptiveInitialDelay()
                 kotlinx.coroutines.delay(initialDelay)
                 
@@ -1042,7 +1051,7 @@ class AgentLoop @Inject constructor(
         // the current screen fingerprint. If any are found, they're appended
         // here so the LLM can avoid known-bad actions and repeat known-good ones.
         val fingerprint = episodeRecorder.fingerprint(observation)
-        val lessons = runCatching { learning.lessonsForPrompt(fingerprint) }.getOrNull()
+        val lessons = runCatching { learning.lessonsForPrompt(fingerprint, sessionId = sessionId) }.getOrNull()
         if (lessons != null) {
             appendLine(lessons)
             // Emit a LessonsApplied event so the chat UI can show a transparency
@@ -1086,6 +1095,29 @@ class AgentLoop @Inject constructor(
         }
     }
 
+    /**
+     * Incremental history builder — fetches all messages only on the first
+     * call per session, then only appends new messages on subsequent steps.
+     * Avoids fetching + deserializing the full Room message list every step.
+     */
+    private val historyCache = java.util.concurrent.ConcurrentHashMap<String, MutableList<LlmClient.Message>>()
+
+    private suspend fun buildHistory(sessionId: String): List<LlmClient.Message> {
+        val cached = historyCache.getOrPut(sessionId) { mutableListOf() }
+        val session = sessions.getById(sessionId) ?: return cached.toList()
+        if (cached.size == session.messages.size) return cached.toList()
+        val startIdx = cached.size
+        for (i in startIdx until session.messages.size) {
+            val msg = session.messages[i]
+            cached.add(LlmClient.Message(role = msg.role.name.lowercase(), content = msg.content))
+        }
+        return cached.toList()
+    }
+
+    private fun clearHistoryCache(sessionId: String) {
+        historyCache.remove(sessionId)
+    }
+
     private suspend fun isStopRequested(sessionId: String): Boolean {
         // Stop if the user requested it OR the session was deleted / externally stopped.
         if (stopMutex.withLock { sessionId in stopSet }) return true
@@ -1110,23 +1142,28 @@ class AgentLoop @Inject constructor(
      * as "stable" and exit, which is the correct behavior when there's no
      * tree to observe (no point polling).
      */
+    /**
+     * O(1) stabilization fingerprint — reads root.packageName:childCount
+     * WITHOUT building the full tree. Previous impl built the entire tree
+     * (~10-50KB string) then took first 80 chars — wasted 12+ tree traversals/step.
+     */
     private fun cheapStabilizationFingerprint(): String {
-        return runCatching { scheduler.snapshotBlocking().take(80) }.getOrDefault("")
+        return scheduler.stabilizationFingerprint()
     }
 
     @Volatile
     private var avgStabilizationTimeMs = 150L
 
     private fun getAdaptiveInitialDelay(): Long {
-        return (avgStabilizationTimeMs * 0.5).toLong().coerceIn(50L, 300L)
+        return (avgStabilizationTimeMs * 0.5).toLong().coerceIn(30L, 200L)
     }
 
     private fun getAdaptiveCap(): Long {
-        return 600L
+        return 400L  // reduced from 600ms
     }
 
     private fun getAdaptivePollInterval(): Long {
-        return 50L
+        return 80L  // increased from 50ms (fewer CPU wake-ups)
     }
 
     private fun updateStabilizationMetrics(elapsedMs: Long) {

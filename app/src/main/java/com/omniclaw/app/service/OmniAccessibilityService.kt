@@ -96,6 +96,30 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
         }
     }
 
+    /**
+     * O(1) stabilization fingerprint for the post-action polling loop.
+     *
+     * Returns "packageName:childCount" from the accessibility root WITHOUT
+     * building the full tree string. Previous approach called
+     * snapshotTree().take(80) which serialized the entire tree (10-50KB)
+     * then discarded all but the first 80 characters — repeated 12+ times
+     * per step in the stabilization loop.
+     *
+     * This method reads root.packageName and root.childCount only — O(1)
+     * with zero string serialization. Returns empty string if no root is
+     * available (service disconnected or initializing).
+     */
+    fun cheapStabilizationFingerprint(): String {
+        val root = rootInActiveWindow ?: return ""
+        try {
+            val pkg = root.packageName?.toString() ?: ""
+            val count = root.childCount
+            return "$pkg:$count"
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
     private fun appendNode(sb: StringBuilder, node: AccessibilityNodeInfo?, depth: Int) {
         if (node == null || depth > 50) return
         
