@@ -33,6 +33,10 @@ import javax.inject.Singleton
  *    polling thread is spawned per speak() call. This was previously a
  *    per-call Thread.sleep heuristic that leaked 240+ threads per session
  *    under streaming-thoughts usage.
+ *  - [shutdown] is @Synchronized and sets [shuttingDown] so the eager init
+ *    thread / its async callback can't construct (or mark ready) a new engine
+ *    after teardown — previously the init thread could assign tts AFTER
+ *    shutdown nulled it, leaking an engine that was never shut down.
  *
  * Error handling:
  *  - If the TTS engine is unavailable (no TTS package on the device),
@@ -52,6 +56,13 @@ class TextToSpeechManager @Inject constructor(
     @Volatile
     private var tts: TextToSpeech? = null
 
+    /** Set by [shutdown] so an in-flight init can't resurrect a leaked engine. */
+    @Volatile
+    private var shuttingDown = false
+
+    /** Background thread that runs the eager init; interrupted on [shutdown]. */
+    private var initThread: Thread? = null
+
     private val _isReady = MutableStateFlow(false)
     /** True once the TTS engine has reported successful init. */
     val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
@@ -64,9 +75,12 @@ class TextToSpeechManager @Inject constructor(
         // Initialize eagerly but off the main thread — TextToSpeech's
         // constructor can take 100-300ms on first launch as it binds to the
         // system TTS service. A background thread keeps app startup snappy.
-        Thread({
+        initThread = Thread({
             ensureInitialized()
-        }, "TtsInit").apply { isDaemon = true }.start()
+        }, "TtsInit").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     /**
@@ -76,45 +90,57 @@ class TextToSpeechManager @Inject constructor(
      */
     @Synchronized
     fun ensureInitialized() {
+        // Don't construct a new engine after shutdown() has run.
+        if (shuttingDown) return
         if (ready.get() || tts != null) return
         tts = TextToSpeech(ctx) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                runCatching {
-                    val result = tts?.setLanguage(Locale.getDefault())
-                    if (result == TextToSpeech.LANG_MISSING_DATA ||
-                        result == TextToSpeech.LANG_NOT_SUPPORTED
-                    ) {
-                        Log.w(TAG, "TTS language not supported; falling back to en-US")
-                        tts?.setLanguage(Locale.US)
-                    }
+            when {
+                shuttingDown -> {
+                    // shutdown() ran while we were binding to the TTS service —
+                    // tear down the freshly-created engine instead of marking it
+                    // ready and leaking it.
+                    runCatching { tts?.shutdown() }
+                    tts = null
                 }
-                // Wire the UtteranceProgressListener for accurate completion
-                // (no per-call Thread.sleep heuristic — those leak threads).
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {
-                        speaking.set(true)
-                        _isSpeaking.value = true
+                status == TextToSpeech.SUCCESS -> {
+                    runCatching {
+                        val result = tts?.setLanguage(Locale.getDefault())
+                        if (result == TextToSpeech.LANG_MISSING_DATA ||
+                            result == TextToSpeech.LANG_NOT_SUPPORTED
+                        ) {
+                            Log.w(TAG, "TTS language not supported; falling back to en-US")
+                            tts?.setLanguage(Locale.US)
+                        }
                     }
-                    override fun onDone(utteranceId: String?) {
-                        speaking.set(false)
-                        _isSpeaking.value = false
-                    }
-                    @Deprecated("Required override", ReplaceWith(""))
-                    override fun onError(utteranceId: String?) {
-                        speaking.set(false)
-                        _isSpeaking.value = false
-                    }
-                    override fun onError(utteranceId: String?, errorCode: Int) {
-                        speaking.set(false)
-                        _isSpeaking.value = false
-                    }
-                })
-                ready.set(true)
-                _isReady.value = true
-                Log.i(TAG, "TTS engine ready")
-            } else {
-                Log.w(TAG, "TTS init failed: status=$status")
-                tts = null
+                    // Wire the UtteranceProgressListener for accurate completion
+                    // (no per-call Thread.sleep heuristic — those leak threads).
+                    tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {
+                            speaking.set(true)
+                            _isSpeaking.value = true
+                        }
+                        override fun onDone(utteranceId: String?) {
+                            speaking.set(false)
+                            _isSpeaking.value = false
+                        }
+                        @Deprecated("Required override", ReplaceWith(""))
+                        override fun onError(utteranceId: String?) {
+                            speaking.set(false)
+                            _isSpeaking.value = false
+                        }
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            speaking.set(false)
+                            _isSpeaking.value = false
+                        }
+                    })
+                    ready.set(true)
+                    _isReady.value = true
+                    Log.i(TAG, "TTS engine ready")
+                }
+                else -> {
+                    Log.w(TAG, "TTS init failed: status=$status")
+                    tts = null
+                }
             }
         }
     }
@@ -157,7 +183,13 @@ class TextToSpeechManager @Inject constructor(
     }
 
     /** Release the TTS engine. Safe to call multiple times. */
+    @Synchronized
     fun shutdown() {
+        // Mark shutting down first (and interrupt the eager init thread) so an
+        // in-flight ensureInitialized / its async callback can't construct or
+        // mark-ready a new engine after we tear the current one down.
+        shuttingDown = true
+        initThread?.interrupt()
         runCatching { tts?.stop() }
         runCatching { tts?.setOnUtteranceProgressListener(null) }
         runCatching { tts?.shutdown() }

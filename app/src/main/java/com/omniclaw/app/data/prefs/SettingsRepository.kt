@@ -163,7 +163,11 @@ interface SettingsRepository {
     val permissions: Flow<PermissionsState>
     /** Emits true when the user has accepted the cloud LLM privacy disclosure, false if not accepted, or null while loading. */
     val privacyAccepted: Flow<Boolean?>
-    /** FIX #8: Expose SecureStorage state so the UI can warn about cleartext fallback. */
+    /** FIX #8: Expose SecureStorage state so the UI can warn about cleartext fallback.
+     *  NOTE (M-49): This is a ONE-SHOT Flow — it emits the current state once and
+     *  completes. SecureStorage.state is set once at init and does not change at
+     *  runtime. Callers should use first() rather than collect() to avoid
+     *  expecting reactive updates. */
     val secureStorageState: Flow<SecureStorage.StorageState>
 
     suspend fun setModelConfig(cfg: ModelConfig)
@@ -247,6 +251,7 @@ class SettingsRepositoryImpl @Inject constructor(
     // or when SecureStorage has failed entirely (RELEASE FAILED). This lets the
     // Settings screen banner alert users that their API keys may not be protected.
     override val secureStorageState: Flow<SecureStorage.StorageState> =
+    // M-49: One-shot Flow — emits once and completes. Callers should use first().
         kotlinx.coroutines.flow.flow { emit(secure.state) }
 
     // Secrets (API keys, webhooks) are read from SecureStorage (encrypted at

@@ -82,8 +82,10 @@ class LearningEngine @Inject constructor(
     suspend fun lessonsForPrompt(screenFingerprint: String, minConfidence: Int = 2, sessionId: String = ""): String? = withContext(Dispatchers.IO) {
         // PERFORMANCE: cached lesson prompt. Room query skipped on cache hit.
         if (sessionId.isNotBlank()) {
-            val cached = lessonCache[lessonCacheKey(sessionId, screenFingerprint)]
-            if (cached !== null || lessonCache.containsKey(lessonCacheKey(sessionId, screenFingerprint))) return@withContext cached
+            val key = lessonCacheKey(sessionId, screenFingerprint)
+            // Single membership check distinguishes "cached null" from "not cached"
+            // without a racy [] + containsKey pair (audit M-51).
+            if (lessonCache.containsKey(key)) return@withContext lessonCache[key]
         }
         val lessons = runCatching { lessonDao.forScreen(screenFingerprint, limit = 5, minConfidence = minConfidence) }
             .getOrDefault(emptyList())
@@ -188,6 +190,9 @@ class LearningEngine @Inject constructor(
                 Log.w(TAG, "Pruning stale lessons failed: ${e.message}")
             } finally {
                 recorder.clear(sessionId)
+                // Evict per-session state so mutexes + cached lessons do not leak (audit H-08).
+                sessionMutexes.remove(sessionId)
+                clearLessonCache(sessionId)
             }
         }
     }
@@ -293,8 +298,7 @@ class LearningEngine @Inject constructor(
                 maxTokens = 400,
             )
             val content = result.text
-            val hash = userPrompt.hashCode().toString(16).take(6)
-            val id = "auto-$hash"
+            val id = "auto-${UUID.randomUUID().toString().take(8)}"
             val dir = java.io.File(ctx.filesDir, "skills/$id").apply { mkdirs() }
             java.io.File(dir, "SKILL.md").writeText(content)
             logger.logInfo(sessionId, 0, "auto-skill: created $id from ${steps.size}-step trajectory")

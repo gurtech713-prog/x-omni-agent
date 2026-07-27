@@ -49,12 +49,15 @@ import androidx.core.view.WindowCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.omniclaw.app.core.nav.OmniApp
+import com.omniclaw.app.deeplink.DeepLinkHandler
+import com.omniclaw.app.deeplink.DeepLinkResult
 import com.omniclaw.app.core.theme.Motion
 import com.omniclaw.app.core.theme.OmniMono
 import com.omniclaw.app.core.theme.OmniTheme
 import com.omniclaw.app.service.ScreenCaptureService
 import com.omniclaw.app.ui.settings.SettingsViewModel
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -62,6 +65,8 @@ import android.util.Log
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
+
+    @Inject lateinit var deepLinkHandler: DeepLinkHandler
 
     /** Activity-result launcher for MediaProjection permission. */
     private val mediaProjectionLauncher = registerForActivityResult(
@@ -116,8 +121,30 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            // C-13: process a cold-start deep link (e.g. omniclaw://session/{id}).
+            handleDeepLink(intent)
         } catch (e: Throwable) {
             Log.e("MainActivity", "Error in onCreate", e)
+        }
+    }
+
+    /**
+     * C-13: route a new intent into the deep-link handler. Called for both
+     * cold starts (onCreate) and singleInstance re-launches (onNewIntent).
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    private fun handleDeepLink(intent: Intent?) {
+        when (val result = deepLinkHandler.handleIntent(intent)) {
+            is DeepLinkResult.SESSION_OPEN ->
+                Log.d("MainActivity", "Deep link -> open session ${'$'}{result.sessionId}")
+            DeepLinkResult.INVALID ->
+                Log.w("MainActivity", "Deep link -> invalid / unparseable")
+            DeepLinkResult.NONE -> Unit
         }
     }
 

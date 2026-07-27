@@ -34,6 +34,17 @@ class AudioRecorder @Inject constructor(
             r.setAudioEncodingBitRate(64_000)
             r.setAudioSamplingRate(16_000)
             r.setOutputFile(out.absolutePath)
+            // Safety bound (M-22): cap recordings at 60s so a stuck or pocket press
+            // can't write a multi-MB file to cacheDir and stress the encoder. The
+            // OnInfoListener auto-stops when the limit is hit.
+            r.setMaxDuration(MAX_DURATION_MS)
+            r.setOnInfoListener { _, what, _ ->
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                    Log.i(TAG, "Max duration (${MAX_DURATION_MS}ms) reached — auto-stopping")
+                    runCatching { stop() }
+                        .onFailure { Log.w(TAG, "auto-stop at max duration failed: ${it.message}") }
+                }
+            }
             r.prepare()
             r.start()
         } catch (e: Exception) {
@@ -89,5 +100,6 @@ class AudioRecorder @Inject constructor(
 
     companion object {
         private const val TAG = "AudioRecorder"
+        private const val MAX_DURATION_MS = 60_000
     }
 }

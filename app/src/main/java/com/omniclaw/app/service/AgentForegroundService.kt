@@ -31,11 +31,7 @@ class AgentForegroundService : Service() {
         ensureNotificationChannel()
         val notif = buildNotification()
 
-        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            tryStartForegroundSpecialUse(notif)
-        } else {
-            tryStartForegroundPlain(notif)
-        }
+        val started = tryStartForeground(notif)
 
         if (!started) {
             android.util.Log.e("AgentForegroundService", "AgentForegroundService failed to promote to foreground onCreate; stopping service.")
@@ -60,24 +56,18 @@ class AgentForegroundService : Service() {
         )
     }
 
-    private fun tryStartForegroundSpecialUse(notif: Notification): Boolean {
+    private fun tryStartForeground(notif: Notification): Boolean {
+        // The manifest declares foregroundServiceType="specialUse". On Android 14+
+        // (UPSIDE_DOWN_CAKE) the typed startForeground call is mandatory; a plain
+        // startForeground for a manifest-typed service throws
+        // ForegroundServiceTypeNotAllowed, so there is intentionally NO plain
+        // fallback (audit L-05). Failures surface as started=false -> stopSelf().
         return runCatching {
-            startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        }.map { true }
-            .recoverCatching { e ->
-                android.util.Log.w(
-                    "AgentForegroundService",
-                    "specialUse foreground start failed; falling back to plain foreground: ${e.message}",
-                    e,
-                )
-                tryStartForegroundPlain(notif)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notif)
             }
-            .getOrDefault(false)
-    }
-
-    private fun tryStartForegroundPlain(notif: Notification): Boolean {
-        return runCatching {
-            startForeground(NOTIF_ID, notif)
         }.onFailure { e ->
             android.util.Log.e("AgentForegroundService", "Failed to start foreground service in onCreate: ${e.message}", e)
         }.isSuccess

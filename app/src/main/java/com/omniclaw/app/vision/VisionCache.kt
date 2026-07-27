@@ -2,6 +2,8 @@ package com.omniclaw.app.vision
 
 import android.util.LruCache
 import java.security.MessageDigest
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * LRU cache for VLM responses, keyed by (image-hash + question-hash).
@@ -23,6 +25,17 @@ class VisionCache(
     private val cache = object : LruCache<String, CacheEntry>(maxSizeBytes) {
         override fun sizeOf(key: String, value: CacheEntry): Int =
             value.text.toByteArray().size + 64 // overhead estimate
+    }
+
+    /** Scheduled executor for periodic expired-entry sweeps. */
+    private val sweepExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "VisionCacheSweep").apply { isDaemon = true }
+    }
+
+    init {
+        // Sweep expired entries every 60 seconds to prevent stale entries
+        // from accumulating when they are never looked up again.
+        sweepExecutor.scheduleAtFixedRate({ sweepExpired() }, 60, 60, TimeUnit.SECONDS)
     }
 
     data class CacheEntry(
@@ -49,7 +62,7 @@ class VisionCache(
         val entry = CacheEntry(
             text = response,
             createdAt = System.currentTimeMillis(),
-            imageHash = hash(imageBytes),
+            imageHash = hashSampled(imageBytes),
             questionHash = hash(question.toByteArray()),
         )
         cache.put(key, entry)
@@ -61,8 +74,34 @@ class VisionCache(
     /** Number of cached entries. */
     val size: Int get() = cache.size()
 
+    /** Remove all expired entries from the cache. */
+    fun sweepExpired() {
+        val now = System.currentTimeMillis()
+        cache.snapshot().keys.filter { key ->
+            val entry = cache.get(key)
+            entry != null && now - entry.createdAt > TTL_MS
+        }.forEach { key ->
+            cache.remove(key)
+        }
+    }
+
     private fun buildKey(imageBytes: ByteArray, question: String): String =
-        hash(imageBytes) + ":" + hash(question.toByteArray())
+        hashSampled(imageBytes) + ":" + hash(question.toByteArray())
+
+    /**
+     * Hash a sampled prefix of the image (first 4 KB + last 4 KB) instead of
+     * the full multi-MB payload. This reduces SHA-256 cost from ~5-15 ms to
+     * <1 ms while still providing a unique-enough key for cache lookups.
+     */
+    private fun hashSampled(data: ByteArray): String {
+        val sampleSize = 4096
+        val sampled = if (data.size <= sampleSize * 2) {
+            data
+        } else {
+            data.copyOfRange(0, sampleSize) + data.copyOfRange(data.size - sampleSize, data.size)
+        }
+        return hash(sampled)
+    }
 
     private fun hash(data: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(data)

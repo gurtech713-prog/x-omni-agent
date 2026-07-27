@@ -49,9 +49,9 @@ object VisionRetryPolicy {
  *   - [VisionResponseParser] for response extraction.
  *   - [VisionRetryPolicy] for transient-failure retry.
  *
- * The pipeline is a [Singleton] so the [BitmapPool] and [VisionCache] are
- * shared across all callers (agent loop, skills, UI). Thread safety: all
- * collaborators are thread-safe; the pipeline itself is stateless.
+ * The pipeline is a [Singleton] so the [VisionCache] is shared across all
+ * callers (agent loop, skills, UI). Thread safety: all collaborators are
+ * thread-safe; the pipeline itself is stateless.
  */
 @Singleton
 class VisionPipeline @Inject constructor(
@@ -60,10 +60,13 @@ class VisionPipeline @Inject constructor(
     private val settings: com.omniclaw.app.data.prefs.SettingsRepository,
 ) {
 
-    private val bitmapPool: BitmapPool = BitmapPool(width = 768, height = 768, maxPoolSize = 4)
-    private val preprocessor = ImagePreprocessor(bitmapPool)
+    // M-17: the fixed-size BitmapPool was injected into ImagePreprocessor but
+    // never used (preprocess resizes to a variable aspect ratio that a fixed
+    // 768x768 pooled bitmap can't back without padding/crashes). Removed per the
+    // finding's 'delete the pool' option; BitmapPool remains available elsewhere.
+    private val preprocessor = ImagePreprocessor()
     private val cache = VisionCache()
-    private val requestBuilder = VisionRequestBuilder(settings)
+    private val requestBuilder = VisionRequestBuilder()
     private val parser = VisionResponseParser(json)
 
     /**
@@ -91,10 +94,11 @@ class VisionPipeline @Inject constructor(
         val mime = sniffImageMime(processed)
         val dataUri = "data:$mime;base64,$b64"
 
-        // 4. Build payload
-        val payload = requestBuilder.build(dataUri, question)
+        // 4. Build payload (M-18: read modelConfig ONCE and share it with the
+        //    builder instead of each calling settings.modelConfig.first()).
         val cfg = settings.modelConfig.first()
         if (cfg.vlmApiKey.isBlank() || cfg.vlmBaseUrl.isBlank()) return null
+        val payload = requestBuilder.build(cfg, dataUri, question)
 
         // 5. Upload with retry
         val result = runCatching {

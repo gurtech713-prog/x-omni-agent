@@ -1,5 +1,8 @@
 package com.omniclaw.app.service
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -10,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -17,6 +21,9 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import com.omniclaw.app.OmniApplication
+import com.omniclaw.app.R
 import com.omniclaw.app.agent.AgentLoop
 import com.omniclaw.app.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
@@ -65,6 +72,25 @@ class HaloOverlayService : Service() {
         super.onCreate()
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
+
+        // H-20: promote to a specialUse foreground service so the halo isn't
+        // killed on Android 14+. Shares the agent notification channel; the
+        // manifest declares foregroundServiceType="specialUse" for this service.
+        ensureNotificationChannel()
+        runCatching {
+            val notif = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIF_ID,
+                    notif,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to promote HaloOverlayService to foreground: ${'$'}{e.message}", e)
+        }
         halo = HaloView(this).also { it.attach() }
         // Subscribe to agent events to drive the halo state.
         scope.launch {
@@ -87,6 +113,11 @@ class HaloOverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Display any status text pushed via ServiceGateway.showHaloStatus (audit M-44).
+        val status = intent?.getStringExtra(EXTRA_STATUS)
+        if (!status.isNullOrEmpty()) {
+            halo?.showStatus(status)
+        }
         return START_STICKY
     }
 
@@ -282,7 +313,25 @@ class HaloOverlayService : Service() {
             }
         }
 
+        /** Display a dynamic status line pushed via ServiceGateway.showHaloStatus (audit M-44). */
+        fun showStatus(text: String) {
+            setState(HaloState.RUNNING, "AGENT", text)
+            subtitleText?.text = text
+            subtitleText?.visibility = View.VISIBLE
+        }
+
+        /** Re-read the system night-mode and re-apply title/subtitle colors so a
+         *  theme toggle while the halo is visible never leaves invisible text (audit M-23). */
+        private fun applyThemeColors() {
+            val isDarkTheme = (ctx.resources.configuration.uiMode and
+                android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                android.content.res.Configuration.UI_MODE_NIGHT_YES
+            titleText?.setTextColor(if (isDarkTheme) Color.WHITE else Color.BLACK)
+            subtitleText?.setTextColor(if (isDarkTheme) 0xCCFFFFFF.toInt() else 0xCC000000.toInt())
+        }
+
         private fun setState(state: HaloState, title: String, subtitle: String?) {
+            applyThemeColors()
             currentState = state
             titleText?.text = title
             if (subtitle != null && expanded) {
@@ -297,6 +346,7 @@ class HaloOverlayService : Service() {
         }
 
         private fun toggleExpanded() {
+            applyThemeColors()
             // Instantly bring the app to the foreground on any click of the Halo Notch!
             val intent = Intent(ctx, MainActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -377,13 +427,42 @@ class HaloOverlayService : Service() {
         ).toInt()
     }
 
+    private fun buildNotification(): Notification =
+        NotificationCompat.Builder(this, OmniApplication.CHANNEL_AGENT)
+            .setContentTitle("Omni Halo")
+            .setContentText("Agent status overlay is active.")
+            .setSmallIcon(R.drawable.ic_omni_mono)
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(OmniApplication.CHANNEL_AGENT) != null) return
+        nm.createNotificationChannel(
+            NotificationChannel(
+                OmniApplication.CHANNEL_AGENT,
+                "Omni agent",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "On-device agent services (overlay, capture, automation)."
+                setShowBadge(false)
+            }
+        )
+    }
+
     private enum class HaloState { IDLE, RUNNING, DONE, FAILED }
 
     companion object {
         @Volatile private var instance: HaloOverlayService? = null
         fun isRunning(): Boolean = instance != null
+        const val EXTRA_STATUS = "com.omniclaw.app.service.HaloOverlayService.EXTRA_STATUS"
+        private const val TAG = "HaloOverlayService"
+        private const val NOTIF_ID = 0x0B52
 
-        fun start(ctx: Context) {
+        fun start(ctx: Context, statusText: String? = null) {
             if (!android.provider.Settings.canDrawOverlays(ctx)) {
                 android.widget.Toast.makeText(
                     ctx,
@@ -400,7 +479,13 @@ class HaloOverlayService : Service() {
                 return
             }
             val i = Intent(ctx, HaloOverlayService::class.java)
-            runCatching { ctx.startService(i) }
+            if (statusText != null) i.putExtra(EXTRA_STATUS, statusText)
+            // H-20: the service promotes itself to a specialUse foreground
+            // service in onCreate, so start it as a foreground service on O+.
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                else ctx.startService(i)
+            }
         }
         fun stop(ctx: Context) {
             ctx.stopService(Intent(ctx, HaloOverlayService::class.java))

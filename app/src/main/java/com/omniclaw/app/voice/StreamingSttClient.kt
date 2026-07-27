@@ -4,6 +4,7 @@ import android.util.Log
 import com.omniclaw.app.core.retry
 import com.omniclaw.app.data.prefs.SettingsRepository
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
@@ -14,7 +15,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okio.ByteString.Companion.toByteString
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -34,6 +34,7 @@ import okhttp3.WebSocketListener
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -151,8 +152,13 @@ class StreamingSttClient @Inject constructor(
             .replace("/audio/transcriptions", "/audio/transcriptions/stream")
 
         val partials = MutableSharedFlow<String>(extraBufferCapacity = 64)
-        var failure: Throwable? = null
-        var closed = false
+        // Thread-safe close/failure signalling between OkHttp's dispatcher
+        // thread and this channelFlow coroutine. A plain `var closed` polled in
+        // a loop could be cached in a register by the JIT and never re-read,
+        // hanging the stream; a CompletableDeferred gives a real suspend point
+        // and AtomicReference publishes the failure across threads (H-16).
+        val failure = AtomicReference<Throwable?>(null)
+        val closedSignal = CompletableDeferred<Unit>()
 
         val request = Request.Builder()
             .url(wsUrl)
@@ -169,23 +175,34 @@ class StreamingSttClient @Inject constructor(
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.w(TAG, "STT WebSocket failure: ${t.message}")
-                failure = t
-                closed = true
+                failure.set(t)
+                closedSignal.complete(Unit)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "STT WebSocket closed: $code $reason")
-                closed = true
+                closedSignal.complete(Unit)
             }
         })
 
-        // Upload the audio file as a single binary frame.
+        // Upload the audio file in 16 KB binary frames. Many streaming STT
+        // endpoints (and proxies like nginx) enforce a ~1 MB max frame size and
+        // close the connection with code 1009 if a multi-MB frame is sent in a
+        // single shot (L-04). A small delay between frames keeps the sender from
+        // outrunning the network; EOF is signalled by ws.close(1000, "EOF").
         val bytes = runCatching { audioFile.readBytes() }.getOrNull()
         if (bytes == null) {
             send(SttResult.UnknownFailure("Could not read audio file"))
             ws.cancel()
             return@channelFlow
         }
-        ws.send(bytes.toByteString())
+        val chunkSize = 16 * 1024
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + chunkSize, bytes.size)
+            ws.send(bytes.toByteString(offset, end - offset))
+            offset = end
+            kotlinx.coroutines.delay(10)
+        }
         ws.close(1000, "EOF")
 
         // Collect partials until the socket closes.
@@ -197,14 +214,14 @@ class StreamingSttClient @Inject constructor(
                     send(SttResult.Segment(partial, 0L, 0L))
                 }
             }
-            // Wait for the socket to close (poll — WebSockets don't expose a suspend close).
-            while (!closed && isActive) {
-                kotlinx.coroutines.delay(50)
-            }
+            // Suspend on the close signal from onClosed/onFailure instead of
+            // polling a plain flag (H-16). await() is cancellation-aware, so a
+            // cancelled collector still unwinds cleanly.
+            closedSignal.await()
             collectJob.cancel()
         }
 
-        failure?.let {
+        failure.get()?.let {
             send(SttResult.NetworkFailure(it.message ?: "WebSocket STT failed"))
             return@channelFlow
         }

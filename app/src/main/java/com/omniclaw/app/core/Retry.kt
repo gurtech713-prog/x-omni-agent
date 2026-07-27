@@ -19,7 +19,7 @@ suspend fun <T> retry(
     maxAttempts: Int = 3,
     baseDelayMs: Long = 500,
     maxDelayMs: Long = 8_000,
-    retryable: (Throwable) -> Boolean = { it is java.io.IOException },
+    retryable: (Throwable) -> Boolean = { it.isRetryableByDefault() },
     block: suspend () -> T,
 ): T {
     var lastError: Throwable? = null
@@ -37,4 +37,19 @@ suspend fun <T> retry(
         }
     }
     throw lastError ?: RuntimeException("retry: exhausted all $maxAttempts attempts")
+}
+
+/**
+ * Default retry classifier (audit M-48). Retries on transport-level
+ * [java.io.IOException] AND on transient HTTP errors commonly returned by LLM
+ * providers - 429 (rate limit) and 503 (service unavailable) - which clients
+ * surface as exceptions whose message carries the status code / reason rather
+ * than an IOException subtype.
+ */
+fun Throwable.isRetryableByDefault(): Boolean {
+    if (this is java.io.IOException) return true
+    val msg = (message ?: "").lowercase()
+    return msg.contains("429") || msg.contains("503") ||
+        msg.contains("rate limit") || msg.contains("too many requests") ||
+        msg.contains("service unavailable")
 }

@@ -2,6 +2,8 @@ package com.omniclaw.app.vision
 
 import android.graphics.Bitmap
 import android.util.Log
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -35,6 +37,12 @@ class BitmapPool(
     private val pool = ConcurrentLinkedDeque<Bitmap>()
     private val allocated = AtomicInteger(0)
 
+    // Identity-tracked set of bitmaps currently loaned out via [acquire].
+    // release() only touches the allocation counter for bitmaps present here,
+    // so releasing a foreign (never-acquired) bitmap cannot corrupt the count.
+    private val loaned: MutableSet<Bitmap> =
+        Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap<Bitmap, Boolean>()))
+
     /**
      * Acquire a bitmap from the pool, or allocate a new one if the pool is
      * empty and below [maxPoolSize]. Returns null if the pool is exhausted
@@ -44,7 +52,10 @@ class BitmapPool(
      * the entire bitmap before use.
      */
     fun acquire(): Bitmap? {
-        pool.pollFirst()?.let { return it }
+        pool.pollFirst()?.let {
+            loaned.add(it)
+            return it
+        }
         // Atomically check-and-increment the allocation counter. If we exceed
         // maxPoolSize, no new bitmap is allocated.
         while (true) {
@@ -57,7 +68,7 @@ class BitmapPool(
                     // Allocation failed (OOM) — undo the increment.
                     allocated.decrementAndGet()
                     null
-                }
+                }?.also { loaned.add(it) }
             }
         }
     }
@@ -65,12 +76,17 @@ class BitmapPool(
     /**
      * Return [bitmap] to the pool for reuse.
      *
-     * If the bitmap has the wrong shape or has been recycled externally, it
-     * is discarded and the allocation counter is decremented so a future
-     * [acquire] can allocate a replacement.
+     * Only bitmaps that were actually acquired from this pool are tracked:
+     * releasing a foreign bitmap is a no-op and never touches the allocation
+     * counter. If a loaned bitmap has the wrong shape or has been recycled
+     * externally, it is discarded and the allocation counter is decremented
+     * so a future [acquire] can allocate a replacement.
      */
     fun release(bitmap: Bitmap?) {
         if (bitmap == null) return
+        // Ignore bitmaps that were never acquired from this pool — otherwise
+        // the counter would go negative and the pool could grow unbounded.
+        if (!loaned.remove(bitmap)) return
         if (bitmap.width != width || bitmap.height != height || bitmap.config != config) {
             runCatching { bitmap.recycle() }
             allocated.decrementAndGet()
@@ -84,11 +100,21 @@ class BitmapPool(
         pool.addFirst(bitmap)
     }
 
-    /** Recycle all pooled bitmaps and reset the allocation counter. */
+    /**
+     * Recycle all pooled (not-currently-loaned) bitmaps.
+     *
+     * The allocation counter is decremented for each recycled pooled bitmap
+     * but is NOT reset to zero: bitmaps that are still loaned out remain live
+     * and stay counted. As those outstanding bitmaps are released, [release]
+     * keeps the counter consistent. Resetting to zero here would let [acquire]
+     * allocate up to [maxPoolSize] additional bitmaps on top of the live ones.
+     */
     fun clear() {
-        pool.forEach { runCatching { it.recycle() } }
+        pool.forEach {
+            runCatching { it.recycle() }
+            allocated.decrementAndGet()
+        }
         pool.clear()
-        allocated.set(0)
     }
 
     /** Current number of bitmaps available in the pool (not in use). */

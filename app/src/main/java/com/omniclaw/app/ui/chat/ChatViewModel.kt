@@ -51,6 +51,17 @@ class ChatViewModel @Inject constructor(
     private val _events = MutableStateFlow<List<AgentLoop.Event>>(emptyList())
     val events: StateFlow<List<AgentLoop.Event>> = _events.asStateFlow()
 
+    /**
+     * Bounded backing buffer for [events]. Appends are O(1) on an [ArrayDeque],
+     * unlike the previous `(_events.value + e).takeLast(200)` which performed
+     * two O(n) list copies on every agent event (dozens/sec during token
+     * streaming), causing GC pressure and main-thread jank. Guarded by
+     * [eventsLock]; the StateFlow is republished with an immutable snapshot
+     * after each append (M-37).
+     */
+    private val eventsLock = Any()
+    private val eventBuffer = ArrayDeque<AgentLoop.Event>(200)
+
     val uiMessages: StateFlow<List<ChatMessage>> = combine(
         activeSession,
         events
@@ -81,6 +92,22 @@ class ChatViewModel @Inject constructor(
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    /** Append [e] to the bounded [eventBuffer] and republish [events] (M-37). */
+    private fun appendEvent(e: AgentLoop.Event) {
+        val snapshot = synchronized(eventsLock) {
+            eventBuffer.addLast(e)
+            while (eventBuffer.size > 200) eventBuffer.removeFirst()
+            eventBuffer.toList()
+        }
+        _events.value = snapshot
+    }
+
+    /** Clear both the backing buffer and the published [events] (M-37). */
+    private fun clearEvents() {
+        synchronized(eventsLock) { eventBuffer.clear() }
+        _events.value = emptyList()
+    }
+
     init {
         Log.d(TAG, "ChatViewModel initialized")
         // Subscribe to agent events so the UI can show them live.
@@ -91,7 +118,7 @@ class ChatViewModel @Inject constructor(
                 Log.d(TAG, "Received agent event for session ${e.sessionId}: $e")
                 val activeId = _activeId.value
                 if (activeId == null || e.sessionId == activeId) {
-                    _events.value = (_events.value + e).takeLast(200)
+                    appendEvent(e)
 
                     // On-device Text-To-Speech integration:
                     // Only trigger TTS on the FINAL thought of each step
@@ -121,7 +148,7 @@ class ChatViewModel @Inject constructor(
         _activeId.value = s.id
         // Clear the event log so step/thought/tool-call entries from the
         // previously active session don't bleed into the fresh one.
-        _events.value = emptyList()
+        clearEvents()
         return s.id
     }
 
@@ -135,13 +162,13 @@ class ChatViewModel @Inject constructor(
             } else {
                 _activeId.value = id
             }
-            _events.value = emptyList()
+            clearEvents()
         }
     }
 
     fun send(text: String) {
         ttsManager.stop()
-        _events.value = emptyList()
+        clearEvents()
         // CHAT-2 FIX: create a fresh session if the active one is terminal
         // (DONE / FAILED / STOPPED). Previously, sending a message into a
         // completed session appended the user message + set status=RUNNING,
@@ -159,30 +186,36 @@ class ChatViewModel @Inject constructor(
         // for reference). This matches how ChatGPT / Claude / every chat app
         // behaves — a "done" conversation is archived, and the user starts
         // fresh.
-        val existingId = _activeId.value
-        val existingSession = existingId?.let { sessions.getByIdSnapshot(it) }
-        // CHAT-2 FIX: a terminal session (DONE/FAILED/STOPPED) is archived - the
-        // next message starts a fresh session instead of reusing finished history.
-        val existingIsTerminal = existingSession?.status?.let {
-            it == SessionStatus.DONE || it == SessionStatus.FAILED || it == SessionStatus.STOPPED
-        } == true
-        val id = if (existingId == null || existingSession == null || existingIsTerminal) {
-            Log.d(TAG, "Creating a new session for message: $text")
-            newSession()
-        } else {
-            existingId
-        }
-        // Use getByIdSnapshot (in-memory) so we don't race with the DB write
-        // that create() fires asynchronously. If the session isn't in memory yet
-        // (shouldn't happen — create() adds it synchronously to the StateFlow),
-        // we fall back to creating another one.
-        val s = sessions.getByIdSnapshot(id) ?: run {
-            Log.d(TAG, "Session $id not found in memory, creating another one")
-            val newId = newSession()
-            sessions.getByIdSnapshot(newId) ?: return
-        }
-        Log.i(TAG, "Sending message to agent (session: $id): $text")
+        // M-38 FIX: the getByIdSnapshot() lookups (and newSession()/create())
+        // touch the session store synchronously. send() is invoked from the
+        // Compose Composer on the Main thread, so doing that work inline risks
+        // an ANR. Move it into the viewModelScope.launch block (the same block
+        // that already runs agent.start) so the DB access no longer happens on
+        // the synchronous Main-thread entry path.
         viewModelScope.launch {
+            val existingId = _activeId.value
+            val existingSession = existingId?.let { sessions.getByIdSnapshot(it) }
+            // CHAT-2 FIX: a terminal session (DONE/FAILED/STOPPED) is archived - the
+            // next message starts a fresh session instead of reusing finished history.
+            val existingIsTerminal = existingSession?.status?.let {
+                it == SessionStatus.DONE || it == SessionStatus.FAILED || it == SessionStatus.STOPPED
+            } == true
+            val id = if (existingId == null || existingSession == null || existingIsTerminal) {
+                Log.d(TAG, "Creating a new session for message: $text")
+                newSession()
+            } else {
+                existingId
+            }
+            // Use getByIdSnapshot (in-memory) so we don't race with the DB write
+            // that create() fires asynchronously. If the session isn't in memory yet
+            // (shouldn't happen — create() adds it synchronously to the StateFlow),
+            // we fall back to creating another one.
+            val s = sessions.getByIdSnapshot(id) ?: run {
+                Log.d(TAG, "Session $id not found in memory, creating another one")
+                val newId = newSession()
+                sessions.getByIdSnapshot(newId) ?: return@launch
+            }
+            Log.i(TAG, "Sending message to agent (session: $id): $text")
             agent.start(s, text)
         }
     }

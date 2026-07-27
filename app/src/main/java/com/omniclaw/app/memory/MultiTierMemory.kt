@@ -63,10 +63,15 @@ class MultiTierMemory @Inject constructor() {
             createdAt = System.currentTimeMillis(),
             tags = tags,
         )
-        shortTerm.computeIfAbsent(sessionId) { mutableListOf() }.apply {
-            add(m)
-            // Cap at 50 entries — short-term memory is transient.
-            while (size > 50) removeAt(0)
+        // computeIfAbsent is atomic, but the returned MutableList is not thread-safe;
+        // guard the mutation so concurrent addShortTerm calls for the same session
+        // can't race on the same list (corruption / ConcurrentModificationException).
+        shortTerm.computeIfAbsent(sessionId) { mutableListOf() }.let { list ->
+            synchronized(list) {
+                list.add(m)
+                // Cap at 50 entries — short-term memory is transient.
+                while (list.size > 50) list.removeAt(0)
+            }
         }
     }
 
@@ -79,9 +84,11 @@ class MultiTierMemory @Inject constructor() {
             createdAt = System.currentTimeMillis(),
             tags = tags,
         )
-        working.computeIfAbsent(sessionId) { mutableListOf() }.apply {
-            add(m)
-            while (size > 30) removeAt(0)
+        working.computeIfAbsent(sessionId) { mutableListOf() }.let { list ->
+            synchronized(list) {
+                list.add(m)
+                while (list.size > 30) list.removeAt(0)
+            }
         }
     }
 
@@ -94,21 +101,24 @@ class MultiTierMemory @Inject constructor() {
             createdAt = System.currentTimeMillis(),
             tags = tags,
         )
-        task.computeIfAbsent(taskId) { mutableListOf() }.apply {
-            add(m)
-            while (size > 100) removeAt(0)
+        task.computeIfAbsent(taskId) { mutableListOf() }.let { list ->
+            synchronized(list) {
+                list.add(m)
+                while (list.size > 100) list.removeAt(0)
+            }
         }
     }
 
     /** Retrieve all in-memory entries for [sessionId] (short-term + working). */
     fun retrieveForSession(sessionId: String): List<Memory> {
-        val st = shortTerm[sessionId]?.toList() ?: emptyList()
-        val wk = working[sessionId]?.toList() ?: emptyList()
+        val st = shortTerm[sessionId]?.let { synchronized(it) { it.toList() } } ?: emptyList()
+        val wk = working[sessionId]?.let { synchronized(it) { it.toList() } } ?: emptyList()
         return st + wk
     }
 
     /** Retrieve task memory for [taskId]. */
-    fun retrieveTask(taskId: String): List<Memory> = task[taskId]?.toList() ?: emptyList()
+    fun retrieveTask(taskId: String): List<Memory> =
+        task[taskId]?.let { synchronized(it) { it.toList() } } ?: emptyList()
 
     /**
      * Retrieve memories relevant to [query] — simple tag + substring match.
@@ -169,8 +179,8 @@ class MultiTierMemory @Inject constructor() {
 
     /** Snapshot counts per tier (for diagnostics). */
     fun tierCounts(): Map<Memory.Tier, Int> = mapOf(
-        Memory.Tier.SHORT_TERM to shortTerm.values.sumOf { it.size },
-        Memory.Tier.WORKING to working.values.sumOf { it.size },
-        Memory.Tier.TASK to task.values.sumOf { it.size },
+        Memory.Tier.SHORT_TERM to shortTerm.values.sumOf { synchronized(it) { it.size } },
+        Memory.Tier.WORKING to working.values.sumOf { synchronized(it) { it.size } },
+        Memory.Tier.TASK to task.values.sumOf { synchronized(it) { it.size } },
     )
 }

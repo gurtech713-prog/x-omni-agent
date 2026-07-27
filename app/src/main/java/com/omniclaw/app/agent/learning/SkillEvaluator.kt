@@ -2,6 +2,7 @@ package com.omniclaw.app.agent.learning
 
 import com.omniclaw.app.data.local.LessonDao
 import com.omniclaw.app.data.model.Session
+import com.omniclaw.app.data.model.SessionStatus
 import com.omniclaw.app.data.session.SessionRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +66,7 @@ class SkillEvaluator @Inject constructor(
         // Compare against previous sessions with similar fingerprints
         // This is a simplified version - full implementation would need more context
         val lessonsApplied = lessonDao.countLessonsForSession(sessionId)
-        val isSuccess = session.status.name == "DONE"
+        val isSuccess = session.status == SessionStatus.DONE
         
         if (isSuccess && lessonsApplied > 0) {
             // Reinforce lessons applied in successful sessions

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -54,7 +55,14 @@ class SettingsViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val storageState: StateFlow<com.omniclaw.app.data.prefs.SecureStorage.StorageState> =
-        MutableStateFlow(secureStorage.state).asStateFlow()
+        // H-36 FIX: bridge the underlying reactive source instead of snapshotting
+        // secureStorage.state once at construction. SecureStorage emits on
+        // rotationEvents whenever a key is rotated; re-read the (cheap,
+        // in-memory) storage state on each emission so the API Key Rotation
+        // card reflects rotations performed during this session.
+        secureStorage.rotationEvents
+            .map { secureStorage.state }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, secureStorage.state)
 
     suspend fun setModel(cfg: ModelConfig) {
         Log.i(TAG, "Updating model config: $cfg")
@@ -63,14 +71,19 @@ class SettingsViewModel @Inject constructor(
     
     suspend fun changeProvider(provider: com.omniclaw.app.data.prefs.LlmProvider, baseUrl: String, model: String) {
         Log.i(TAG, "Changing provider: provider=$provider, baseUrl=$baseUrl, model=$model")
-        val current = repo.modelConfig.first()
-        val newKey = repo.getApiKeyForProvider(provider, baseUrl)
-        repo.setModelConfig(current.copy(
-            provider = provider,
-            baseUrl = baseUrl,
-            model = model,
-            apiKey = newKey
-        ))
+        // M-39 FIX: getApiKeyForProvider reads EncryptedSharedPreferences
+        // (disk + crypto). This is invoked from a Main-immediate scope, so hop
+        // to IO to avoid freezing the UI while switching providers.
+        withContext(Dispatchers.IO) {
+            val current = repo.modelConfig.first()
+            val newKey = repo.getApiKeyForProvider(provider, baseUrl)
+            repo.setModelConfig(current.copy(
+                provider = provider,
+                baseUrl = baseUrl,
+                model = model,
+                apiKey = newKey
+            ))
+        }
     }
     suspend fun setChannel(cfg: ChannelConfig) {
         Log.i(TAG, "Updating channel config: $cfg")
@@ -219,7 +232,15 @@ class SettingsViewModel @Inject constructor(
         val dir = File(baseDir, ".xomniclaw").apply { mkdirs() }
         val file = File(dir, "xomniclaw.json")
         runCatching {
-            file.writeText(json.toString())
+            // M-40 FIX: atomic write — write to a temp file in the same
+            // directory, then rename onto the target. A crash/kill mid-write
+            // leaves only the temp file behind, never a truncated export.
+            val tmp = File(file.parentFile, "xomniclaw.json.tmp")
+            tmp.writeText(json.toString())
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
+            }
             Log.i(TAG, "Config successfully exported to ${file.absolutePath}")
             file
         }.onFailure {

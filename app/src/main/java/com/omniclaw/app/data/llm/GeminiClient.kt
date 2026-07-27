@@ -7,6 +7,7 @@ import com.omniclaw.app.data.model.LlmUsage
 import com.omniclaw.app.data.model.ToolSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -124,7 +125,12 @@ class GeminiClient(
                 }
                 putJsonObject("toolConfig") {
                     putJsonObject("functionCallingConfig") {
-                        put("mode", if (toolChoice == "auto") "AUTO" else "ANY")
+                        put("mode", when (toolChoice) {
+                            "auto" -> "AUTO"
+                            "none" -> "NONE"
+                            "required" -> "ANY"
+                            else -> "AUTO"
+                        })
                     }
                 }
             }
@@ -166,8 +172,12 @@ class GeminiClient(
             val b = resp.use { it.body?.string().orEmpty() }
             if (!resp.isSuccessful) {
                 if (resp.code == 429) {
+                    val retryAfter = resp.header("Retry-After")?.toIntOrNull()
+                    // Honor the server Retry-After header before the retry helper backs
+                    // off again, so a long quota window is not hammered at 1-8s (audit M-25).
+                    if (retryAfter != null) delay(retryAfter * 1000L)
                     throw RateLimitException(
-                        retryAfterSeconds = resp.header("Retry-After")?.toIntOrNull(),
+                        retryAfterSeconds = retryAfter,
                         body = b,
                     )
                 }

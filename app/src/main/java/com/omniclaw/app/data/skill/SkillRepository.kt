@@ -74,7 +74,13 @@ class SkillRepositoryImpl @Inject constructor(
     private suspend fun persistEnabledState() = withContext(Dispatchers.IO) {
         runCatching {
             val text = _skills.value.joinToString("\n") { "${it.id}=${it.enabled}" }
-            enabledStateFile.writeText(text)
+            // Atomic write: write to a temp file then rename over the target, so a
+            // crash mid-write can't leave a truncated skill_enabled.json that
+            // loadEnabledState would parse as an empty map (silently re-enabling
+            // every skill the user disabled).
+            val tmp = File(enabledStateFile.parentFile, "skill_enabled.json.tmp")
+            tmp.writeText(text)
+            tmp.renameTo(enabledStateFile)
         }
     }
 

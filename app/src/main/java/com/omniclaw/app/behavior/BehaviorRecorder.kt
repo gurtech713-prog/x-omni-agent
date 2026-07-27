@@ -77,8 +77,10 @@ class BehaviorRecorder @Inject constructor(
         // Use a tryLock-style non-suspending path because this is called from a
         // non-suspend UI callback. We clear under the lock to avoid racing
         // with a concurrent recordAction() from the agent loop.
-        current.clear()
-        lastTimestamp = System.currentTimeMillis()
+        synchronized(this) {
+            current.clear()
+            lastTimestamp = System.currentTimeMillis()
+        }
         _isRecording.value = true
     }
 
@@ -105,7 +107,18 @@ class BehaviorRecorder @Inject constructor(
             synchronized(this) { current.clear() }
             return null
         }
-        val id = "behavior-" + name.lowercase().replace(Regex("[^a-z0-9]+"), "-").take(24)
+        val baseId = "behavior-" + name.lowercase().replace(Regex("[^a-z0-9]+"), "-").take(24)
+        // Ensure a unique skill id: two names that sanitize to the same base id
+        // (e.g. "Open Amazon" and "Open Amazon Quick") would otherwise write to the
+        // same behavior/<id> directory and silently overwrite the first skill.
+        // Mirror DeepLinkManager.saveBookmark by appending -2, -3, etc.
+        var id = baseId
+        var n = 2
+        while (File(ctx.filesDir, "behavior/$id").exists()) {
+            id = "$baseId-$n"
+            n++
+            if (n > 999) { id = "$baseId-${System.currentTimeMillis()}"; break }
+        }
         val skill = RecordedSkill(id, name, triggerPhrase, actions, System.currentTimeMillis())
         saveSkill(skill)
         synchronized(this) { current.clear() }
@@ -127,7 +140,15 @@ class BehaviorRecorder @Inject constructor(
             // Wrap each dispatch so one failing action doesn't abort the
             // whole replay. Previously a single thrown exception propagated
             // out of the for-loop, killing the remaining actions silently.
-            runCatching { scheduler.dispatch(deviceAction) }
+            // Re-throw CancellationException so a cancelled replay (e.g. user
+            // navigated away) stops dispatching instead of being swallowed.
+            try {
+                scheduler.dispatch(deviceAction)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                android.util.Log.w("BehaviorRecorder", "replay action failed: ${e.message}")
+            }
             kotlinx.coroutines.delay(action.delayAfterMs.coerceAtMost(2000))
         }
         return true

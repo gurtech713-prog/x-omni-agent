@@ -1,8 +1,6 @@
 package com.omniclaw.app.accessibility
 
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 import javax.inject.Inject
@@ -18,9 +16,9 @@ import javax.inject.Singleton
  * [current] before dispatching actions so it can apply window-specific
  * strategies (e.g. press BACK to dismiss a dialog before tapping).
  *
- * Thread safety: all mutable state is backed by [AtomicReference] /
- * [ConcurrentHashMap], so reads from the agent loop (Dispatchers.Default)
- * and writes from the a11y service main looper are race-free.
+ * Thread safety: all mutable state is backed by [AtomicReference], so reads
+ * from the agent loop (Dispatchers.Default) and writes from the a11y service
+ * main looper are race-free.
  */
 @Singleton
 class WindowTracker @Inject constructor() {
@@ -52,8 +50,6 @@ class WindowTracker @Inject constructor() {
     }
 
     private val stateRef = AtomicReference(WindowState.EMPTY)
-    /** Per-package window root snapshots, keyed by package name. */
-    private val packageRoots = ConcurrentHashMap<String, AccessibilityNodeInfo>()
 
     /** Current window state — safe to read from any thread. */
     val current: WindowState get() = stateRef.get()
@@ -79,8 +75,14 @@ class WindowTracker @Inject constructor() {
         )
         val isDialog = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             (className?.endsWith("Dialog") == true || className?.endsWith("AlertDialog") == true)
+        // PiP detection: AccessibilityEvent.getParcelableData() is deprecated since
+        // API 33 and was rarely populated, so the old heuristic never fired. Instead,
+        // detect the PiP window via its class name / window title on the event itself
+        // (the a11y service surfaces PiP frames whose class/title contains
+        // "PictureInPicture"; see AccessibilityService.windows / TYPE_PICTURE_IN_PICTURE).
         val isPip = type == AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
-            event.parcelableData?.javaClass?.simpleName?.contains("PictureInPicture") == true
+            (className?.contains("PictureInPicture", ignoreCase = true) == true ||
+                event.text?.any { it?.contains("PictureInPicture", ignoreCase = true) == true } == true)
 
         val titles = mutableListOf<String>()
         runCatching {

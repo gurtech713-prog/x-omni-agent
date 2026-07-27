@@ -114,9 +114,14 @@ class LiteRtEngine @Inject constructor(
             toRemove.mapNotNull { cache.remove(it) }
         }
         removed.forEach {
-            runCatching { it.interpreter.close() }
-            it.gpuDelegate?.close()
-            it.nnApiDelegate?.close()
+            // Drain any in-flight inference before closing (H-24): the Interpreter
+            // is not thread-safe, so closing while another coroutine holds the
+            // per-model mutex inside run() would be a native use-after-free.
+            it.mutex.withLock {
+                runCatching { it.interpreter.close() }
+                it.gpuDelegate?.close()
+                it.nnApiDelegate?.close()
+            }
         }
     }
 
@@ -128,9 +133,12 @@ class LiteRtEngine @Inject constructor(
             copy
         }
         all.forEach {
-            runCatching { it.interpreter.close() }
-            it.gpuDelegate?.close()
-            it.nnApiDelegate?.close()
+            // Drain any in-flight inference before closing (H-24) — see unload().
+            it.mutex.withLock {
+                runCatching { it.interpreter.close() }
+                it.gpuDelegate?.close()
+                it.nnApiDelegate?.close()
+            }
         }
         runCatching { scheduler.shutdown() }
     }
@@ -138,6 +146,12 @@ class LiteRtEngine @Inject constructor(
     /** True if LiteRT native libs loaded successfully. */
     val isAvailable: Boolean by lazy {
         runCatching {
+            // Force the native library to load eagerly (M-50). Class-load success
+            // alone does NOT imply libtensorflowlite_jni.so loaded; an ABI mismatch
+            // would otherwise surface later as a cryptic UnsatisfiedLinkError /
+            // native crash at first inference. Probing System.loadLibrary here makes
+            // that failure show up as a clean `false` from isAvailable.
+            System.loadLibrary("tensorflowlite_jni")
             Interpreter::class.java
             true
         }.getOrElse {
@@ -166,33 +180,31 @@ class LiteRtEngine @Inject constructor(
 
     private suspend fun getOrLoad(modelPath: String, useGpu: Boolean, useNnapi: Boolean): LoadedModel {
         val key = normalizeKey(modelPath, useGpu, useNnapi)
-        cacheMutex.withLock { cache[key]?.let { return it } }
-        val file = resolveToFile(modelPath)
-        val options = Interpreter.Options()
-        var gpuDelegate: GpuDelegate? = null
-        var nnApiDelegate: NnApiDelegate? = null
-        if (useNnapi) {
-            runCatching {
-                nnApiDelegate = NnApiDelegate()
-                options.addDelegate(nnApiDelegate)
-            }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
-        }
-        if (useGpu) {
-            runCatching {
-                gpuDelegate = GpuDelegate()
-                options.addDelegate(gpuDelegate)
-            }.onFailure { Log.w(TAG, "GPU delegate unavailable: ${it.message}") }
-        }
-        options.setNumThreads(2)
-        val interpreter = Interpreter(file, options)
-        val loaded = LoadedModel(file, interpreter, gpuDelegate, nnApiDelegate)
+        // Hold cacheMutex across the entire load (M-26). This serializes concurrent
+        // loads but guarantees two coroutines can't both miss the cache and both
+        // construct an Interpreter for the same key (the previous check-then-load
+        // outside the lock was a TOCTOU race that double-loaded models).
         return cacheMutex.withLock {
-            cache[key]?.let { duplicate ->
-                runCatching { interpreter.close() }
-                gpuDelegate?.close()
-                nnApiDelegate?.close()
-                return@withLock duplicate
+            cache[key]?.let { return@withLock it }
+            val file = resolveToFile(modelPath)
+            val options = Interpreter.Options()
+            var gpuDelegate: GpuDelegate? = null
+            var nnApiDelegate: NnApiDelegate? = null
+            if (useNnapi) {
+                runCatching {
+                    nnApiDelegate = NnApiDelegate()
+                    options.addDelegate(nnApiDelegate)
+                }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
             }
+            if (useGpu) {
+                runCatching {
+                    gpuDelegate = GpuDelegate()
+                    options.addDelegate(gpuDelegate)
+                }.onFailure { Log.w(TAG, "GPU delegate unavailable: ${it.message}") }
+            }
+            options.setNumThreads(2)
+            val interpreter = Interpreter(file, options)
+            val loaded = LoadedModel(file, interpreter, gpuDelegate, nnApiDelegate)
             cache[key] = loaded
             loaded
         }
@@ -214,7 +226,11 @@ class LiteRtEngine @Inject constructor(
             else -> "models/$modelPath"
         }
         val outDir = File(ctx.filesDir, "litert_models").apply { mkdirs() }
-        val outFile = File(outDir, assetPath.replace('/', '_'))
+        // Preserve the asset's subdirectory structure (M-27): flattening '/' to '_'
+        // made distinct assets like "models/a/m.tflite" and "models/a_m.tflite"
+        // collide on the same extracted file.
+        val outFile = File(outDir, assetPath)
+        outFile.parentFile?.mkdirs()
         // Validate the extracted file is non-empty AND its size matches the
         // asset's size — a partial extract (e.g. crash during copy, full disk)
         // would otherwise produce a corrupt interpreter.

@@ -22,6 +22,7 @@ import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
 import javax.inject.Inject
 
@@ -230,39 +231,46 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
     }
 
     /**
-     * Synchronous tap — retained for BehaviorRecorder.replay() which dispatches
-     * via DeviceAction without coroutine scope. New code should prefer
-     * AccessibilityExecutor.dispatch() (suspend, with retry + stabilization).
+     * Suspend tap — uses suspendCancellableCoroutine to avoid blocking the
+     * calling thread. The GestureResultCallback resumes the continuation.
      */
-    fun tap(x: Int, y: Int): Boolean {
+    suspend fun tap(x: Int, y: Int): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val stroke = GestureDescription.StrokeDescription(path, 0, 60)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        val latch = java.util.concurrent.CountDownLatch(1)
-        var success = false
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gesture: GestureDescription?) { success = true; latch.countDown() }
-            override fun onCancelled(gesture: GestureDescription?) { success = false; latch.countDown() }
-        }, handler)
-        latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
-        return success
+        return suspendCancellableCoroutine { cont ->
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gesture: GestureDescription?) {
+                    if (cont.isActive) cont.resume(true)
+                }
+                override fun onCancelled(gesture: GestureDescription?) {
+                    if (cont.isActive) cont.resume(false)
+                }
+            }, handler)
+        }
     }
 
-    fun swipe(x1: Int, y1: Int, x2: Int, y2: Int): Boolean {
+    /**
+     * Suspend swipe — uses suspendCancellableCoroutine to avoid blocking the
+     * calling thread. The GestureResultCallback resumes the continuation.
+     */
+    suspend fun swipe(x1: Int, y1: Int, x2: Int, y2: Int): Boolean {
         val path = Path().apply {
             moveTo(x1.toFloat(), y1.toFloat())
             lineTo(x2.toFloat(), y2.toFloat())
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, 250)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        val latch = java.util.concurrent.CountDownLatch(1)
-        var success = false
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gesture: GestureDescription?) { success = true; latch.countDown() }
-            override fun onCancelled(gesture: GestureDescription?) { success = false; latch.countDown() }
-        }, handler)
-        latch.await(800, java.util.concurrent.TimeUnit.MILLISECONDS)
-        return success
+        return suspendCancellableCoroutine { cont ->
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gesture: GestureDescription?) {
+                    if (cont.isActive) cont.resume(true)
+                }
+                override fun onCancelled(gesture: GestureDescription?) {
+                    if (cont.isActive) cont.resume(false)
+                }
+            }, handler)
+        }
     }
 
     fun type(text: String): Boolean {
@@ -289,9 +297,10 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
 
     private fun findFirstEditable(node: AccessibilityNodeInfo?, depth: Int = 0): AccessibilityNodeInfo? {
         if (node == null || depth > 50) return null
-        if (node.isEditable) return node
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
+        if (runCatching { node.isEditable }.getOrDefault(false)) return node
+        val childCount = runCatching { node.childCount }.getOrDefault(0)
+        for (i in 0 until childCount) {
+            val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
             val found = findFirstEditable(child, depth + 1)
             if (found != null) {
                 // Recycle the child if it's not the found node.
@@ -327,38 +336,39 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
      */
     override suspend fun screenshot(): ByteArray? = withContext(Dispatchers.IO) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext null
-        suspendCancellableCoroutine { cont ->
-            takeScreenshot(DisplayId, screenshotExecutor, object : TakeScreenshotCallback {
-                override fun onSuccess(screenshot: ScreenshotResult) {
-                    try {
-                        // Guard: caller may have cancelled the coroutine before
-                        // the callback fires. Resume only if still active.
-                        if (!cont.isActive) {
-                            return
-                        }
-                        val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
-                        if (hw != null) {
-                            val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
-                            hw.recycle()
-                            if (sw != null) {
-                                val out = java.io.ByteArrayOutputStream()
-                                sw.compress(Bitmap.CompressFormat.PNG, 100, out)
-                                sw.recycle()
-                                if (cont.isActive) cont.resume(out.toByteArray())
-                                return@onSuccess
+        withTimeout(3_000) {
+            suspendCancellableCoroutine { cont ->
+                takeScreenshot(DisplayId, screenshotExecutor, object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        try {
+                            // Guard: caller may have cancelled the coroutine before
+                            // the callback fires. Resume only if still active.
+                            if (!cont.isActive) {
+                                return
                             }
+                            val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                            if (hw != null) {
+                                val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                if (sw != null) {
+                                    val out = java.io.ByteArrayOutputStream()
+                                    sw.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                    sw.recycle()
+                                    if (cont.isActive) cont.resume(out.toByteArray())
+                                    return@onSuccess
+                                }
+                            }
+                            if (cont.isActive) cont.resume(null)
+                        } finally {
+                            screenshot.hardwareBuffer.close()
                         }
-                        if (cont.isActive) cont.resume(null)
-                    } finally {
-                        screenshot.hardwareBuffer.close()
                     }
-                }
-                override fun onFailure(errorCode: Int) {
-                    Log.w(TAG, "takeScreenshot failed: errorCode=$errorCode")
-                    if (cont.isActive) cont.resume(null)
-                }
-            })
-            cont.invokeOnCancellation { /* nothing to clean up — the callback handles resources */ }
+                    override fun onFailure(errorCode: Int) {
+                        Log.w(TAG, "takeScreenshot failed: errorCode=$errorCode")
+                        if (cont.isActive) cont.resume(null)
+                    }
+                })
+                cont.invokeOnCancellation { /* nothing to clean up — the callback handles resources */ }
+            }
         }
     }
 

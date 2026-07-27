@@ -107,8 +107,17 @@ class SecureStorage @Inject constructor(
         }
     }
 
-    fun getSecret(key: String): String =
-        if (_state == StorageState.FAILED) "" else prefs.getString(key, "").orEmpty()
+    fun getSecret(key: String): String {
+        if (_state == StorageState.FAILED) return ""
+        return runCatching { prefs.getString(key, "").orEmpty() }.getOrElse {
+            // Keystore key invalidated (biometric reset, factory reset restore, etc.)
+            // Reset the corrupted store so subsequent reads do not keep throwing.
+            runCatching { removeSecret(key) }
+            runCatching { prefs.edit().clear().commit() }
+            android.util.Log.w(TAG, "SecureStorage read failed for key; store reset. Error: ${it.message}")
+            ""
+        }
+    }
 
     fun setSecret(key: String, value: String) {
         if (_state == StorageState.FAILED) return

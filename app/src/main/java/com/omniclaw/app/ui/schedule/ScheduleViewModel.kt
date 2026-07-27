@@ -30,8 +30,16 @@ class ScheduleViewModel @Inject constructor(
     private val serializer = ListSerializer(ScheduledTask.serializer())
     private val storeFile: File by lazy { File(ctx.filesDir, "scheduled_tasks.json") }
 
-    private val _tasks = MutableStateFlow(loadOrSeed())
+    private val _tasks = MutableStateFlow<List<ScheduledTask>>(emptyList())
     val tasks: StateFlow<List<ScheduledTask>> = _tasks.asStateFlow()
+
+    init {
+        // Load off the Main thread: the VM constructor must not do blocking
+        // file I/O + JSON decoding (audit H-30).
+        viewModelScope.launch(Dispatchers.IO) {
+            _tasks.value = loadOrSeed()
+        }
+    }
 
     fun create(task: ScheduledTask) {
         Log.i(TAG, "Creating new scheduled task: ID=${task.id}, title='${task.title}'")

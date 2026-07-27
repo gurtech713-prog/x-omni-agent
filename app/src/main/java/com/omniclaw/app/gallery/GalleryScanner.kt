@@ -4,6 +4,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import com.omniclaw.app.data.memory.MemoryRepository
 import com.omniclaw.app.data.model.MemoryEntry
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -37,8 +38,24 @@ class GalleryScanner @Inject constructor(
         val bucket: String,
     )
 
+    /**
+     * Outcome of a gallery query (M-43). Lets callers distinguish "no photos"
+     * ([Ok] with an empty list) from "permission denied" ([NoPermission]) and
+     * other failures ([Error]) — previously a revoked media permission was
+     * silently swallowed into an empty list.
+     */
+    sealed class GalleryResult {
+        data class Ok(val photos: List<Photo>) : GalleryResult()
+        object NoPermission : GalleryResult()
+        object Error : GalleryResult()
+    }
+
     /** Returns the most recent N photos, newest first. */
-    suspend fun recent(limit: Int = 20): List<Photo> = withContext(Dispatchers.IO) {
+    suspend fun recent(limit: Int = 20): List<Photo> =
+        (recentResult(limit) as? GalleryResult.Ok)?.photos.orEmpty()
+
+    /** [recent] but preserving the full [GalleryResult] for callers that need it. */
+    suspend fun recentResult(limit: Int = 20): GalleryResult = withContext(Dispatchers.IO) {
         query(
             selection = null,
             selectionArgs = null,
@@ -47,7 +64,11 @@ class GalleryScanner @Inject constructor(
     }
 
     /** Returns photos taken since [sinceEpoch]. */
-    suspend fun since(sinceEpoch: Long, limit: Int = 200): List<Photo> = withContext(Dispatchers.IO) {
+    suspend fun since(sinceEpoch: Long, limit: Int = 200): List<Photo> =
+        (sinceResult(sinceEpoch, limit) as? GalleryResult.Ok)?.photos.orEmpty()
+
+    /** [since] but preserving the full [GalleryResult] for callers that need it. */
+    suspend fun sinceResult(sinceEpoch: Long, limit: Int = 200): GalleryResult = withContext(Dispatchers.IO) {
         query(
             selection = "${MediaStore.Images.Media.DATE_TAKEN} >= ?",
             selectionArgs = arrayOf(sinceEpoch.toString()),
@@ -56,7 +77,11 @@ class GalleryScanner @Inject constructor(
     }
 
     /** Free-text filter by file name / bucket name. */
-    suspend fun search(query: String, limit: Int = 100): List<Photo> = withContext(Dispatchers.IO) {
+    suspend fun search(query: String, limit: Int = 100): List<Photo> =
+        (searchResult(query, limit) as? GalleryResult.Ok)?.photos.orEmpty()
+
+    /** [search] but preserving the full [GalleryResult] for callers that need it. */
+    suspend fun searchResult(query: String, limit: Int = 100): GalleryResult = withContext(Dispatchers.IO) {
         // Escape SQL LIKE wildcards in the user query so a search for "50%_off"
         // doesn't match far more than intended. We escape % and _ and wrap the
         // whole thing in a LIKE pattern with the ESCAPE clause.
@@ -72,7 +97,7 @@ class GalleryScanner @Inject constructor(
         )
     }
 
-    private fun query(selection: String?, selectionArgs: Array<String>?, limit: Int): List<Photo> {
+    private fun query(selection: String?, selectionArgs: Array<String>?, limit: Int): GalleryResult {
         val out = mutableListOf<Photo>()
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
@@ -84,7 +109,7 @@ class GalleryScanner @Inject constructor(
             MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
         )
         val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC LIMIT $limit"
-        runCatching {
+        return try {
             ctx.contentResolver.query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 projection,
@@ -114,8 +139,16 @@ class GalleryScanner @Inject constructor(
                     )
                 }
             }
+            GalleryResult.Ok(out)
+        } catch (se: SecurityException) {
+            // Media permission revoked (possibly mid-query). Surface this distinctly
+            // from "no photos" so callers can prompt for permission (M-43).
+            Log.w(TAG, "Gallery query denied (permission revoked): ${se.message}")
+            GalleryResult.NoPermission
+        } catch (t: Throwable) {
+            Log.w(TAG, "Gallery query failed: ${t.message}")
+            GalleryResult.Error
         }
-        return out
     }
 
     /**
@@ -123,7 +156,17 @@ class GalleryScanner @Inject constructor(
      * long-term memory entries (one EPISODE per batch + one FACT per bucket).
      */
     suspend fun syncMemory(scanCount: Int = 20): Int {
-        val photos = recent(scanCount)
+        val photos = when (val result = recentResult(scanCount)) {
+            is GalleryResult.NoPermission -> {
+                Log.w(TAG, "syncMemory: no media permission — nothing scanned")
+                return 0
+            }
+            is GalleryResult.Error -> {
+                Log.w(TAG, "syncMemory: gallery query errored — nothing scanned")
+                return 0
+            }
+            is GalleryResult.Ok -> result.photos
+        }
         if (photos.isEmpty()) return 0
         // Group by bucket (camera roll, screenshots, downloads, etc.)
         val byBucket = photos.groupBy { it.bucket }
@@ -149,5 +192,9 @@ class GalleryScanner @Inject constructor(
      * a list of URIs suitable for staging into a temp album.
      */
     suspend fun stageForTheme(theme: String, limit: Int = 30): List<Uri> =
-        search(theme, limit).map { it.uri }
+        (searchResult(theme, limit) as? GalleryResult.Ok)?.photos.orEmpty().map { it.uri }
+
+    companion object {
+        private const val TAG = "GalleryScanner"
+    }
 }

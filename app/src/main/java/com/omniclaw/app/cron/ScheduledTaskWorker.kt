@@ -100,6 +100,15 @@ class ScheduledTaskWorker @AssistedInject constructor(
             Log.w("ScheduledTaskWorker", "Foreground promotion failed: ${it.message}")
         }
 
+        // Cleanup: delete scheduled sessions older than 7 days to prevent unbounded DB growth.
+        runCatching {
+            sessions.deleteScheduledOlderThan(
+                System.currentTimeMillis() - 7 * 24 * 60 * 60 * 1000L
+            )
+        }.onFailure {
+            Log.w("ScheduledTaskWorker", "Scheduled session cleanup failed: ${it.message}")
+        }
+
         // Create a fresh session and dispatch the prompt to the shared execution core.
         val session = sessions.create("[Scheduled] $title")
         agentLoop.start(session, prompt)
@@ -126,18 +135,22 @@ class ScheduledTaskWorker @AssistedInject constructor(
         }
 
         // If the session never reached a terminal state (timeout fired, or
-        // WorkManager cancelled us), return Result.retry() so WorkManager
-        // re-attempts with exponential backoff. Previously we returned
-        // Result.success(completed=false) which WorkManager treated as "work
-        // succeeded" — the scheduled task was silently lost.
+        // WorkManager cancelled us), check isStopped to distinguish cancellation
+        // from timeout. For cancellation, return success() to avoid resurrecting
+        // the cancelled work. For timeout, return retry() so WorkManager re-attempts.
         //
         // We DO return Result.success() for terminal states (DONE / FAILED /
         // STOPPED) — even FAILED — because retrying a session that failed
         // due to a bad prompt or a missing permission will just fail again.
         // The user can manually re-trigger from the Sessions screen.
         return if (finalStatus == null) {
-            Log.w("ScheduledTaskWorker", "Task $sessionId did not reach a terminal state — returning retry() so WorkManager re-attempts")
-            Result.retry()
+            if (isStopped) {
+                Log.i("ScheduledTaskWorker", "Task $sessionId cancelled by WorkManager — returning success() to avoid resurrection")
+                Result.success()
+            } else {
+                Log.w("ScheduledTaskWorker", "Task $sessionId did not reach a terminal state — returning retry() so WorkManager re-attempts")
+                Result.retry()
+            }
         } else {
             Result.success(workDataOf(
                 KEY_TASK_ID to taskId,
@@ -215,11 +228,23 @@ class ScheduledTaskWorker @AssistedInject constructor(
          * Schedule (or replace) a periodic task.
          * @param intervalMinutes must be >= 15 (WorkManager minimum).
          */
-        fun scheduleInterval(ctx: Context, taskId: String, title: String, prompt: String, intervalMinutes: Long) {
+        fun scheduleInterval(
+            ctx: Context,
+            taskId: String,
+            title: String,
+            prompt: String,
+            intervalMinutes: Long,
+            onlyWhenScreenOn: Boolean = false,
+            quietStart: String = "",
+            quietEnd: String = "",
+        ) {
             val data = workDataOf(
                 KEY_TASK_ID to taskId,
                 KEY_TASK_TITLE to title,
                 KEY_PROMPT to prompt,
+                KEY_ONLY_WHEN_SCREEN_ON to onlyWhenScreenOn,
+                KEY_QUIET_START to quietStart,
+                KEY_QUIET_END to quietEnd,
             )
             val req = PeriodicWorkRequestBuilder<ScheduledTaskWorker>(
                 intervalMinutes.coerceAtLeast(15), TimeUnit.MINUTES,
@@ -256,6 +281,9 @@ class ScheduledTaskWorker @AssistedInject constructor(
             prompt: String,
             weekdays: Set<Int>,
             timeOfDay: String,
+            onlyWhenScreenOn: Boolean = false,
+            quietStart: String = "",
+            quietEnd: String = "",
         ) {
             val delayMs = computeDelayToNext(weekdays, timeOfDay)
             val delayMinutes = (delayMs / 60_000L).coerceAtLeast(1)
@@ -266,6 +294,9 @@ class ScheduledTaskWorker @AssistedInject constructor(
                 KEY_TASK_TITLE to title,
                 KEY_PROMPT to prompt,
                 KEY_WEEKDAYS to weekdaysStr,
+                KEY_ONLY_WHEN_SCREEN_ON to onlyWhenScreenOn,
+                KEY_QUIET_START to quietStart,
+                KEY_QUIET_END to quietEnd,
             )
             val periodic = PeriodicWorkRequestBuilder<ScheduledTaskWorker>(
                 24 * 60, TimeUnit.MINUTES,
@@ -289,11 +320,23 @@ class ScheduledTaskWorker @AssistedInject constructor(
             WorkManager.getInstance(ctx).cancelUniqueWork("$WORK_PREFIX${taskId}_oneshot")
         }
 
-        fun scheduleOneShot(ctx: Context, taskId: String, title: String, prompt: String, delayMinutes: Long) {
+        fun scheduleOneShot(
+            ctx: Context,
+            taskId: String,
+            title: String,
+            prompt: String,
+            delayMinutes: Long,
+            onlyWhenScreenOn: Boolean = false,
+            quietStart: String = "",
+            quietEnd: String = "",
+        ) {
             val data = workDataOf(
                 KEY_TASK_ID to taskId,
                 KEY_TASK_TITLE to title,
                 KEY_PROMPT to prompt,
+                KEY_ONLY_WHEN_SCREEN_ON to onlyWhenScreenOn,
+                KEY_QUIET_START to quietStart,
+                KEY_QUIET_END to quietEnd,
             )
             val req = OneTimeWorkRequestBuilder<ScheduledTaskWorker>()
                 .setInputData(data)
@@ -347,4 +390,3 @@ class ScheduledTaskWorker @AssistedInject constructor(
 interface ScheduledTaskWorkerFactory {
     fun create(appContext: Context, params: WorkerParameters): ScheduledTaskWorker
 }
-

@@ -6,9 +6,11 @@ import com.omniclaw.app.behavior.BehaviorRecorder
 import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.session.SessionRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 @HiltViewModel
@@ -34,7 +36,7 @@ class SessionsViewModel @Inject constructor(
 
     init {
         loadSessions()
-        refreshBehaviors()
+        viewModelScope.launch { refreshBehaviors() }
     }
 
     fun loadSessions() {
@@ -50,14 +52,21 @@ class SessionsViewModel @Inject constructor(
                     _isLoading.value = false
                 }
             } catch (e: Exception) {
+                // Re-throw cancellation so structured concurrency isn't broken
+                // (H-32): swallowing CancellationException would prevent the
+                // collector job from being cancelled cleanly on refresh()/onCleared.
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 e.printStackTrace()
                 _isLoading.value = false
             }
         }
     }
 
-    fun refreshBehaviors() {
-        _savedBehaviors.value = behaviorRecorder.listSaved()
+    suspend fun refreshBehaviors() {
+        // listSaved() does synchronous disk I/O; hop to IO so we never block the
+        // main thread (H-31). Callers invoke this from viewModelScope.launch.
+        val saved = withContext(Dispatchers.IO) { behaviorRecorder.listSaved() }
+        _savedBehaviors.value = saved
     }
 
     fun newSession(): String {
@@ -88,7 +97,7 @@ class SessionsViewModel @Inject constructor(
 
     fun stopAndSaveRecording(name: String, triggerPhrase: String) {
         behaviorRecorder.stopAndSave(name, triggerPhrase)
-        refreshBehaviors()
+        viewModelScope.launch { refreshBehaviors() }
     }
 
     fun cancelRecording() {
@@ -103,7 +112,7 @@ class SessionsViewModel @Inject constructor(
 
     fun refresh() {
         loadSessions()
-        refreshBehaviors()
+        viewModelScope.launch { refreshBehaviors() }
     }
 
     companion object {

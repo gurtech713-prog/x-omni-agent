@@ -33,14 +33,14 @@ import java.util.concurrent.atomic.AtomicReference
  * MediaProjection screen-capture service.
  *
  * Captures the device's screen continuously and exposes the latest frame to
- * the agent loop via [latestFramePng]. Used by the VLM vision fallback when
+ * the agent loop via [latestFrameBytes]. Used by the VLM vision fallback when
  * the accessibility tree alone isn't enough to understand the current screen.
  *
  * Lifecycle:
  *   1. Activity calls [requestPermission] -> user grants via system dialog
  *   2. Activity forwards the result Intent to [startWithPermission]
  *   3. Service starts foreground + creates MediaProjection + ImageReader
- *   4. Each new frame is PNG-encoded into [latestFramePng]
+ *   4. Each new frame is WebP-encoded into [latestFrameBytes]
  *   5. Stop via [stop] or unbind
  */
 @AndroidEntryPoint
@@ -61,36 +61,20 @@ class ScreenCaptureService : Service() {
     override fun onCreate() {
         super.onCreate()
         // Register this instance so the agent loop can pull the latest frame
-        // via ScreenCaptureService.latestFramePng().
+        // via ScreenCaptureService.latestFrameBytes().
         instance = this
 
         // Ensure the notification channel exists before promoting to foreground.
         ensureNotificationChannel()
 
-        // Promote to foreground with a PLAIN type in onCreate() — this satisfies
-        // the 5-second startForeground() deadline imposed on
-        // Context.startForegroundService(). We CANNOT use
-        // FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION here because the MediaProjection
-        // result Intent hasn't been delivered yet (onStartCommand hasn't run).
-        //
-        // On Android 14+ (UPSIDE_DOWN_CAKE+), passing the mediaProjection type
-        // without the projection token being delivered to the service triggers
-        // ForegroundServiceTypeNotAllowed / SecurityException. We re-issue
-        // startForeground() with the mediaProjection type inside onStartCommand
-        // once the token is in hand.
-        //
-        // On pre-14, plain startForeground() is the only variant available anyway.
-        val notif = buildNotification()
-        runCatching {
-            startForeground(NOTIF_ID, notif)
-        }.onFailure { e ->
-            Log.e(TAG, "Failed to start foreground service in onCreate: ${e.message}", e)
-            // If plain foreground promotion fails (e.g. background-start restriction
-            // on Android 12+), there's nothing more we can do here. Stop self so
-            // the system doesn't ANR-kill the process for failing to call
-            // startForeground() within the deadline.
-            stopSelf()
-        }
+        // Foreground promotion is deferred to onStartCommand (C-05). On Android 14+
+        // (UPSIDE_DOWN_CAKE) a mediaProjection-type foreground service MUST be
+        // promoted with the MediaProjection token already in hand; calling plain
+        // startForeground() here — before the token arrives via the start intent —
+        // throws ForegroundServiceTypeNotAllowed, and the resulting catch would
+        // stopSelf(), so the service would never start. onStartCommand runs
+        // immediately after onCreate, so the 5-second startForeground() deadline
+        // imposed on Context.startForegroundService() is still met there.
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -98,42 +82,63 @@ class ScreenCaptureService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        @Suppress("DEPRECATION")
-        val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+
+        // Use the typed two-arg getParcelableExtra on API 33+ (TIRAMISU); the
+        // single-arg overload is deprecated and can return null on some Android
+        // 13+ device/ROM combinations (C-06).
+        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        }
         if (data == null) {
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // Re-issue startForeground() with the mediaProjection type now that we
-        // have the projection token. On Android 14+ this is REQUIRED — the
-        // platform enforces that mediaProjection-type foreground services
-        // receive the token at foreground-promotion time. The plain
-        // startForeground() in onCreate() satisfied the 5-second deadline;
-        // this call upgrades the type.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            runCatching {
+        // Promote to foreground WITH the mediaProjection type now that we hold the
+        // projection token (C-05). On Android 14+ the platform enforces that
+        // mediaProjection-type foreground services receive the token at promotion
+        // time, so this call — not onCreate — is where promotion must happen. The
+        // typed 3-arg overload exists on API 29+ (Q); fall back to plain on 26-28.
+        val promoted = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIF_ID,
                     buildNotification(),
                     android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
                 )
-            }.onFailure { e ->
-                Log.e(TAG, "Failed to upgrade to mediaProjection foreground type: ${e.message}", e)
-                // Don't stopSelf — the plain foreground from onCreate is still
-                // valid and the capture may still work; the type mismatch just
-                // means the system may treat us as a plain FGS for OOM purposes.
+            } else {
+                startForeground(NOTIF_ID, buildNotification())
             }
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to start foreground service: ${e.message}", e)
+        }.isSuccess
+        if (!promoted) {
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         startCapture(data)
-        return START_STICKY
+        // MediaProjection result-data can't be persisted across process death, so a
+        // sticky restart would receive a null intent and immediately stopSelf()
+        // anyway — START_NOT_STICKY avoids the pointless restart churn (M-20).
+        return START_NOT_STICKY
     }
 
     private fun startCapture(resultData: Intent) {
         try {
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = mpm.getMediaProjection(android.app.Activity.RESULT_OK, resultData)
+            if (projection == null) {
+                // Token already consumed or revoked — we can never produce frames.
+                // Don't linger as a silent foreground service (C-07).
+                Log.w(TAG, "getMediaProjection returned null — stopping service")
+                if (instance === this) instance = null
+                stopSelf()
+                return
+            }
             val metrics = resources.displayMetrics
             val width = metrics.widthPixels
             val height = metrics.heightPixels
@@ -161,6 +166,10 @@ class ScreenCaptureService : Service() {
             Log.i(TAG, "Screen capture started: ${width}x${height}")
         } catch (e: Exception) {
             Log.w(TAG, "startCapture failed: ${e.message}")
+            // Don't stay running with a foreground notification but no frames (C-07):
+            // clear the instance reference and stop the service.
+            if (instance === this) instance = null
+            stopSelf()
         }
     }
 
@@ -278,8 +287,18 @@ class ScreenCaptureService : Service() {
 
         fun isRunning(): Boolean = instance != null
 
-        /** The latest captured frame as PNG bytes, or null if capture isn't active. */
-        fun latestFramePng(): ByteArray? = instance?.latestFrame?.get()
+        /** The latest captured frame as compressed (WebP) bytes, or null if capture isn't active. */
+        fun latestFrameBytes(): ByteArray? = instance?.latestFrame?.get()
+
+        /**
+         * Deprecated alias for [latestFrameBytes] (M-21). The returned payload is
+         * WebP, not PNG; kept so existing callers keep compiling until they migrate.
+         */
+        @Deprecated(
+            "Renamed to latestFrameBytes() — the payload is WebP, not PNG",
+            ReplaceWith("latestFrameBytes()"),
+        )
+        fun latestFramePng(): ByteArray? = latestFrameBytes()
 
         fun startWithPermission(ctx: Context, resultData: Intent) {
             // instance will be assigned in onCreate() when the service binds.

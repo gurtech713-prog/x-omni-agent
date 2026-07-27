@@ -45,7 +45,7 @@ class DeepLinkHandler @Inject constructor(
             
             return when {
                 uri.scheme == SCHEME -> uri.getQueryParameter("id")
-                uri.host?.contains("session") == true -> uri.lastPathSegment
+                uri.path?.contains("/session/") == true -> uri.lastPathSegment
                 else -> null
             }
         }

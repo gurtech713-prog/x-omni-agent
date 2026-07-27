@@ -1,19 +1,23 @@
 package com.omniclaw.app.data.local
 
 import android.content.Context
+import android.util.Log
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.omniclaw.app.data.model.ChatMessage
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 
 @Database(
     entities = [SessionEntity::class, MemoryEntity::class, LessonEntity::class, ChatMessageEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -46,16 +50,36 @@ class DatabaseProvider @Inject constructor(
      */
     val db: AppDatabase by lazy {
         Room.databaseBuilder(ctx, AppDatabase::class.java, "omniclaw.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
             // Write-Ahead Logging: enables concurrent readers + 1 writer.
             // Critical for the agent loop (writer) + chat UI (reader) to not
             // block each other. Default on modern Android, but we set it
             // explicitly for determinism across OEM builds.
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+            // Enable SQLite foreign-key enforcement. SQLite disables it by
+            // default and Room does not flip the pragma automatically, so
+            // without this the ON DELETE CASCADE on chat_messages is dead
+            // code and deleting a session would orphan its message rows.
+            .addCallback(object : RoomDatabase.Callback() {
+                override fun onOpen(db: SupportSQLiteDatabase) {
+                    db.execSQL("PRAGMA foreign_keys = ON")
+                }
+            })
             .build()
     }
 
     companion object {
+        /**
+         * Lenient JSON instance used by [MIGRATION_3_4] to parse legacy
+         * `sessions.messagesJson`. Consistent with AppModule.provideJson —
+         * tolerates unknown fields and lenient primitives so a single
+         * slightly-off legacy row does not wipe an entire session's history.
+         */
+        private val lenientJson = Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+        }
+
         /**
          * v1 → v2: add the `lessons` table for the self-learning engine.
          *
@@ -163,8 +187,16 @@ class DatabaseProvider @Inject constructor(
                         if (messagesJson.isBlank()) continue
 
                         val messages = try {
-                            Converters().deserializeMessages(messagesJson)
-                        } catch (_: Exception) {
+                            lenientJson.decodeFromString(
+                                ListSerializer(ChatMessage.serializer()),
+                                messagesJson,
+                            )
+                        } catch (e: Exception) {
+                            Log.w(
+                                "AppDatabase",
+                                "MIGRATION_3_4: failed to parse messagesJson for session $sessionId",
+                                e,
+                            )
                             continue
                         }
 
@@ -187,6 +219,18 @@ class DatabaseProvider @Inject constructor(
                         }
                     }
                 }
+            }
+        }
+
+        /**
+         * C-16: add the tool-call history + reasoning-thought columns to
+         * chat_messages so a ChatMessage survives a DB round-trip intact.
+         * Both are nullable TEXT; existing rows decode NULL as empty.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chat_messages ADD COLUMN toolCallsJson TEXT")
+                db.execSQL("ALTER TABLE chat_messages ADD COLUMN thoughtsJson TEXT")
             }
         }
     }

@@ -262,7 +262,9 @@ class AgentLoop @Inject constructor(
         } catch (e: CancellationException) {
             // Cooperative cancellation — user requested stop or session was superseded.
             _events.tryEmit(Event.Stopped(sessionId))
-            sessions.setStatus(sessionId, SessionStatus.DONE)
+            sessions.setStatus(sessionId, SessionStatus.STOPPED)
+            episodeRecorder.finish(sessionId, "STOPPED")
+            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
         } catch (e: Exception) {
             Log.e(TAG, "Agent loop crashed: ${e.message}", e)
             scope.launch {
@@ -278,6 +280,8 @@ class AgentLoop @Inject constructor(
             }
             _events.tryEmit(Event.Failed(sessionId, e.message ?: "Crash"))
             sessions.setStatus(sessionId, SessionStatus.FAILED)
+            episodeRecorder.finish(sessionId, "FAILED")
+            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
         } finally {
             // Decrement active session count; stop the foreground service + Halo
             // when no sessions are running anymore.
@@ -289,6 +293,7 @@ class AgentLoop @Inject constructor(
             verifier.reset(sessionId)
             stopMutex.withLock { stopSet.remove(sessionId) }
             runningJobs.remove(sessionId)
+            clearHistoryCache(sessionId)
         }
     }
 
@@ -309,6 +314,10 @@ class AgentLoop @Inject constructor(
             }
             sessions.setStatus(sessionId, SessionStatus.DONE)
             _events.tryEmit(Event.Completed(sessionId, "Launched bookmark shortcut matching: $prompt"))
+            clearHistoryCache(sessionId)
+            learning.clearLessonCache(sessionId)
+            episodeRecorder.finish(sessionId, "DONE")
+            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
             return
         }
 
@@ -382,9 +391,9 @@ class AgentLoop @Inject constructor(
             var observation = scheduler.snapshot()
             var usedVision = false
             // Heuristic: if the tree is empty / very short / looks unparseable, ask the VLM (if VLM API key is configured).
-            if (cfg.vlmApiKey.isNotBlank() && (observation.isBlank() || observation.length < 80 || observation.contains("not connected", ignoreCase = true))) {
+            if (cfg.vlmApiKey.isNotBlank() && (observation.isBlank() || observation.length < 80 || observation.contains("accessibility service not connected", ignoreCase = true))) {
                 // Prefer the continuous MediaProjection stream if available, else fall back to one-shot screenshot.
-                var png: ByteArray? = ScreenCaptureService.latestFramePng()
+                var png: ByteArray? = ScreenCaptureService.latestFrameBytes()
                 if (png == null || png.isEmpty()) png = scheduler.screenshot()
                 if (png != null && png.isNotEmpty()) {
                     val vlmAnswer = runCatching {
@@ -453,7 +462,7 @@ class AgentLoop @Inject constructor(
                             }.trimEnd()
                             structuredUsage = res.usage
                             _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!))
-                            _events.tryEmit(Event.ToolCall(sessionId, step, ToolCall(id = tc.id, name = tc.name, args = tc.arguments)))
+                            // Preview ToolCall emit removed (M-08): the canonical event is emitted after dispatch.
                         }
                     }
                 }
@@ -725,7 +734,7 @@ class AgentLoop @Inject constructor(
             val verifyResult = verifier.verifyLastDetailed(sessionId, call, preSnapshot = observation)
             val verifyOk = verifyResult.ok
             // Hermes-style plan tracking: a verified-successful action advances the plan.
-            if (verifyOk) plan?.nextStep?.let { it.done = true }
+            if (verifyOk) plan?.nextStep?.let { it.markDone() }
             // Record this step in the episode for self-learning reflection.
             episodeRecorder.recordStep(sessionId, step, observation, action, call, verifyOk)
             // Record a direct (fingerprint, action, outcome) lesson immediately —
@@ -773,51 +782,6 @@ class AgentLoop @Inject constructor(
                 }
             }
 
-            // ---- Inter-step delay + screen stabilization ----
-            // After dispatching a tap / swipe / launch, the target app needs
-            // time to animate before the next snapshot. Without this delay, the
-            // next step's snapshot() captures the pre-transition screen and the
-            // agent reasons about stale state — causing phantom "action didn't
-            // work" failures.
-            //
-            // We wait 400ms, then poll the accessibility tree twice (100ms apart)
-            // and only proceed once it stabilizes (two consecutive identical
-            // fingerprints) or after a 1.5s cap. This balances responsiveness
-            // against correctness for slow-animating apps.
-            //
-            // The poll uses a CHEAP fingerprint (packageName:childCount) via
-            // the scheduler's snapshotBlocking() — NOT the full SHA-256
-            // fingerprint used for cycle detection. The cheap fingerprint is
-            // sufficient for "did the screen change?" polling and avoids
-            // re-hashing up to 8KB of observation text 15x per step.
-            // PERFORMANCE: Skip stabilization if the action already failed —
-            // the screen didn't change so there's nothing to wait for. This saves
-            // 200-400ms on every failed attempt (common when the app isn't responding).
-            if (call.ok && (
-                parsedAction.startsWith("tap", ignoreCase = true) ||
-                parsedAction.startsWith("swipe", ignoreCase = true) ||
-                parsedAction.startsWith("launch", ignoreCase = true) ||
-                parsedAction.startsWith("back", ignoreCase = true) ||
-                parsedAction.startsWith("home", ignoreCase = true) ||
-                parsedAction.startsWith("type", ignoreCase = true)
-            )) {
-                val initialDelay = getAdaptiveInitialDelay()
-                kotlinx.coroutines.delay(initialDelay)
-                
-                // Wait for the screen to stabilize — compare two cheap fingerprints.
-                val cap = getAdaptiveCap()
-                val start = System.currentTimeMillis()
-                var prevFp = cheapStabilizationFingerprint()
-                while (System.currentTimeMillis() - start < cap) {
-                    kotlinx.coroutines.delay(getAdaptivePollInterval())
-                    val curFp = cheapStabilizationFingerprint()
-                    if (curFp == prevFp) break  // stabilized
-                    prevFp = curFp
-                }
-                
-                // Update stabilization metrics for future adaptive delays
-                updateStabilizationMetrics(System.currentTimeMillis() - start)
-            }
         }
 
         _events.tryEmit(Event.Completed(sessionId, "Max steps reached."))
@@ -880,11 +844,13 @@ class AgentLoop @Inject constructor(
                 val m = Regex("(?i)type\\s*\\(\\s*\"(.*?)\"\\s*\\)").find(s)
                 val unquoted = m?.groupValues?.getOrNull(1)
                     ?: Regex("(?i)type\\s*\\(\\s*(.+?)\\s*\\)").find(s)?.groupValues?.getOrNull(1)
-                DeviceAction.Type(unquoted.orEmpty().trim())
+                val text = unquoted?.takeIf { it.isNotBlank() }?.trim() ?: return null
+                DeviceAction.Type(text)
             }
             s.startsWith("launch", ignoreCase = true) || s.startsWith("open_app", ignoreCase = true) || s.startsWith("openapp", ignoreCase = true) -> {
                 val m = Regex("(?i)(?:launch|open_app|openapp)\\s*\\(\\s*(?:\"|')?(.*?)(?:\"|')?\\s*\\)").find(s)
-                DeviceAction.Launch(m?.groupValues?.getOrNull(1).orEmpty().trim())
+                val pkg = m?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }?.trim() ?: return null
+                DeviceAction.Launch(pkg)
             }
             s.startsWith("back", ignoreCase = true) -> DeviceAction.Back
             s.startsWith("home", ignoreCase = true) -> DeviceAction.Home
@@ -964,7 +930,7 @@ class AgentLoop @Inject constructor(
                     else -> arg.substringBefore(':').ifBlank { "com.android.chrome" }
                 }
                 val query = if (skillId == "app-search" && arg.contains(':')) arg.substringAfter(':').trim() else arg
-                val launched = runCatching { scheduler.dispatchBlocking(DeviceAction.Launch(pkg)) }.isSuccess
+                val launched = runCatching { scheduler.dispatch(DeviceAction.Launch(pkg)) }.getOrDefault(false)
                 if (launched) {
                     "Launched $pkg. Next step: tap the search bar and type '$query'."
                 } else {

@@ -45,14 +45,10 @@
          a manifest permission. Declaring it is a no-op (system ignores unknown
          permissions) and indicates a misunderstanding. -->
 
-    <!-- Exact alarm for scheduled automation. Only SCHEDULE_EXACT_ALARM is
-         needed (and only if we used AlarmManager.setExact*). We use WorkManager
-         for all scheduling, so even this is technically optional — but keeping
-         it allows future use without a manifest change.
-         REMOVED: USE_EXACT_ALARM — this is a restricted permission on Play
-         Store (requires policy approval) and is NOT needed since we use
-         WorkManager, not AlarmManager.setExact*. -->
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- REMOVED: SCHEDULE_EXACT_ALARM — unused. All scheduling goes through
+         WorkManager, not AlarmManager.setExact*, so this permission was dead
+         weight (L-02). USE_EXACT_ALARM was already removed earlier (restricted
+         on Play Store and likewise unnecessary). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
@@ -91,6 +87,21 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Deep-link entry point (C-13): handle omniclaw:// URLs and the
+                 https://omniclaw.app host so session/skill links open the app.
+                 MainActivity forwards VIEW intents to DeepLinkHandler. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omniclaw" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="omniclaw.app" />
+            </intent-filter>
         </activity>
 
         <!-- Accessibility service: real UI automation (taps, swipes, tree inspection) -->
@@ -120,12 +131,22 @@
         <!-- Overlay service: floating push-to-talk bubble -->
         <service
             android:name=".service.OverlayService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating push-to-talk overlay bubble for voice-driven agent control." />
+        </service>
 
         <!-- Halo overlay: Dynamic Island-style agent status pill -->
         <service
             android:name=".service.HaloOverlayService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Dynamic-Island-style agent status pill overlay." />
+        </service>
 
         <!-- Screen capture service: MediaProjection for vision fallback -->
         <service

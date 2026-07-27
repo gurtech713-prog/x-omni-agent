@@ -4,6 +4,10 @@ import com.omniclaw.app.data.prefs.SettingsRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -25,6 +29,7 @@ import javax.inject.Singleton
 class SttClient @Inject constructor(
     private val http: OkHttpClient,
     private val settings: SettingsRepository,
+    private val json: Json,
 ) {
 
     suspend fun transcribe(audioFile: File): String? = withContext(Dispatchers.IO) {
@@ -63,10 +68,27 @@ class SttClient @Inject constructor(
                     return@use null
                 }
                 val text = r.body?.string().orEmpty()
-                // Response shape: {"text":"..."} — extract just the text field.
-                val m = Regex("\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(text)
-                m?.groupValues?.getOrNull(1)?.replace("\\\"", "\"")?.replace("\\\\", "\\")?.trim()
+                // Response shape: {"text":"..."} — parse the top-level "text" field
+                // structurally so nested shapes like {"segments":[{"text":"a"}],"text":"b"}
+                // return "b" (the regex used to grab the first "text", i.e. "a").
+                parseTranscript(text)
             }
         }.getOrNull()
+    }
+
+    /** Parse the STT JSON response. Falls back to regex if structured parse fails. */
+    private fun parseTranscript(body: String): String? {
+        // Try structured JSON first: {"text": "..."}
+        runCatching {
+            val obj = json.parseToJsonElement(body).jsonObject
+            val text = obj["text"]?.jsonPrimitive?.contentOrNull
+            if (text != null) return text.trim()
+        }
+        // Fallback: regex extract the "text" field.
+        val m = Regex("\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(body)
+        return m?.groupValues?.getOrNull(1)
+            ?.replace("\\\"", "\"")
+            ?.replace("\\\\", "\\")
+            ?.trim()
     }
 }

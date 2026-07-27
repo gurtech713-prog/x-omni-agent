@@ -6,7 +6,7 @@ import com.omniclaw.app.data.model.LlmUsage
 import com.omniclaw.app.data.model.ToolSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
@@ -59,6 +59,16 @@ class LlmClient @Inject constructor(
     private val http: OkHttpClient,
     private val json: Json,
 ) {
+
+    /**
+     * Dedicated client for SSE streaming (audit M-29). OkHttp readTimeout fires
+     * between byte reads, so the shared 60s client kills long-running streams
+     * (reasoning models, slow tool calls) mid-generation. readTimeout(0) disables
+     * the read timeout for streaming only; complete() keeps the injected client.
+     */
+    private val streamingHttp: OkHttpClient by lazy {
+        http.newBuilder().readTimeout(0, java.util.concurrent.TimeUnit.SECONDS).build()
+    }
 
     @Serializable
     data class Message(
@@ -147,7 +157,7 @@ class LlmClient @Inject constructor(
                 }
             }
         }
-        val call = http.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
+        val call = streamingHttp.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
 
         // Coroutine cancellation → cancel the OkHttp call so the socket closes
         // promptly and the server stops generating tokens.
@@ -208,6 +218,7 @@ class LlmClient @Inject constructor(
                                 val result = channel.trySend(delta)
                                 if (!result.isSuccess) {
                                     Log.w(TAG, "stream back-pressure: trySend failed (${result.exceptionOrNull()?.message}) — closing stream, caller will fall back to non-streaming")
+                                    channel.close(IllegalStateException("back-pressure"))
                                     return
                                 }
                             }
@@ -219,7 +230,7 @@ class LlmClient @Inject constructor(
                 }
             }
         })
-    }.buffer(Channel.UNLIMITED).flowOn(Dispatchers.IO)
+    }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST).flowOn(Dispatchers.IO)
 
     private fun parseCompletion(body: String): CompletionResult {
         val obj = runCatching { json.parseToJsonElement(body).jsonObject }.getOrElse {
@@ -277,6 +288,20 @@ class LlmClient @Inject constructor(
             .removeSuffix("/chat/completions")
             .trimEnd('/')
         val url = if (cleanBase.isEmpty()) "https://api.openai.com/v1/chat/completions" else "$cleanBase/chat/completions"
+        // Reject cleartext http:// endpoints that are not loopback: the Bearer
+        // token below would otherwise be sent in cleartext (audit H-28). Loopback
+        // hosts (localhost / 127.0.0.1 / 10.0.2.2) stay allowed for local model
+        // servers such as Ollama and LM Studio.
+        if (url.startsWith("http://")) {
+            val host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
+            val loopback = host.equals("localhost", ignoreCase = true) ||
+                host == "127.0.0.1" || host == "10.0.2.2"
+            if (!loopback) {
+                throw IllegalArgumentException(
+                    "Refusing cleartext http:// LLM endpoint (host $host); use https:// or a loopback address."
+                )
+            }
+        }
         val builder = Request.Builder()
             .url(url)
             .header("Content-Type", "application/json")

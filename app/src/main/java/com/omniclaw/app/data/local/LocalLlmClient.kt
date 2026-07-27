@@ -138,9 +138,10 @@ class LocalLlmClient @Inject constructor(
                 // We only use seqLen elements (the rest of inputSlice is
                 // already exactly seqLen long).
                 val inputForInference = if (inputSlice.size == seqLen) inputSlice else inputSlice.copyOf(seqLen)
-                val logits = engine.runIntSingle(modelPath, inputForInference, outputSize = vocabSize)
+                val logits = engine.runIntSingle(modelPath, inputForInference, outputSize = seqLen * vocabSize)
                 // The model returns logits for the next position; argmax for greedy.
-                val nextToken = argmax(logits)
+                val lastSlice = logits.copyOfRange((seqLen - 1) * vocabSize, seqLen * vocabSize)
+                val nextToken = argmax(lastSlice)
                 if (nextToken == eos) {
                     stopReason = "stop"
                     break

@@ -8,9 +8,11 @@ import com.omniclaw.app.data.local.SessionEntity
 import com.omniclaw.app.data.model.ChatMessage
 import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.model.SessionStatus
+import com.omniclaw.app.data.model.ToolCall
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -62,8 +65,14 @@ class SessionRepositoryImpl @Inject constructor(
         private const val TAG = "SessionRepository"
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // Held separately so close() can cancel the collector scope. Previously the
+    // scope was created with an anonymous SupervisorJob and never cancelled, so
+    // the init collector ran forever (leaking across instrumented tests).
+    private val supervisorJob = SupervisorJob()
+    private val scope = CoroutineScope(supervisorJob + Dispatchers.Default)
     private val msgSerializer = ListSerializer(ChatMessage.serializer())
+    private val toolCallSerializer = ListSerializer(ToolCall.serializer())
+    private val thoughtsSerializer = ListSerializer(String.serializer())
 
     /**
      * Per-session mutex map — serializes appendMessage calls so two rapid
@@ -72,6 +81,14 @@ class SessionRepositoryImpl @Inject constructor(
     private val sessionMutexes = ConcurrentHashMap<String, Mutex>()
     private fun mutexFor(id: String): Mutex =
         sessionMutexes.computeIfAbsent(id) { Mutex() }
+
+    /**
+     * Tombstoned session IDs — [delete] marks an id here so an in-flight
+     * [appendMessage] for that id bails out instead of re-inserting the session
+     * (appendMessage upserts from memory when the DB row is missing, which used
+     * to resurrect deleted sessions).
+     */
+    private val tombstones = ConcurrentHashMap.newKeySet<String>()
 
     // Private mutable StateFlow that we own and can update immediately (create/delete).
     // Room's observeAll() also feeds into it, but for operations like create() we
@@ -83,10 +100,12 @@ class SessionRepositoryImpl @Inject constructor(
 
     init {
         scope.launch {
-            sessionDao.observeAll().collect { entities ->
-                val dbSessions = entities.map { entity ->
-                    val msgs = chatMessageDao.getBySession(entity.id).map { it.toDomain() }
-                    entity.toDomain().copy(messages = msgs)
+            // Single SQL join via Room @Relation (SessionWithMessages) instead of an
+            // N+1 per-session chatMessageDao.getBySession() that re-ran for every
+            // session on every sessions-table change.
+            sessionDao.observeSessionsWithMessages().collect { rows ->
+                val dbSessions = rows.map { row ->
+                    row.session.toDomain().copy(messages = row.messages.map { it.toDomain() })
                 }
                 _sessions.update { currentList ->
                     dbSessions.map { dbSession ->
@@ -117,7 +136,11 @@ class SessionRepositoryImpl @Inject constructor(
     override fun create(title: String): Session {
         val now = System.currentTimeMillis()
         val session = Session(
-            id = UUID.randomUUID().toString().take(8),
+            // Full UUID (122 bits of entropy). The previous UUID.take(8) yielded only
+            // 32-bit IDs whose birthday bound (~65k entries) collided for long-term
+            // users; combined with @Insert(onConflict = REPLACE) a collision silently
+            // overwrote an existing session row.
+            id = UUID.randomUUID().toString(),
             title = title.ifBlank { "Untitled session" },
             createdAt = now,
             lastActiveAt = now,
@@ -154,7 +177,14 @@ class SessionRepositoryImpl @Inject constructor(
      */
     override suspend fun appendMessage(id: String, message: ChatMessage) {
         Log.d(TAG, "appendMessage START: sessionId=$id, messageId=${message.id}, role=${message.role}, timestamp=${message.timestamp}")
-        
+
+        // Skip appends to a session that is being deleted — otherwise the
+        // upsert-from-memory path below would resurrect the tombstoned session.
+        if (id in tombstones) {
+            Log.d(TAG, "appendMessage SKIPPED: session $id is tombstoned (being deleted)")
+            return
+        }
+
         // Step 1: Update in-memory StateFlow (synchronous, atomic)
         _sessions.update { list ->
             val session = list.firstOrNull { it.id == id }
@@ -174,6 +204,9 @@ class SessionRepositoryImpl @Inject constructor(
         // Step 2: Update database synchronously within same critical section
         try {
             mutexFor(id).withLock {
+                // Re-check under the mutex: delete() may have tombstoned this id
+                // while we were waiting for the lock.
+                if (id in tombstones) return@withLock
                 if (sessionDao.getById(id) == null) {
                     val memSession = getByIdSnapshot(id)
                     if (memSession != null) {
@@ -243,21 +276,43 @@ class SessionRepositoryImpl @Inject constructor(
     override fun stop(id: String) = setStatus(id, SessionStatus.STOPPED)
 
     override fun delete(id: String) {
-        sessionMutexes.remove(id)
+        // Tombstone first so an in-flight appendMessage for this id skips its
+        // write (and its upsert-from-memory path) instead of resurrecting the
+        // session we're about to delete.
+        tombstones.add(id)
         _sessions.update { list -> list.filter { it.id != id } }
         scope.launch {
-            sessionDao.delete(id)
-            chatMessageDao.deleteBySession(id)
+            // Hold the per-session mutex across the DB delete so a concurrent
+            // appendMessage can't slip in between the in-memory and DB deletes;
+            // only drop the mutex mapping once the delete has committed.
+            mutexFor(id).withLock {
+                sessionDao.delete(id)
+                chatMessageDao.deleteBySession(id)
+            }
+            sessionMutexes.remove(id)
         }
     }
 
     override fun clearAll() {
         sessionMutexes.clear()
+        tombstones.clear()
         _sessions.update { emptyList() }
         scope.launch {
             sessionDao.clearAll()
             chatMessageDao.clearAll()
         }
+    }
+
+    /**
+     * Cancel the repository's collector scope. The scope was previously never
+     * cancelled, so the init collector ran forever — in instrumented tests a
+     * lingering collector from a previous test polluted the next test's
+     * StateFlow. Tests (and production component teardown) can call this to
+     * release it; wire it to Hilt teardown (e.g. @PreDestroy) or an injected
+     * @ApplicationScope for automatic cancellation.
+     */
+    fun close() {
+        scope.cancel()
     }
 
     private fun serializeMessages(msgs: List<ChatMessage>): String =
@@ -266,6 +321,20 @@ class SessionRepositoryImpl @Inject constructor(
     private fun deserializeMessages(s: String): List<ChatMessage> =
         if (s.isBlank()) emptyList()
         else runCatching { json.decodeFromString(msgSerializer, s) }.getOrDefault(emptyList())
+
+    private fun serializeToolCalls(calls: List<ToolCall>): String? =
+        if (calls.isEmpty()) null else json.encodeToString(toolCallSerializer, calls)
+
+    private fun deserializeToolCalls(s: String?): List<ToolCall> =
+        if (s.isNullOrBlank()) emptyList()
+        else runCatching { json.decodeFromString(toolCallSerializer, s) }.getOrDefault(emptyList())
+
+    private fun serializeThoughts(thoughts: List<String>): String? =
+        if (thoughts.isEmpty()) null else json.encodeToString(thoughtsSerializer, thoughts)
+
+    private fun deserializeThoughts(s: String?): List<String> =
+        if (s.isNullOrBlank()) emptyList()
+        else runCatching { json.decodeFromString(thoughtsSerializer, s) }.getOrDefault(emptyList())
 
     private fun SessionEntity.toDomain(): Session = Session(
         id = id,
@@ -295,7 +364,13 @@ class SessionRepositoryImpl @Inject constructor(
         role = role.name,
         content = content,
         timestamp = timestamp,
-        toolCallId = toolCalls?.firstOrNull()?.id,
+        toolCallId = toolCalls.firstOrNull()?.id,
+        // Persist the full tool-call history and thoughts so they survive a DB
+        // round-trip. Previously only toolCalls.firstOrNull()?.id + content were
+        // stored, silently dropping tool args/results/ok/duration and thoughts on
+        // every restart — which broke the agent's self-learning loop.
+        toolCallsJson = serializeToolCalls(toolCalls),
+        thoughtsJson = serializeThoughts(thoughts),
     )
 
     private fun ChatMessageEntity.toDomain(): ChatMessage = ChatMessage(
@@ -303,6 +378,8 @@ class SessionRepositoryImpl @Inject constructor(
         role = runCatching { ChatMessage.Role.valueOf(role) }.getOrDefault(ChatMessage.Role.SYSTEM),
         content = content,
         timestamp = timestamp,
+        toolCalls = deserializeToolCalls(toolCallsJson),
+        thoughts = deserializeThoughts(thoughtsJson),
         toolCallId = toolCallId,
     )
 }

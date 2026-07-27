@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -29,6 +30,12 @@ import kotlin.math.sqrt
  * (like Silero), but it has zero native dependencies and runs in <1% CPU.
  * Good enough for the push-to-talk use case where the user is intentionally
  * holding the bubble to speak.
+ *
+ * Thread safety (M-16): [feed] is invoked from the audio capture thread while
+ * [state] / [hasDetectedSpeech] / [reset] may be read from the UI/coroutine
+ * layer. The mutable timing fields are therefore [AtomicLong] and the flag is
+ * [@Volatile] so writes on one thread are visible to the others without
+ * relying on accidental single-thread confinement.
  */
 class VoiceActivityDetector(
     private val speechThreshold: Float = 0.02f,
@@ -43,8 +50,12 @@ class VoiceActivityDetector(
     private val _state = MutableStateFlow(VadState.SILENCE)
     val state: StateFlow<VadState> = _state.asStateFlow()
 
-    private var speechStartedAt = 0L
-    private var silenceStartedAt = 0L
+    // Timing markers shared across the audio thread and readers (M-16): use
+    // AtomicLong so cross-thread reads/writes are atomic and visible.
+    private val speechStartedAt = AtomicLong(0L)
+    private val silenceStartedAt = AtomicLong(0L)
+
+    @Volatile
     private var everDetectedSpeech = false
 
     /** True if speech was detected at any point since [reset]. */
@@ -64,26 +75,26 @@ class VoiceActivityDetector(
         return when (_state.value) {
             VadState.SILENCE -> {
                 if (rms >= speechThreshold) {
-                    if (speechStartedAt == 0L) speechStartedAt = now
-                    if (now - speechStartedAt >= speechOnsetMs) {
+                    speechStartedAt.compareAndSet(0L, now)
+                    if (now - speechStartedAt.get() >= speechOnsetMs) {
                         everDetectedSpeech = true
-                        silenceStartedAt = 0L
+                        silenceStartedAt.set(0L)
                         _state.value = VadState.SPEECH
                     }
                 } else {
-                    speechStartedAt = 0L
+                    speechStartedAt.set(0L)
                 }
                 _state.value
             }
             VadState.SPEECH -> {
                 if (rms < silenceThreshold) {
-                    if (silenceStartedAt == 0L) silenceStartedAt = now
-                    if (now - silenceStartedAt >= silenceOffsetMs) {
+                    silenceStartedAt.compareAndSet(0L, now)
+                    if (now - silenceStartedAt.get() >= silenceOffsetMs) {
                         _state.value = VadState.SILENCE
-                        speechStartedAt = 0L
+                        speechStartedAt.set(0L)
                     }
                 } else {
-                    silenceStartedAt = 0L
+                    silenceStartedAt.set(0L)
                 }
                 _state.value
             }
@@ -93,8 +104,8 @@ class VoiceActivityDetector(
     /** Reset the VAD state (call before starting a new recording). */
     fun reset() {
         _state.value = VadState.SILENCE
-        speechStartedAt = 0L
-        silenceStartedAt = 0L
+        speechStartedAt.set(0L)
+        silenceStartedAt.set(0L)
         everDetectedSpeech = false
     }
 

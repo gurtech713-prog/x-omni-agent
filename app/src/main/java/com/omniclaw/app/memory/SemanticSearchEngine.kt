@@ -23,10 +23,11 @@ import javax.inject.Singleton
  * model and cache the results in [EmbeddingCache]. The [search] API stays the same.
  */
 @Singleton
-class SemanticSearchEngine @Inject constructor() {
+class SemanticSearchEngine @Inject constructor(
+    private val embeddingCache: EmbeddingCache,
+) {
 
     private val documents = ConcurrentHashMap<String, DocEntry>()
-    private val embeddingCache = EmbeddingCache()
 
     /** Add a document to the search index. */
     fun index(docId: String, content: String) {

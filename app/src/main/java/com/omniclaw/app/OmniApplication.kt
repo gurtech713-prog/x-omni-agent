@@ -151,18 +151,18 @@ class OmniApplication : Application(), Configuration.Provider {
 /**
  * No-op fallback tokenizer — used when no real tokenizer.json is bundled.
  *
- * This is a CHARACTER-LEVEL tokenizer: it encodes each char to its Unicode
- * code point and decodes back. It won't produce meaningful LLM output (the
- * model's vocabulary is token-based, not char-based), but it lets the LiteRT
- * path run end-to-end for testing the runtime plumbing without a real
- * tokenizer. Replace by registering a real tokenizer at app startup.
+ * This is a CHARACTER-LEVEL tokenizer: it encodes each Unicode code point
+ * and decodes back. It won't produce meaningful LLM output (the model's
+ * vocabulary is token-based, not char-based), but it lets the LiteRT path
+ * run end-to-end for testing the runtime plumbing without a real tokenizer.
+ * Replace by registering a real tokenizer at app startup.
  */
 private object FallbackTokenizer : LocalLlmClient.Tokenizer {
     override fun encode(text: String): IntArray =
-        IntArray(text.length) { text[it].code }
+        text.codePoints().toArray()
 
     override fun decode(tokens: IntArray): String =
-        String(tokens.map { it.toChar() }.toCharArray())
+        String(tokens, 0, tokens.size)
 
     override fun chatTemplate(messages: List<LlmClient.Message>): String =
         messages.joinToString("\n") { m ->

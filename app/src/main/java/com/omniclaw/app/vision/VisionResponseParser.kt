@@ -58,7 +58,10 @@ class VisionResponseParser(private val json: Json) {
             val usage = obj["usageMetadata"]?.jsonObject
             val prompt = usage?.get("promptTokenCount")?.jsonPrimitive?.contentOrNull?.toLongOrNull()
             val completion = usage?.get("candidatesTokenCount")?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-            if (text != null) {
+            // Treat empty/blank text the same as "no text field at all" so the
+            // caller reports "empty content from provider" instead of masking
+            // the cause behind a downstream "Malformed VLM response" throw.
+            if (!text.isNullOrEmpty()) {
                 return VisionResult(text, finish, prompt, completion)
             }
         }

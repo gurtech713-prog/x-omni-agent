@@ -15,7 +15,7 @@ import javax.inject.Singleton
  * mmap on some devices), and caches extracted models by content hash.
  *
  * Extraction is idempotent: if the extracted file already exists with the
- * expected size, it's reused. A SHA-256 of the first 4KB is used to detect
+ * expected size, it's reused. A SHA-256 of the full file is used to detect
  * APK updates that change the bundled model (in which case the extracted
  * file is overwritten).
  *
@@ -65,43 +65,74 @@ class ModelManager @Inject constructor(
             return outFile
         }
 
-        // Extract the asset.
+        // Extract the asset atomically: write to a temp file, then rename.
+        val tmpFile = File(outFile.absolutePath + ".tmp")
         runCatching {
             ctx.assets.open(assetPath).use { input ->
-                FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                FileOutputStream(tmpFile).use { output -> input.copyTo(output) }
+            }
+            // Verify the extracted file is non-empty before renaming.
+            if (tmpFile.length() == 0L) {
+                tmpFile.delete()
+                throw LiteRtModelException("Asset '$assetPath' extracted as empty file — model not found in APK")
+            }
+            // Atomic rename — prevents partial files from being used after a crash.
+            if (!tmpFile.renameTo(outFile)) {
+                tmpFile.delete()
+                throw LiteRtModelException("Failed to rename temp file to '${outFile.absolutePath}'")
             }
         }.onFailure {
+            runCatching { tmpFile.delete() }
+            if (it is LiteRtModelException) throw it
             throw LiteRtModelException("Could not extract model '$assetPath': ${it.message}")
         }
 
-        if (outFile.length() == 0L) {
-            throw LiteRtModelException("Asset '$assetPath' extracted as empty file — model not found in APK")
-        }
         Log.i(TAG, "Extracted LiteRT model '$assetPath' -> ${outFile.absolutePath} (${outFile.length()} bytes)")
         synchronized(lock) { cache[modelPath] = outFile }
         return outFile
     }
 
     /**
-     * Check if the bundled asset differs from the extracted file by hashing
-     * the first 4KB of each. Returns true if they differ (asset was updated).
+     * Check if the bundled asset differs from the extracted file.
+     * Compares file length first (cheap), then hashes the full file content
+     * to detect any corruption or truncation.
      */
     private fun assetChanged(assetPath: String, extracted: File): Boolean {
+        // Get asset size for length comparison.
+        val assetSize = runCatching {
+            ctx.assets.openFd(assetPath).use { it.length }
+        }.getOrNull()
+
+        // If we can determine the asset size, check length first (cheap check).
+        if (assetSize != null && extracted.length() != assetSize) {
+            return true
+        }
+
+        // Hash the full asset content.
         val assetHash = runCatching {
             ctx.assets.open(assetPath).use { input ->
-                val buf = ByteArray(4096)
-                val n = input.read(buf)
-                if (n <= 0) return@use ""
-                MessageDigest.getInstance("SHA-256").digest(buf.copyOf(n)).joinToString("") { "%02x".format(it) }
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buf = ByteArray(8192)
+                var n = input.read(buf)
+                while (n > 0) {
+                    digest.update(buf, 0, n)
+                    n = input.read(buf)
+                }
+                digest.digest().joinToString("") { "%02x".format(it) }
             }
         }.getOrNull() ?: return false  // can't read asset — don't trigger re-extract
 
+        // Hash the full extracted file content.
         val fileHash = runCatching {
             extracted.inputStream().use { input ->
-                val buf = ByteArray(4096)
-                val n = input.read(buf)
-                if (n <= 0) return@use ""
-                MessageDigest.getInstance("SHA-256").digest(buf.copyOf(n)).joinToString("") { "%02x".format(it) }
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buf = ByteArray(8192)
+                var n = input.read(buf)
+                while (n > 0) {
+                    digest.update(buf, 0, n)
+                    n = input.read(buf)
+                }
+                digest.digest().joinToString("") { "%02x".format(it) }
             }
         }.getOrNull() ?: return true  // can't read extracted — re-extract
 

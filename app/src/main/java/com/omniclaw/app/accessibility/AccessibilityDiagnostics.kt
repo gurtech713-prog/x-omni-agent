@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicInteger
 
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -37,6 +38,7 @@ class AccessibilityDiagnostics @Inject constructor() {
 
     private val eventLog = ConcurrentLinkedDeque<DiagnosticEvent>()
     private val maxLogSize = 200
+    private val eventLogSize = AtomicInteger(0)
 
     data class DiagnosticEvent(
         val timestamp: Long,
@@ -95,7 +97,8 @@ class AccessibilityDiagnostics @Inject constructor() {
     fun log(category: String, message: String, severity: DiagnosticEvent.Severity = DiagnosticEvent.Severity.INFO) {
         val event = DiagnosticEvent(System.currentTimeMillis(), category, message, severity)
         eventLog.addFirst(event)
-        while (eventLog.size > maxLogSize) eventLog.pollLast()
+        eventLogSize.incrementAndGet()
+        while (eventLogSize.get() > maxLogSize) { eventLog.pollLast(); eventLogSize.decrementAndGet() }
         val priority = when (severity) {
             DiagnosticEvent.Severity.INFO -> Log.INFO
             DiagnosticEvent.Severity.WARN -> Log.WARN
@@ -124,6 +127,7 @@ class AccessibilityDiagnostics @Inject constructor() {
         keyboardDismissals.set(0)
         packageSwitches.set(0)
         eventLog.clear()
+        eventLogSize.set(0)
         _state.value = ServiceState.DISCONNECTED
     }
 

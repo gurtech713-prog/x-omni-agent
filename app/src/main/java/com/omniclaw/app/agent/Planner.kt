@@ -26,11 +26,14 @@ import javax.inject.Singleton
 class Planner @Inject constructor(
     private val llm: UnifiedLlmClient,
 ) {
-    data class PlanStep(val id: Int, val intent: String, var done: Boolean = false)
+    data class PlanStep(val id: Int, val intent: String, private var done: Boolean = false) {
+        val isDone: Boolean get() = done
+        fun markDone() { done = true }
+    }
 
     data class Plan(val goal: String, val steps: MutableList<PlanStep>) {
-        val nextStep: PlanStep? get() = steps.firstOrNull { !it.done }
-        val isComplete: Boolean get() = steps.isNotEmpty() && steps.all { it.done }
+        val nextStep: PlanStep? get() = steps.firstOrNull { !it.isDone }
+        val isComplete: Boolean get() = steps.isNotEmpty() && steps.all { it.isDone }
     }
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -99,7 +102,7 @@ class Planner @Inject constructor(
         return buildString {
             appendLine("CURRENT PLAN (goal: ${plan.goal}):")
             plan.steps.forEach { s ->
-                appendLine("  ${if (s.done) "[x]" else "[ ]"} ${s.id}. ${s.intent}")
+                appendLine("  ${if (s.isDone) "[x]" else "[ ]"} ${s.id}. ${s.intent}")
             }
             plan.nextStep?.let { appendLine("Focus on step ${it.id} next.") }
         }.trimEnd()

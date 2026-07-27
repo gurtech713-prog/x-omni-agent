@@ -51,6 +51,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -113,7 +117,7 @@ fun ChatScreen(sessionId: String? = null) {
     // (the already-filtered StateFlow) and only adds +1 for the typing
     // indicator when the session is RUNNING and has at least one message
     // (matching the `else if` condition that renders TypingIndicator below).
-    LaunchedEffect(messages.size, session?.status, messages.lastOrNull()?.content?.length) {
+    LaunchedEffect(messages.size, session?.status) {
         val n = messages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING
@@ -122,6 +126,25 @@ fun ChatScreen(sessionId: String? = null) {
             val targetIndex = n - 1 + (if (showTypingIndicator) 1 else 0)
             listState.animateScrollToItem(targetIndex)
         }
+        // H-37: live-scroll while the last message streams in. Keying this
+        // effect on the content length of the last message restarted the whole
+        // effect (cancelling the in-flight scroll animation) on every token.
+        // Instead, observe it via snapshotFlow + distinctUntilChanged + debounce
+        // so streaming growth scrolls smoothly without restart churn; the effect
+        // key now relies on messages.size only.
+        snapshotFlow { messages.lastOrNull()?.content?.length }
+            .distinctUntilChanged()
+            .debounce(100)
+            .collect {
+                val count = messages.size
+                if (count > 0) {
+                    val running = session?.status == SessionStatus.RUNNING
+                    val hasMsgs = session?.messages?.isNotEmpty() == true
+                    val typing = running && hasMsgs
+                    val target = count - 1 + (if (typing) 1 else 0)
+                    listState.animateScrollToItem(target)
+                }
+            }
     }
 
     // Snappily adjust scroll position when screen height changes (e.g. keyboard opens)

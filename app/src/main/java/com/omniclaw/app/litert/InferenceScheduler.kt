@@ -4,6 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,13 +26,12 @@ import javax.inject.Singleton
  *   - [ModelManager] for model file resolution.
  *   - [DelegateManager] for delegate lifecycle.
  *   - [InterpreterPool] for limited concurrent inference.
- *   - [TensorCache] for reusable I/O buffers.
  *
  * Profiling: every inference is timed and recorded. The [stats] flow
  * exposes per-model latency percentiles for the diagnostics UI.
  *
  * OOM recovery: if an interpreter construction fails with OutOfMemoryError,
- * the scheduler evicts all cached interpreters + tensors and retries once.
+ * the scheduler evicts all cached interpreters and retries once.
  * If the retry also fails, it throws [LiteRtOomException].
  *
  * Warm-up: [warmUp] runs a dummy inference (all-zeros input) on a freshly
@@ -44,7 +44,6 @@ class InferenceScheduler @Inject constructor(
     private val modelManager: ModelManager,
     private val delegateManager: DelegateManager,
     private val interpreterPool: InterpreterPool,
-    private val tensorCache: TensorCache,
 ) {
 
     data class ModelStats(
@@ -80,8 +79,8 @@ class InferenceScheduler @Inject constructor(
         val start = System.currentTimeMillis()
         try {
             val result = runWithOomRecovery(modelPath, useGpu, useNnapi) { interp ->
-                // Per-call output buffer: tensorCache returns a SHARED array that
-                // races when the InterpreterPool runs concurrent same-model inferences.
+                // Per-call output buffer: a shared/cached array would race when the
+                // InterpreterPool runs concurrent same-model inferences.
                 val output = FloatArray(outputSize)
                 interp.run(input, output)
                 output
@@ -108,8 +107,8 @@ class InferenceScheduler @Inject constructor(
         val start = System.currentTimeMillis()
         try {
             val result = runWithOomRecovery(modelPath, useGpu, useNnapi) { interp ->
-                // Per-call output buffer: tensorCache returns a SHARED array that
-                // races when the InterpreterPool runs concurrent same-model inferences.
+                // Per-call output buffer: a shared/cached array would race when the
+                // InterpreterPool runs concurrent same-model inferences.
                 val output = FloatArray(outputSize)
                 interp.run(input, output)
                 output
@@ -137,7 +136,7 @@ class InferenceScheduler @Inject constructor(
 
     /**
      * Run an inference with OOM recovery: if the interpreter construction
-     * throws OutOfMemoryError, evict all cached interpreters + tensors and
+     * throws OutOfMemoryError, evict all cached interpreters and
      * retry once on CPU. If the retry also OOMs, surface as [LiteRtOomException]
      * so callers can fall back to a cloud LLM instead of crashing the process.
      */
@@ -152,7 +151,6 @@ class InferenceScheduler @Inject constructor(
         } catch (e: OutOfMemoryError) {
             Log.w(TAG, "OOM during inference for $modelPath — evicting caches and retrying on CPU", e)
             runCatching { interpreterPool.closeAll() }
-            tensorCache.clearAll()
             // Retry on CPU only (no GPU/NNAPI delegates — both can be the source of native OOM).
             try {
                 runWithPool(modelPath, useGpu = false, useNnapi = false, block)
@@ -243,10 +241,12 @@ class InferenceScheduler @Inject constructor(
         }
     }
 
-    /** Release all pooled interpreters + tensors. Call on app background / low memory. */
+    /** Release all pooled interpreters and cancel warm-up work. Call on app background / low memory. */
     suspend fun shutdown() {
         interpreterPool.closeAll()
-        tensorCache.clearAll()
+        // Cancel the warm-up scope (M-33): otherwise its SupervisorJob leaks and
+        // any in-flight warm-up coroutine keeps running after shutdown.
+        warmupScope.cancel()
     }
 
     companion object {

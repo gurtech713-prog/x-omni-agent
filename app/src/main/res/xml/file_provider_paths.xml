@@ -16,8 +16,13 @@
     <files-path
         name="litert_models"
         path="litert_models/" />
-    <!-- Cache for any temp files (e.g. intermediate screenshots). -->
+    <!--
+        Shareable temp files only. Restricted to the cacheDir/shared/
+        subdirectory (File(cacheDir, "shared/")) instead of the entire
+        cacheDir so unrelated cached data (intermediate screenshots, temp
+        downloads, sensitive caches) is never exposed via content:// URIs.
+    -->
     <cache-path
         name="cache"
-        path="." />
+        path="shared/" />
 </paths>

@@ -136,10 +136,25 @@ fun SettingsScreen() {
     val perms by vm.permissions.collectAsStateWithLifecycle()
     val privacyAccepted by vm.privacyAccepted.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
-    var haloEnabled by remember { mutableStateOf(com.omniclaw.app.service.HaloOverlayService.isRunning()) }
+    // M-46 FIX: rememberSaveable survives process-death restoration, and the
+    // sync LaunchedEffect below re-reads the volatile service state so the
+    // toggle can't show a stale ON after the service is killed externally.
+    // (HaloOverlayService currently exposes only isRunning(), not a StateFlow,
+    // so we re-poll on a short interval rather than collect a flow.)
+    var haloEnabled by rememberSaveable { mutableStateOf(com.omniclaw.app.service.HaloOverlayService.isRunning()) }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "SettingsScreen composed")
+    }
+
+    // M-46 FIX: keep the Halo toggle in sync with the real service state so an
+    // external kill (crash / system stop) flips it off instead of leaving a
+    // stale ON. Re-reads isRunning() periodically.
+    LaunchedEffect(Unit) {
+        while (true) {
+            haloEnabled = com.omniclaw.app.service.HaloOverlayService.isRunning()
+            kotlinx.coroutines.delay(1000)
+        }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -636,8 +651,17 @@ private fun ModelConfigEditor(
     // State to toggle custom model text input visibility
     var showCustomModelInput by remember { mutableStateOf(false) }
 
+    // H-35 FIX: tracks whether the user has unsaved local edits. While true,
+    // the LaunchedEffect(cfg) sync below is skipped so an external config
+    // emission (process-death restoration, preset/backup flow) doesn't clobber
+    // typed-but-unsaved values. rememberSaveable so the guard itself survives
+    // process death alongside the draft fields it protects.
+    var userEdited by rememberSaveable { mutableStateOf(false) }
+
     // Synchronize local states when external config updates (presets, backups, etc.)
     LaunchedEffect(cfg) {
+        // H-35 FIX: don't overwrite the user's unsaved edits.
+        if (userEdited) return@LaunchedEffect
         localBaseUrl = cfg.baseUrl
         localApiKey = cfg.apiKey
         localModel = cfg.model
@@ -672,7 +696,11 @@ private fun ModelConfigEditor(
         localSttBaseUrl, localSttApiKey, localSttModel,
         localVlmBaseUrl, localVlmApiKey, localVlmModel,
     ) {
-        onDirty(computeDirty())
+        val dirty = computeDirty()
+        // H-35 FIX: remember that the user has unsaved edits so a later cfg
+        // emission doesn't reset the fields out from under them.
+        userEdited = dirty
+        onDirty(dirty)
     }
 
     Column(Modifier.padding(16.dp)) {

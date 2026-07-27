@@ -110,8 +110,9 @@ class AccessibilityExecutor @Inject constructor(
      */
     suspend fun dispatch(action: DeviceAction): Boolean {
         val svc = svc() as? AccessibilityService ?: return false
-        // Pre-action: dismiss dialogs / keyboard that would intercept.
-        clearBlockingOverlays(svc)
+        // Pre-action: dismiss dialogs / keyboard that would intercept — but
+        // only when they would actually block this specific action (M-02).
+        clearBlockingOverlays(svc, action)
 
         return when (action) {
             is DeviceAction.Tap -> {
@@ -188,8 +189,23 @@ class AccessibilityExecutor @Inject constructor(
      * never speculatively — so we don't dismiss the user's legitimate
      * foreground activity.
      */
-    private fun clearBlockingOverlays(svc: AccessibilityService) {
+    private fun clearBlockingOverlays(svc: AccessibilityService, action: DeviceAction) {
+        // Type actions target the focused field, which is often inside a
+        // dialog. Pressing BACK first would dismiss the dialog the agent is
+        // typing into, so never clear overlays for Type (M-02).
+        if (action is DeviceAction.Type) return
+
         val state = windowTracker.current
+
+        // For a tap/swipe aimed AT a visible dialog (e.g. "OK"/"Delete"),
+        // dismissing the dialog first makes the gesture land on the app
+        // behind it. When a dialog is showing it owns the active window, so
+        // the active root's screen bounds are the dialog's bounds; only
+        // dismiss when the gesture lands outside them.
+        if (state.isDialogVisible && gestureInsideActiveWindow(svc, action)) {
+            return
+        }
+
         if (state.isDialogVisible || state.isKeyboardVisible) {
             val ok = runCatching {
                 svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
@@ -205,6 +221,30 @@ class AccessibilityExecutor @Inject constructor(
                 }
             }
         }
+    }
+
+    /**
+     * True if [action] is a tap/swipe whose target coordinates fall inside the
+     * active window's bounds. When a dialog is visible it owns the active
+     * window, so this effectively tests whether the gesture targets the dialog
+     * (and therefore must NOT be dismissed first). See M-02.
+     */
+    private fun gestureInsideActiveWindow(svc: AccessibilityService, action: DeviceAction): Boolean {
+        val (x, y) = when (action) {
+            is DeviceAction.Tap -> action.x to action.y
+            is DeviceAction.Swipe -> action.x1 to action.y1
+            else -> return false
+        }
+        return runCatching {
+            val root = svc.rootInActiveWindow ?: return@runCatching false
+            try {
+                val bounds = android.graphics.Rect()
+                root.getBoundsInScreen(bounds)
+                bounds.contains(x, y)
+            } finally {
+                runCatching { root.recycle() }
+            }
+        }.getOrDefault(false)
     }
 
     /**
@@ -277,6 +317,41 @@ class AccessibilityExecutor @Inject constructor(
         }
     }
 
+    /**
+     * Process-level cache of launchable app label -> package name, built lazily
+     * with a single [android.content.pm.PackageManager.queryIntentActivities]
+     * call (ACTION_MAIN + CATEGORY_LAUNCHER). Avoids 150+ per-app PackageManager
+     * IPCs on the launch fallback path (H-05).
+     */
+    @Volatile
+    private var launchableAppsCache: Map<String, String>? = null
+
+    private fun launchableApps(svc: AccessibilityService): Map<String, String> {
+        launchableAppsCache?.let { return it }
+        val pm = svc.packageManager
+        val map = runCatching {
+            val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(
+                    launcherIntent,
+                    android.content.pm.PackageManager.ResolveInfoFlags.of(0L),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(launcherIntent, 0)
+            }
+            val result = HashMap<String, String>(resolveInfos.size)
+            for (info in resolveInfos) {
+                val label = runCatching { info.loadLabel(pm).toString().lowercase() }.getOrNull() ?: continue
+                val pkgName = info.activityInfo?.packageName ?: continue
+                result.putIfAbsent(label, pkgName)
+            }
+            result
+        }.getOrDefault(emptyMap())
+        launchableAppsCache = map
+        return map
+    }
+
     private fun launchPackage(svc: AccessibilityService, packageNameOrAppName: String): Boolean {
         return try {
             val pm = svc.packageManager
@@ -308,18 +383,16 @@ class AccessibilityExecutor @Inject constructor(
             
             var intent = pm.getLaunchIntentForPackage(pkg)
             
-            // If getLaunchIntentForPackage returned null and input looks like an app label, search installed applications
+            // If getLaunchIntentForPackage returned null and input looks like an
+            // app label, search launchable apps via a single cached query
+            // (ACTION_MAIN + CATEGORY_LAUNCHER) instead of iterating every
+            // installed app with a per-app IPC (H-05).
             if (intent == null && !cleanedInput.contains('.')) {
-                val installedApps = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
-                for (appInfo in installedApps) {
-                    val label = pm.getApplicationLabel(appInfo).toString().lowercase()
-                    if (label == cleanedInput || label.contains(cleanedInput)) {
-                        val foundIntent = pm.getLaunchIntentForPackage(appInfo.packageName)
-                        if (foundIntent != null) {
-                            intent = foundIntent
-                            break
-                        }
-                    }
+                val apps = launchableApps(svc)
+                val matchPkg = apps[cleanedInput]
+                    ?: apps.entries.firstOrNull { (label, _) -> label.contains(cleanedInput) }?.value
+                if (matchPkg != null) {
+                    intent = pm.getLaunchIntentForPackage(matchPkg)
                 }
             }
             
@@ -353,7 +426,8 @@ class AccessibilityExecutor @Inject constructor(
         val cls = runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "?"
         val text = runCatching { node.text?.toString().orEmpty().take(80) }.getOrDefault("")
         val rawId = runCatching { node.viewIdResourceName }.getOrNull()
-        val id = if (rawId != null) logger.rebindRef(rawId, node.packageName?.toString() ?: "") ?: rawId else ""
+        val pkg = runCatching { node.packageName?.toString() }.getOrNull().orEmpty()
+        val id = if (rawId != null) logger.rebindRef(rawId, pkg) ?: rawId else ""
         sb.append("$pad- $cls")
         if (id.isNotBlank()) sb.append(" id=$id")
         if (text.isNotBlank()) sb.append(" text=\"$text\"")

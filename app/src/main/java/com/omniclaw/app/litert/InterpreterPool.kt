@@ -3,8 +3,10 @@ package com.omniclaw.app.litert
 import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.tensorflow.lite.Interpreter
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -41,6 +43,9 @@ class InterpreterPool @Inject constructor() {
 
     private val pools = ConcurrentHashMap<PoolKey, MutableList<PooledInterpreter>>()
     private val poolLocks = ConcurrentHashMap<PoolKey, Mutex>()
+    // Per-key count of creation slots reserved (but not yet materialized) so
+    // that factory() can run OUTSIDE poolLock without overshooting maxPoolSize.
+    private val reservedSlots = ConcurrentHashMap<PoolKey, AtomicInteger>()
     private val warmupCount = AtomicLong(0)
 
     /**
@@ -63,6 +68,7 @@ class InterpreterPool @Inject constructor() {
     ): LeasedInterpreter {
         val key = PoolKey(modelPath, useGpu, useNnapi)
         val poolLock = poolLocks.computeIfAbsent(key) { Mutex() }
+        val reserved = reservedSlots.computeIfAbsent(key) { AtomicInteger(0) }
         // Loop until we acquire (or create) an interpreter. The loop is
         // required because two coroutines may both see "no free slot" and
         // both wait on the same mutex; when one releases, only one waiter
@@ -75,6 +81,7 @@ class InterpreterPool @Inject constructor() {
             // wrong one.
             var leased: LeasedInterpreter? = null
             var waitFor: PooledInterpreter? = null
+            var shouldCreate = false
             poolLock.withLock {
                 val pool = pools.computeIfAbsent(key) { mutableListOf() }
                 // Find a free interpreter (one whose mutex is unlocked).
@@ -84,12 +91,12 @@ class InterpreterPool @Inject constructor() {
                         return@withLock
                     }
                 }
-                // All in use — create a new one if below capacity.
-                if (pool.size < maxPoolSize) {
-                    val pi = factory()
-                    pool.add(pi)
-                    pi.mutex.lock()
-                    leased = LeasedInterpreter(pi, key, this)
+                // All in use — reserve a creation slot if below capacity. We only
+                // RESERVE here; the expensive factory() call runs OUTSIDE poolLock
+                // (below) so other acquirers can progress during construction.
+                if (pool.size + reserved.get() < maxPoolSize) {
+                    reserved.incrementAndGet()
+                    shouldCreate = true
                     return@withLock
                 }
                 // Pool at capacity — remember which interpreter to wait on, then
@@ -97,11 +104,31 @@ class InterpreterPool @Inject constructor() {
                 waitFor = pool.first()
             }
             leased?.let { return it }
+            if (shouldCreate) {
+                // Construct WITHOUT holding poolLock (H-43): model load can be
+                // slow/native and must not block other acquirers of this model.
+                val created = runCatching { factory() }.getOrNull()
+                poolLock.withLock {
+                    val pool = pools.computeIfAbsent(key) { mutableListOf() }
+                    reserved.decrementAndGet()
+                    if (created != null) {
+                        pool.add(created)
+                        created.mutex.lock()
+                        return LeasedInterpreter(created, key, this)
+                    }
+                }
+                // factory() failed — loop to retry or wait on an existing slot.
+                continue
+            }
             val chosen = waitFor ?: continue  // null only on a race with closeAll → retry
             // Acquire exclusively with lock() (NOT withLock): the lease must KEEP
             // the mutex held until release(). withLock's finally block would unlock
             // on return, handing out an unheld interpreter → concurrent run() corruption.
-            chosen.mutex.lock()
+            // Bound the wait (H-44): a stuck/leaked interpreter must not wedge this
+            // caller forever. On timeout, retry the loop to re-evaluate free slots
+            // or create a new interpreter.
+            val locked = withTimeoutOrNull(30_000) { chosen.mutex.lock() }
+            if (locked == null) continue
             return LeasedInterpreter(chosen, key, this)
         }
     }
@@ -117,7 +144,18 @@ class InterpreterPool @Inject constructor() {
             val poolLock = poolLocks[key] ?: continue
             poolLock.withLock {
                 pool.forEach { pi ->
-                    runCatching { pi.interpreter.close() }
+                    // Drain any in-flight inference before closing (C-12): the
+                    // TFLite Interpreter is not thread-safe, so closing during a
+                    // concurrent run() causes a native use-after-free / SIGSEGV.
+                    // Acquiring pi.mutex waits for the current holder to finish;
+                    // the timeout bounds shutdown so a stuck lease can't hang it.
+                    runCatching {
+                        withTimeoutOrNull(30_000) {
+                            pi.mutex.withLock {
+                                runCatching { pi.interpreter.close() }
+                            }
+                        }
+                    }
                     runCatching { pi.gpuDelegate?.close() }
                     runCatching { pi.nnApiDelegate?.close() }
                 }
@@ -126,6 +164,7 @@ class InterpreterPool @Inject constructor() {
         }
         pools.clear()
         poolLocks.clear()
+        reservedSlots.clear()
     }
 
     /** Number of interpreters currently pooled for a given key. */
@@ -141,7 +180,17 @@ class InterpreterPool @Inject constructor() {
         private val pool: InterpreterPool,
     ) : AutoCloseable {
         val interpreter: Interpreter get() = pooled.interpreter
-        override fun close() = pool.release(this)
+        // Idempotency guard (M-47): close() may be invoked both by a
+        // try-finally { lease.close() } and an explicit release; only the first
+        // call should unlock the mutex, otherwise the second throws
+        // IllegalStateException: Mutex is not locked.
+        private var released = false
+        override fun close() {
+            if (!released) {
+                released = true
+                pool.release(this)
+            }
+        }
     }
 
     companion object {

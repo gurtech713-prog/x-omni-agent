@@ -1,6 +1,10 @@
 package com.omniclaw.app.service
 
 import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -20,7 +24,10 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.omniclaw.app.MainActivity
+import com.omniclaw.app.OmniApplication
 import com.omniclaw.app.R
 import com.omniclaw.app.agent.AgentLoop
 import com.omniclaw.app.data.session.SessionRepository
@@ -32,6 +39,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
@@ -66,6 +74,27 @@ class OverlayService : Service() {
         super.onCreate()
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
+
+        // Promote to a specialUse foreground service so the overlay isn't killed
+        // on Android 14+ (H-20). Shares the agent notification channel. The
+        // manifest declares foregroundServiceType="specialUse" plus the required
+        // PROPERTY_SPECIAL_USE_FGS_SUBTYPE for this service.
+        ensureNotificationChannel()
+        runCatching {
+            val notif = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIF_ID,
+                    notif,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to promote OverlayService to foreground: ${e.message}", e)
+        }
+
         bubble = buildBubble()
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -82,7 +111,15 @@ class OverlayService : Service() {
             x = 32
             y = 200
         }
+        // Don't silently swallow addView failures (H-19): if the overlay can't be
+        // attached (e.g. SYSTEM_ALERT_WINDOW revoked), log it, drop the bubble
+        // reference, and stop the service so we don't linger uselessly.
         runCatching { windowManager?.addView(bubble, params) }
+            .onFailure { e ->
+                Log.e(TAG, "Failed to add overlay bubble view: ${e.message}", e)
+                bubble = null
+                stopSelf()
+            }
     }
 
     override fun onDestroy() {
@@ -114,7 +151,7 @@ class OverlayService : Service() {
             private var rawStartX = 0f
             private var rawStartY = 0f
             private var moved = false
-            private var recording = false
+            @Volatile private var recording = false
 
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
@@ -138,19 +175,26 @@ class OverlayService : Service() {
                             vibrate(50)
                             return true
                         }
-                        // Start recording
-                        recording = audioRecorder.start() != null
-                        if (recording) {
-                            (v as TextView).text = "REC"
-                            v.announceForAccessibility("Recording")
-                            vibrate(20)
-                        } else {
-                            // start() failed (mic busy or hardware error)
-                            android.widget.Toast.makeText(
-                                this@OverlayService,
-                                "Could not start recording. Microphone may be in use.",
-                                android.widget.Toast.LENGTH_SHORT,
-                            ).show()
+                        // Start recording on IO — MediaRecorder.start() touches the
+                        // mic hardware and must not run on the main thread (H-18).
+                        // Bubble text is updated back on the main thread.
+                        scope.launch(Dispatchers.IO) {
+                            val started = audioRecorder.start() != null
+                            recording = started
+                            withContext(Dispatchers.Main) {
+                                if (started) {
+                                    (v as TextView).text = "REC"
+                                    v.announceForAccessibility("Recording")
+                                    vibrate(20)
+                                } else {
+                                    // start() failed (mic busy or hardware error)
+                                    android.widget.Toast.makeText(
+                                        this@OverlayService,
+                                        "Could not start recording. Microphone may be in use.",
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
+                            }
                         }
                     }
                     MotionEvent.ACTION_MOVE -> {
@@ -160,11 +204,16 @@ class OverlayService : Service() {
                     }
                     MotionEvent.ACTION_UP -> {
                         if (recording) {
-                            val audioFile = audioRecorder.stop()
                             (v as TextView).text = "PUSH"
-                            if (!moved && audioFile != null) {
-                                vibrate(15)
-                                transcribeAndDispatch(audioFile)
+                            val wasMoved = moved
+                            // Stop recording on IO — MediaRecorder.stop() encodes and
+                            // writes the file, which must not block the UI (H-18).
+                            scope.launch(Dispatchers.IO) {
+                                val audioFile = audioRecorder.stop()
+                                if (!wasMoved && audioFile != null) {
+                                    withContext(Dispatchers.Main) { vibrate(15) }
+                                    transcribeAndDispatch(audioFile)
+                                }
                             }
                             recording = false
                         }
@@ -172,8 +221,9 @@ class OverlayService : Service() {
                     }
                     MotionEvent.ACTION_CANCEL -> {
                         if (recording) {
-                            audioRecorder.cancel()
                             (v as TextView).text = "PUSH"
+                            // Cancel on IO for the same reason as start/stop (H-18).
+                            scope.launch(Dispatchers.IO) { audioRecorder.cancel() }
                             recording = false
                         }
                     }
@@ -285,8 +335,42 @@ class OverlayService : Service() {
         }
     }
 
+    private fun buildNotification(): Notification {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Builder(this, OmniApplication.CHANNEL_AGENT)
+            .setContentTitle("Omni overlay")
+            .setContentText("Push-to-talk bubble is active.")
+            .setSmallIcon(R.drawable.ic_omni_mono)
+            .setContentIntent(openIntent)
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(OmniApplication.CHANNEL_AGENT) != null) return
+        nm.createNotificationChannel(
+            NotificationChannel(
+                OmniApplication.CHANNEL_AGENT,
+                "Omni agent",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "On-device agent services (overlay, capture, automation)."
+                setShowBadge(false)
+            }
+        )
+    }
+
     companion object {
         private const val TAG = "OverlayService"
+        private const val NOTIF_ID = 0x0B51
         @Volatile private var instance: OverlayService? = null
         fun isRunning(): Boolean = instance != null
 
@@ -307,7 +391,12 @@ class OverlayService : Service() {
                 return
             }
             val i = Intent(ctx, OverlayService::class.java)
-            runCatching { ctx.startService(i) }
+            // The service promotes itself to a specialUse foreground service in
+            // onCreate (H-20), so start it as a foreground service on O+.
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                else ctx.startService(i)
+            }
         }
         fun stop(ctx: android.content.Context) {
             ctx.stopService(Intent(ctx, OverlayService::class.java))

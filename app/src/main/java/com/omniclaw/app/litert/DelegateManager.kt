@@ -72,8 +72,9 @@ class DelegateManager @Inject constructor(
             }.onFailure { Log.w(TAG, "GPU delegate unavailable: ${it.message}") }
         }
 
-        // XNNPACK is always enabled via setUseXNNPACK(true) on the options.
-        if (config.enableXnnpack && nnApiDelegate == null && gpuDelegate == null) {
+        // XNNPACK is always enabled via setUseXNNPACK(true) on the options when
+        // requested, regardless of whether NNAPI/GPU delegates are active (H-45).
+        if (config.enableXnnpack) {
             runCatching { options.setUseXNNPACK(true) }
                 .onFailure { Log.w(TAG, "XNNPACK unavailable: ${it.message}") }
         }

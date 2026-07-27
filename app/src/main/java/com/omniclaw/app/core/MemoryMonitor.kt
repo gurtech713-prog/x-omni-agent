@@ -47,8 +47,8 @@ class MemoryMonitor @Inject constructor(
             freeMemory = free,
             usedMemory = used,
             memoryClass = activityManager.memoryClass,
-            isLowMemory = free < LOW_MEMORY_THRESHOLD || memInfo.lowMemory,
-            isCriticalMemory = free < CRITICAL_MEMORY_THRESHOLD,
+            isLowMemory = memInfo.availMem < LOW_MEMORY_THRESHOLD || memInfo.lowMemory,
+            isCriticalMemory = memInfo.availMem < CRITICAL_MEMORY_THRESHOLD,
         )
     }
     

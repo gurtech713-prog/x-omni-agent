@@ -77,22 +77,32 @@ class SuccessMonitor @Inject constructor(
      * reason code. Reason codes: dispatch_failed, app_error_or_anr,
      * no_screen_drift, misclick_or_dead_service, ok.
      */
-    fun verifyLastDetailed(sessionId: String, call: ToolCall, preSnapshot: String? = null): VerifyResult = synchronized(lock) {
-        val state = sessionStates.getOrPut(sessionId) { SessionState() }
+    fun verifyLastDetailed(sessionId: String, call: ToolCall, preSnapshot: String? = null): VerifyResult {
         val preFp = preSnapshot?.let { episodeRecorder.fingerprint(it) }.orEmpty()
+
         if (!call.ok) {
-            state.consecutiveFailures++
-            return@synchronized VerifyResult(false, "dispatch_failed", preFp)
+            return synchronized(lock) {
+                val state = sessionStates.getOrPut(sessionId) { SessionState() }
+                state.consecutiveFailures++
+                VerifyResult(false, "dispatch_failed", preFp)
+            }
         }
 
+        // Capture the snapshot OUTSIDE the lock (H-02): snapshotBlocking()
+        // traverses the full accessibility tree and can be slow. Holding the
+        // session lock across it serialized every session on a single tree walk;
+        // only the sessionStates mutation further down actually needs the lock.
         val snap = preSnapshot ?: scheduler.snapshotBlocking()
 
         if (snap.contains("Error launching", ignoreCase = true) ||
             snap.contains("not responding", ignoreCase = true) ||
             snap.contains("has stopped", ignoreCase = true)
         ) {
-            state.consecutiveFailures++
-            return@synchronized VerifyResult(false, "app_error_or_anr", episodeRecorder.fingerprint(snap))
+            return synchronized(lock) {
+                val state = sessionStates.getOrPut(sessionId) { SessionState() }
+                state.consecutiveFailures++
+                VerifyResult(false, "app_error_or_anr", episodeRecorder.fingerprint(snap))
+            }
         }
 
         // Drift detection — use the shared fingerprint (SHA-256 of normalized
@@ -101,29 +111,33 @@ class SuccessMonitor @Inject constructor(
         // masking real loops. The shared fingerprint agrees with the
         // LearningEngine's notion of "same screen."
         val fp = episodeRecorder.fingerprint(snap)
-        val identicalCount = state.recentSnapshots.count { it == fp }
-        state.recentSnapshots.addLast(fp)
-        if (state.recentSnapshots.size > 6) state.recentSnapshots.removeFirst()
-        if (identicalCount >= 2) {
-            state.consecutiveFailures++
-            return@synchronized VerifyResult(false, "no_screen_drift", fp)
-        }
 
-        // Mis-click guard. Also catch the "service not connected" sentinel
-        // returned by DeviceScheduler.snapshot() — previously this only
-        // checked snap.isBlank(), but snapshot() returns the literal string
-        // "(accessibility service not connected)" (not blank) when the a11y
-        // service is down, so the guard never fired and taps onto a dead
-        // service were recorded as "success".
-        if (call.name.startsWith("tap", ignoreCase = true) &&
-            (snap.isBlank() || snap.contains("not connected", ignoreCase = true))
-        ) {
-            state.consecutiveFailures++
-            return@synchronized VerifyResult(false, "misclick_or_dead_service", fp)
-        }
+        return synchronized(lock) {
+            val state = sessionStates.getOrPut(sessionId) { SessionState() }
+            val identicalCount = state.recentSnapshots.count { it == fp }
+            state.recentSnapshots.addLast(fp)
+            if (state.recentSnapshots.size > 6) state.recentSnapshots.removeFirst()
+            if (identicalCount >= 2) {
+                state.consecutiveFailures++
+                return@synchronized VerifyResult(false, "no_screen_drift", fp)
+            }
 
-        state.consecutiveFailures = 0
-        return@synchronized VerifyResult(true, "ok", fp)
+            // Mis-click guard. Also catch the "service not connected" sentinel
+            // returned by DeviceScheduler.snapshot() — previously this only
+            // checked snap.isBlank(), but snapshot() returns the literal string
+            // "(accessibility service not connected)" (not blank) when the a11y
+            // service is down, so the guard never fired and taps onto a dead
+            // service were recorded as "success". Applies to ALL action types
+            // (H-07): a dead accessibility service makes every action
+            // unverifiable, not just taps.
+            if (snap.isBlank() || snap.contains("not connected", ignoreCase = true)) {
+                state.consecutiveFailures++
+                return@synchronized VerifyResult(false, "misclick_or_dead_service", fp)
+            }
+
+            state.consecutiveFailures = 0
+            return@synchronized VerifyResult(true, "ok", fp)
+        }
     }
 
     fun isStuck(sessionId: String, threshold: Int = 5): Boolean = synchronized(lock) {

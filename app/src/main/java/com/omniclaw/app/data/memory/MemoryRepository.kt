@@ -7,6 +7,7 @@ import com.omniclaw.app.data.model.MemoryEntry.MemoryKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,7 +30,16 @@ class MemoryRepositoryImpl @Inject constructor(
     private val dao: MemoryDao,
 ) : MemoryRepository {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // M-32: hold the SupervisorJob separately so close() can cancel the
+    // collector scope. Previously the anonymous scope was never cancelled,
+    // leaking the repository's coroutines for the process lifetime.
+    private val supervisorJob = SupervisorJob()
+    private val scope = CoroutineScope(supervisorJob + Dispatchers.Default)
+
+    /** Cancel the collector scope (mirror of SessionRepositoryImpl.close). */
+    fun close() {
+        scope.cancel()
+    }
 
     override val entries: StateFlow<List<MemoryEntry>> = run {
         val initial = MutableStateFlow<List<MemoryEntry>>(emptyList())

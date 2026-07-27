@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -11,6 +12,15 @@ import kotlinx.coroutines.flow.Flow
 interface SessionDao {
     @Query("SELECT * FROM sessions ORDER BY lastActiveAt DESC")
     fun observeAll(): Flow<List<SessionEntity>>
+
+    /**
+     * H-26: one @Transaction join of sessions + their chat_messages via the
+     * [SessionWithMessages] @Relation POJO. Replaces the N+1 per-session
+     * getBySession() that re-ran for every session on every table change.
+     */
+    @Transaction
+    @Query("SELECT * FROM sessions ORDER BY lastActiveAt DESC")
+    fun observeSessionsWithMessages(): Flow<List<SessionWithMessages>>
 
     /**
      * Paginated session list for efficient UI rendering.

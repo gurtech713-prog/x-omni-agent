@@ -1,9 +1,11 @@
 package com.omniclaw.app.data.local
 
+import androidx.room.Embedded
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import androidx.room.Relation
 import androidx.room.TypeConverter
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
@@ -62,6 +64,28 @@ data class ChatMessageEntity(
     val content: String,
     val timestamp: Long,
     val toolCallId: String? = null,
+    // C-16: persist the full tool-call history + reasoning thoughts so they
+    // survive a DB round-trip. Previously only toolCallId + content were
+    // stored, silently dropping tool args/results/ok/duration and thoughts on
+    // every restart, which broke the agent self-learning loop.
+    val toolCallsJson: String? = null,
+    val thoughtsJson: String? = null,
+)
+
+
+/**
+ * Room @Relation POJO: one [SessionEntity] joined with all of its
+ * [ChatMessageEntity] rows in a single SQL query. Lets the repository observe
+ * sessions-with-messages via one @Transaction join instead of an N+1
+ * per-session getBySession() call (H-26).
+ */
+data class SessionWithMessages(
+    @Embedded val session: SessionEntity,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "sessionId",
+    )
+    val messages: List<ChatMessageEntity>,
 )
 
 @Entity(tableName = "memory")
@@ -104,10 +128,14 @@ data class LessonEntity(
 )
 
 class Converters {
+    private val lenientJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
     @TypeConverter
     fun fromStringList(value: String): List<String> =
         if (value.isBlank()) emptyList()
-        else Json.decodeFromString(ListSerializer(String.serializer()), value)
+        else runCatching {
+            lenientJson.decodeFromString(ListSerializer(String.serializer()), value)
+        }.getOrDefault(emptyList())
 
     @TypeConverter
     fun toStringList(list: List<String>): String =

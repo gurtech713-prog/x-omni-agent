@@ -30,7 +30,7 @@ class ServiceGateway @Inject constructor(
 
     /** Show halo status update. */
     fun showHaloStatus(text: String) {
-        runCatching { HaloOverlayService.start(ctx) }
+        runCatching { HaloOverlayService.start(ctx, text) }
     }
 
     /** Hide the halo overlay. */
@@ -38,9 +38,9 @@ class ServiceGateway @Inject constructor(
         runCatching { HaloOverlayService.stop(ctx) }
     }
 
-    /** Capture current screen as PNG bytes. */
+    /** Capture current screen as WebP bytes (M-21: payload is WebP, not PNG). */
     suspend fun captureScreen(): ByteArray? {
-        return ScreenCaptureService.latestFramePng()
+        return ScreenCaptureService.latestFrameBytes()
     }
 
     /** Check if screen capture is currently running. */
@@ -50,6 +50,8 @@ class ServiceGateway @Inject constructor(
 
     /** Request screen capture permission. */
     fun requestScreenCapture() {
-        // MediaProjection permission launcher is managed by MainActivity
+        // Delegate to the MediaProjection permission launcher holder (audit M-45);
+        // the previous empty body silently did nothing.
+        runCatching { com.omniclaw.app.ScreenCaptureRequestHolder.request() }
     }
 }

@@ -18,15 +18,12 @@ import java.io.ByteArrayOutputStream
  *     images waste bandwidth + tokens; smaller images lose detail.
  *  3. **Re-encode** as WebP (quality 80) for the smallest payload that
  *     preserves visual fidelity for the VLM.
- *  4. **Reuse bitmaps** via [BitmapPool] to avoid GC churn on the
- *     continuous-capture path.
  *
- * The preprocessor is stateless between calls (the pool is shared). Thread
- * safety: all methods are safe to call from any thread; each call borrows
- * and returns its own bitmap from the pool.
+ * The preprocessor is stateless between calls. Thread safety: all methods
+ * are safe to call from any thread. (M-17: the previously-injected BitmapPool
+ * was never used and has been removed.)
  */
 class ImagePreprocessor(
-    private val pool: BitmapPool,
     private val maxDimension: Int = 768,
     private val quality: Int = 80,
 ) {
@@ -40,8 +37,17 @@ class ImagePreprocessor(
      */
     fun preprocess(bytes: ByteArray): ByteArray {
         if (bytes.isEmpty()) return bytes
-        // Quick path: if the image is already small enough, return as-is.
-        if (bytes.size < MAX_NO_RESIZE_BYTES) return bytes
+        // Quick path: decode bounds only to check pixel dimensions.
+        // Skip resize only if both dimensions are <= maxDimension.
+        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        runCatching {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+        }
+        if (boundsOptions.outWidth > 0 && boundsOptions.outHeight > 0 &&
+            boundsOptions.outWidth <= maxDimension && boundsOptions.outHeight <= maxDimension
+        ) {
+            return bytes
+        }
 
         val decoded = runCatching {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
@@ -89,7 +95,5 @@ class ImagePreprocessor(
 
     companion object {
         private const val TAG = "ImagePreprocessor"
-        /** Images smaller than 200KB are sent as-is — no benefit from re-encoding. */
-        private const val MAX_NO_RESIZE_BYTES = 200 * 1024
     }
 }
