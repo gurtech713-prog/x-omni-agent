@@ -75,8 +75,8 @@ class DeviceScheduler @Inject constructor(
     fun dispatchBlocking(action: DeviceAction): Boolean {
         val svc = boundService ?: return false
         return when (action) {
-            is DeviceAction.Tap -> svc.tap(action.x, action.y)
-            is DeviceAction.Swipe -> svc.swipe(action.x1, action.y1, action.x2, action.y2)
+            is DeviceAction.Tap -> kotlinx.coroutines.runBlocking { svc.tap(action.x, action.y) }
+            is DeviceAction.Swipe -> kotlinx.coroutines.runBlocking { svc.swipe(action.x1, action.y1, action.x2, action.y2) }
             is DeviceAction.Type -> svc.type(action.text)
             is DeviceAction.Launch -> svc.launch(action.packageName)
             DeviceAction.Back -> svc.back()
@@ -84,18 +84,5 @@ class DeviceScheduler @Inject constructor(
             DeviceAction.Screenshot -> true
             DeviceAction.NoOp -> true
         }
-    }
-
-    /**
-     * O(1) stabilization fingerprint — reads root.packageName:childCount
-     * from the accessibility root WITHOUT building the full tree.
-     * Called by AgentLoop.cheapStabilizationFingerprint() in the post-action
-     * stabilization polling loop, replacing the previous snapshotBlocking().take(80)
-     * which serialized the entire accessibility tree each time.
-     */
-    fun stabilizationFingerprint(): String {
-        return (boundService as? com.omniclaw.app.service.OmniAccessibilityService)
-            ?.cheapStabilizationFingerprint()
-            ?: ""
     }
 }

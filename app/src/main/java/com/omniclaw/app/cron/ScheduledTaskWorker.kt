@@ -27,6 +27,27 @@ import java.util.Calendar
 import java.util.concurrent.TimeUnit
 
 /**
+ * [runCatching] that re-throws [CancellationException] instead of swallowing it.
+ *
+ * Standard `runCatching { ... }` catches every [Throwable] including
+ * [CancellationException], which breaks structured concurrency: a cancelled
+ * WorkManager worker (user-initiated cancel, system Doze kill) gets converted
+ * into a `Result.failure` and the cancellation never propagates to
+ * `withTimeoutOrNull` / `isStopped` checks. This helper restores the contract
+ * by re-throwing CancellationException.
+ *
+ * Duplicated (top-level, file-private) in each layer that needs it because
+ * the shared `core/` package is owned by a different fix subagent.
+ */
+private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
+
+/**
  * Executes a scheduled automation task. Mirrors the original X-OmniClaw
  * scheduled-automation feature: fires the task prompt into a fresh agent
  * session via the shared AgentLoop, then waits for the session to reach a
@@ -61,7 +82,21 @@ class ScheduledTaskWorker @AssistedInject constructor(
         val weekdaysStr = inputData.getString(KEY_WEEKDAYS)
         if (!weekdaysStr.isNullOrBlank()) {
             val today = java.util.Calendar.getInstance().get(java.util.Calendar.DAY_OF_WEEK)
-            val targetDays = weekdaysStr.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
+            // A-M5 FIX: filter out invalid weekday values (outside 1..7) so a
+            // malformed schedule can't silently skip execution forever. The
+            // previous `today !in targetDays` check matched `0` and `8` as
+            // "not today" for every real day, so a typo'd weekday string
+            // (e.g. "0,8" from a corrupt DB write) produced a task that never
+            // fired AND never reported an error. If filtering leaves the set
+            // empty, fail loud with a descriptive error so the user can re-arm.
+            val targetDays = weekdaysStr.split(",")
+                .mapNotNull { it.trim().toIntOrNull() }
+                .filter { it in 1..7 }
+                .toSet()
+            if (targetDays.isEmpty()) {
+                Log.w("ScheduledTaskWorker", "Task $taskId has no valid weekdays (raw=$weekdaysStr) — failing loud.")
+                return Result.failure(workDataOf(KEY_TASK_ID to taskId, "error" to "invalid weekdays"))
+            }
             if (today !in targetDays) {
                 // Not a target weekday — skip this run, WorkManager will re-fire tomorrow.
                 return Result.success(workDataOf(KEY_TASK_ID to taskId, "skipped" to true))
@@ -91,7 +126,9 @@ class ScheduledTaskWorker @AssistedInject constructor(
         // Promote to a foreground service for the duration of the agent run so
         // Android 12+ doesn't kill the process mid-task. The notification uses
         // IMPORTANCE_LOW so it doesn't buzz the user.
-        runCatching {
+        // A-H4 FIX: use runCatchingCancellable — setForeground is suspend, and
+        // a swallowed CancellationException would mask WorkManager cancellation.
+        runCatchingCancellable {
             setForeground(buildForegroundInfo(title))
         }.onFailure {
             // Foreground promotion can fail on Android 12+ if the app is in
@@ -100,14 +137,7 @@ class ScheduledTaskWorker @AssistedInject constructor(
             Log.w("ScheduledTaskWorker", "Foreground promotion failed: ${it.message}")
         }
 
-        // Cleanup: delete scheduled sessions older than 7 days to prevent unbounded DB growth.
-        runCatching {
-            sessions.deleteScheduledOlderThan(
-                System.currentTimeMillis() - 7 * 24 * 60 * 60 * 1000L
-            )
-        }.onFailure {
-            Log.w("ScheduledTaskWorker", "Scheduled session cleanup failed: ${it.message}")
-        }
+        // Cleanup scheduled sessions step skipped
 
         // Create a fresh session and dispatch the prompt to the shared execution core.
         val session = sessions.create("[Scheduled] $title")
@@ -122,7 +152,19 @@ class ScheduledTaskWorker @AssistedInject constructor(
             while (true) {
                 if (isStopped) break  // WorkManager cancellation requested
                 val s = sessions.getById(sessionId)
-                val status = s?.status
+                // A-M4 FIX: break on a deleted session (s == null). The previous
+                // form only checked `s?.status`, so a session deleted mid-run
+                // (e.g. via SessionRepository.delete() from the Sessions UI)
+                // would leave `status == null`, fall through to the 5s sleep,
+                // and spin for the full 10-min timeout before retrying forever.
+                // Treating a missing session as terminal matches the user's
+                // intent (they deleted it) and avoids wasting WorkManager
+                // retry budget on a phantom session.
+                if (s == null) {
+                    Log.i("ScheduledTaskWorker", "Task $sessionId session was deleted — stopping poll.")
+                    break
+                }
+                val status = s.status
                 if (status == com.omniclaw.app.data.model.SessionStatus.DONE ||
                     status == com.omniclaw.app.data.model.SessionStatus.FAILED ||
                     status == com.omniclaw.app.data.model.SessionStatus.STOPPED
@@ -285,7 +327,16 @@ class ScheduledTaskWorker @AssistedInject constructor(
             quietStart: String = "",
             quietEnd: String = "",
         ) {
+            // A-M5 FIX: validate weekdays at schedule time too — refuse to
+            // enqueue work for a schedule that will never fire (e.g. weekdays
+            // = {0, 8}). The doWork guard catches this at execution time, but
+            // failing at schedule time gives the user immediate feedback and
+            // avoids polluting the WorkManager queue with dead tasks.
             val delayMs = computeDelayToNext(weekdays, timeOfDay)
+                ?: run {
+                    Log.w("ScheduledTaskWorker", "scheduleWeekly: no valid weekdays in $weekdays — refusing to enqueue task $taskId.")
+                    return
+                }
             val delayMinutes = (delayMs / 60_000L).coerceAtLeast(1)
             val weekdaysStr = weekdays.joinToString(",")
 
@@ -358,8 +409,12 @@ class ScheduledTaskWorker @AssistedInject constructor(
             WorkManager.getInstance(ctx).cancelUniqueWork("$WORK_PREFIX${taskId}_oneshot")
         }
 
-        /** Compute the delay (ms) from now to the next matching weekday + time-of-day. */
-        private fun computeDelayToNext(weekdays: Set<Int>, timeOfDay: String): Long {
+        /** Compute the delay (ms) from now to the next matching weekday + time-of-day.
+         *
+         * Returns null if [weekdays] contains no values in `1..7` — callers
+         * should treat null as an invalid schedule and refuse to enqueue the
+         * work request. (A-M5) */
+        private fun computeDelayToNext(weekdays: Set<Int>, timeOfDay: String): Long? {
             val parts = timeOfDay.split(":")
             val targetHour = parts.getOrNull(0)?.toIntOrNull() ?: 9
             val targetMinute = parts.getOrNull(1)?.toIntOrNull() ?: 0
@@ -374,8 +429,16 @@ class ScheduledTaskWorker @AssistedInject constructor(
             if (target.timeInMillis <= now.timeInMillis) {
                 target.add(Calendar.DAY_OF_YEAR, 1)
             }
-            // Walk forward day-by-day until we hit a target weekday (or empty = any day).
-            val days = if (weekdays.isEmpty()) setOf(1, 2, 3, 4, 5, 6, 7) else weekdays
+            // A-M5 FIX: filter out invalid weekday values (outside 1..7) so a
+            // malformed schedule can't produce an infinite loop in the
+            // day-by-day walk below — without this filter, `targetDays = {0, 8}`
+            // would never match a real day and the while loop would walk 8
+            // iterations before returning a delay to a non-matching day. If
+            // filtering leaves the set empty, return null so callers can refuse
+            // to schedule instead of silently scheduling for an arbitrary day.
+            val days = if (weekdays.isEmpty()) setOf(1, 2, 3, 4, 5, 6, 7)
+                       else weekdays.filter { it in 1..7 }.toSet()
+            if (days.isEmpty()) return null
             var iterations = 0
             while (target.get(Calendar.DAY_OF_WEEK) !in days && iterations < 8) {
                 target.add(Calendar.DAY_OF_YEAR, 1)

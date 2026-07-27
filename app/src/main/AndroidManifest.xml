@@ -10,6 +10,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- V-M6: required for OverlayService's microphone capture (push-to-talk
+         bubble) on Android 14+. Without this permission the FGS is rejected
+         at startForeground() with SecurityException when the service type
+         includes `microphone`. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- REMOVED: RECEIVE_BOOT_COMPLETED — there is no BOOT_COMPLETED receiver
@@ -62,7 +67,7 @@
         android:theme="@style/Theme.XOmniClaw"
         android:enableOnBackInvokedCallback="true"
         android:networkSecurityConfig="@xml/network_security_config"
-        tools:targetApi="34">
+        tools:targetApi="36">
 
         <!-- Disable WorkManager's default initializer — we use Configuration.Provider
              via HiltWorkerFactory in OmniApplication. -->
@@ -96,7 +101,12 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="omniclaw" />
             </intent-filter>
-            <intent-filter>
+            <!-- V-M7: autoVerify so Android 12+ App Links verification succeeds
+                 for the https://omniclaw.app host. Without autoVerify, the
+                 system treats this as a regular deep link and shows the
+                 app-chooser dialog instead of opening X-OmniClaw directly.
+                 The omniclaw:// scheme is custom and doesn't need autoVerify. -->
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
@@ -129,10 +139,14 @@
         </service>
 
         <!-- Overlay service: floating push-to-talk bubble -->
+        <!-- V-M6: foregroundServiceType includes `microphone` because the
+             overlay captures audio (AudioRecorder) while in the foreground.
+             On Android 14+ a FGS that uses the mic MUST declare the
+             microphone type or startForeground() throws SecurityException. -->
         <service
             android:name=".service.OverlayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|microphone">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Floating push-to-talk overlay bubble for voice-driven agent control." />

@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import javax.inject.Inject
 
@@ -92,30 +93,6 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
             val sb = StringBuilder()
             appendNode(sb, root, 0)
             return sb.toString()
-        } finally {
-            runCatching { root.recycle() }
-        }
-    }
-
-    /**
-     * O(1) stabilization fingerprint for the post-action polling loop.
-     *
-     * Returns "packageName:childCount" from the accessibility root WITHOUT
-     * building the full tree string. Previous approach called
-     * snapshotTree().take(80) which serialized the entire tree (10-50KB)
-     * then discarded all but the first 80 characters — repeated 12+ times
-     * per step in the stabilization loop.
-     *
-     * This method reads root.packageName and root.childCount only — O(1)
-     * with zero string serialization. Returns empty string if no root is
-     * available (service disconnected or initializing).
-     */
-    fun cheapStabilizationFingerprint(): String {
-        val root = rootInActiveWindow ?: return ""
-        try {
-            val pkg = root.packageName?.toString() ?: ""
-            val count = root.childCount
-            return "$pkg:$count"
         } finally {
             runCatching { root.recycle() }
         }
@@ -212,10 +189,11 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
                 val isEditText = className.contains("EditText", ignoreCase = true) ||
                     className.contains("TextInput", ignoreCase = true)
 
-                val isPasswordField = isEditText && (
-                    hasSensitiveId ||
-                    runCatching { node.isPassword }.getOrDefault(false)
-                )
+                // S-H6: check isPassword independently of isEditText — a
+                // non-EditText node (e.g. a TextView showing a masked OTP)
+                // can still report isPassword=true, and we must redact it.
+                val isPassword = runCatching { node.isPassword }.getOrDefault(false)
+                val isPasswordField = isPassword || (isEditText && hasSensitiveId)
 
                 isPasswordField
             }.getOrNull() ?: false
@@ -233,26 +211,34 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
     /**
      * Suspend tap — uses suspendCancellableCoroutine to avoid blocking the
      * calling thread. The GestureResultCallback resumes the continuation.
+     *
+     * S-M7: wrapped in a 800ms timeout so a stuck callback (e.g. service
+     * lost the gesture mid-flight) doesn't hang the agent loop. Returns
+     * false on timeout, matching the onCancelled semantics.
      */
     suspend fun tap(x: Int, y: Int): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val stroke = GestureDescription.StrokeDescription(path, 0, 60)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return suspendCancellableCoroutine { cont ->
-            dispatchGesture(gesture, object : GestureResultCallback() {
-                override fun onCompleted(gesture: GestureDescription?) {
-                    if (cont.isActive) cont.resume(true)
-                }
-                override fun onCancelled(gesture: GestureDescription?) {
-                    if (cont.isActive) cont.resume(false)
-                }
-            }, handler)
-        }
+        return withTimeoutOrNull(800L) {
+            suspendCancellableCoroutine { cont ->
+                dispatchGesture(gesture, object : GestureResultCallback() {
+                    override fun onCompleted(gesture: GestureDescription?) {
+                        if (cont.isActive) cont.resume(true)
+                    }
+                    override fun onCancelled(gesture: GestureDescription?) {
+                        if (cont.isActive) cont.resume(false)
+                    }
+                }, handler)
+            }
+        } ?: false
     }
 
     /**
      * Suspend swipe — uses suspendCancellableCoroutine to avoid blocking the
      * calling thread. The GestureResultCallback resumes the continuation.
+     *
+     * S-M7: wrapped in a 800ms timeout — see [tap] for rationale.
      */
     suspend fun swipe(x1: Int, y1: Int, x2: Int, y2: Int): Boolean {
         val path = Path().apply {
@@ -261,16 +247,18 @@ class OmniAccessibilityService : AccessibilityService(), AccessibilityExecutor.O
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, 250)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return suspendCancellableCoroutine { cont ->
-            dispatchGesture(gesture, object : GestureResultCallback() {
-                override fun onCompleted(gesture: GestureDescription?) {
-                    if (cont.isActive) cont.resume(true)
-                }
-                override fun onCancelled(gesture: GestureDescription?) {
-                    if (cont.isActive) cont.resume(false)
-                }
-            }, handler)
-        }
+        return withTimeoutOrNull(800L) {
+            suspendCancellableCoroutine { cont ->
+                dispatchGesture(gesture, object : GestureResultCallback() {
+                    override fun onCompleted(gesture: GestureDescription?) {
+                        if (cont.isActive) cont.resume(true)
+                    }
+                    override fun onCancelled(gesture: GestureDescription?) {
+                        if (cont.isActive) cont.resume(false)
+                    }
+                }, handler)
+            }
+        } ?: false
     }
 
     fun type(text: String): Boolean {

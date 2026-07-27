@@ -22,9 +22,20 @@ import java.util.concurrent.TimeUnit
 class VisionCache(
     maxSizeBytes: Int = 4 * 1024 * 1024,
 ) {
+    // V-L9: CacheEntry carries its precomputed byte size so sizeOf() doesn't
+    // re-call toByteArray() on every LruCache insertion/eviction (which can
+    // happen many times per second during a busy vision loop).
+    data class CacheEntry(
+        val text: String,
+        val sizeBytes: Int,
+        val createdAt: Long,
+        val imageHash: String,
+        val questionHash: String,
+    )
+
     private val cache = object : LruCache<String, CacheEntry>(maxSizeBytes) {
         override fun sizeOf(key: String, value: CacheEntry): Int =
-            value.text.toByteArray().size + 64 // overhead estimate
+            value.sizeBytes + 64 // overhead estimate
     }
 
     /** Scheduled executor for periodic expired-entry sweeps. */
@@ -37,13 +48,6 @@ class VisionCache(
         // from accumulating when they are never looked up again.
         sweepExecutor.scheduleAtFixedRate({ sweepExpired() }, 60, 60, TimeUnit.SECONDS)
     }
-
-    data class CacheEntry(
-        val text: String,
-        val createdAt: Long,
-        val imageHash: String,
-        val questionHash: String,
-    )
 
     /** Look up a cached response. Returns null if not present or expired. */
     fun get(imageBytes: ByteArray, question: String): String? {
@@ -61,11 +65,21 @@ class VisionCache(
         val key = buildKey(imageBytes, question)
         val entry = CacheEntry(
             text = response,
+            sizeBytes = response.toByteArray().size,
             createdAt = System.currentTimeMillis(),
             imageHash = hashSampled(imageBytes),
             questionHash = hash(question.toByteArray()),
         )
         cache.put(key, entry)
+    }
+
+    /**
+     * V-M1: shut down the periodic sweep executor. Call from the owning
+     * pipeline's teardown (e.g. VisionPipeline.shutdown()) so the daemon
+     * thread doesn't outlive its cache. Safe to call multiple times.
+     */
+    fun close() {
+        sweepExecutor.shutdownNow()
     }
 
     /** Clear the cache (e.g. on memory pressure). */
@@ -104,8 +118,13 @@ class VisionCache(
     }
 
     private fun hash(data: ByteArray): String {
+        // V-M2: emit the full 64-char hex digest instead of truncating to 16
+        // chars (64 bits). A 64-bit cache key collides meaningfully once the
+        // index grows past ~4B entries (birthday paradox); with full SHA-256
+        // the collision probability is negligible. The hash is also used as
+        // the LruCache KEY, so a collision returns the wrong cached response.
         val digest = MessageDigest.getInstance("SHA-256").digest(data)
-        return digest.joinToString("") { "%02x".format(it) }.take(16)
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     companion object {

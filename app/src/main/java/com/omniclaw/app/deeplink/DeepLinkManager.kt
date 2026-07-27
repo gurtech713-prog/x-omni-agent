@@ -107,7 +107,16 @@ class DeepLinkManager @Inject constructor(
 
     /** Launch a raw URI (http/https or app deep link). */
     fun launchUri(uri: String): Boolean = runCatching {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).apply {
+        val parsed = Uri.parse(uri)
+        val scheme = parsed.scheme?.lowercase()
+        // S-M4: reject dangerous schemes — `intent:` can carry Intent extras
+        // that re-launch arbitrary components, `javascript:` runs script in
+        // the context of whatever app handles the URL. Allow only safe
+        // schemes (http/https and other app deep links).
+        require(scheme != "intent" && scheme != "javascript") {
+            "Scheme $scheme not allowed"
+        }
+        val intent = Intent(Intent.ACTION_VIEW, parsed).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         ctx.startActivity(intent)

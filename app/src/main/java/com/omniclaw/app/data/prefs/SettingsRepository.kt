@@ -11,6 +11,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
@@ -296,7 +297,14 @@ class SettingsRepositoryImpl @Inject constructor(
             vlmApiKey = secure.getSecret(SecureStorage.KEY_VLM_API_KEY),
             vlmModel = p[Keys.vlmModel] ?: "qwen/qwen3.6-flash",
         )
-    }.flowOn(Dispatchers.IO)
+    }
+        // D-M10: dedupe before flowOn so a re-emission from DataStore that
+        // produces a structurally-equal ModelConfig (e.g. an unrelated key
+        // changed in the same prefs file) doesn't trigger a fresh round of
+        // SecureStorage reads + downstream reconfiguration. ModelConfig is a
+        // data class so distinctUntilChanged uses structural equality.
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.IO)
 
     override val channelConfig: Flow<ChannelConfig> = ctx.dataStore.data.map { p ->
         ChannelConfig(

@@ -55,7 +55,14 @@ class DelegateManager @Inject constructor(
         var gpuDelegate: org.tensorflow.lite.gpu.GpuDelegate? = null
         var nnApiDelegate: org.tensorflow.lite.nnapi.NnApiDelegate? = null
 
-        if (config.enableNnapi) {
+        // V-L4: previously GPU was only tried when NNAPI failed to load
+        // (`enableGpu && nnApiDelegate == null`), so a device that successfully
+        // loaded NNAPI but where the user explicitly opted into GPU never got
+        // GPU acceleration. Now: if the user EXPLICITLY opted into GPU, skip
+        // NNAPI entirely and try GPU first. Mixing delegates is undefined, so
+        // we still never run both at once — but GPU is no longer silently
+        // suppressed by an NNAPI success the user didn't ask for.
+        if (config.enableNnapi && !config.enableGpu) {
             runCatching {
                 nnApiDelegate = org.tensorflow.lite.nnapi.NnApiDelegate()
                 options.addDelegate(nnApiDelegate)
@@ -63,8 +70,8 @@ class DelegateManager @Inject constructor(
             }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
         }
 
-        if (config.enableGpu && nnApiDelegate == null) {
-            // Only try GPU if NNAPI didn't load — mixing delegates is undefined.
+        if (config.enableGpu) {
+            // Always try GPU if explicitly enabled, regardless of NNAPI state.
             runCatching {
                 gpuDelegate = org.tensorflow.lite.gpu.GpuDelegate()
                 options.addDelegate(gpuDelegate)

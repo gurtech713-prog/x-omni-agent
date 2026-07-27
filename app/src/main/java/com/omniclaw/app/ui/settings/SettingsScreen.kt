@@ -93,6 +93,7 @@ import com.omniclaw.app.ui.components.OmniRow
 import com.omniclaw.app.ui.components.OmniTopBar
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.launch
+import java.io.File
 
 private enum class SettingsTab(val label: String) {
     AI_CORE("AI Core"),
@@ -153,7 +154,10 @@ fun SettingsScreen() {
     LaunchedEffect(Unit) {
         while (true) {
             haloEnabled = com.omniclaw.app.service.HaloOverlayService.isRunning()
-            kotlinx.coroutines.delay(1000)
+            // U-M11: poll every 5s instead of 1s — the Halo service state
+            // rarely changes (only on user toggle or system kill), and a 1s
+            // wake-up wastes battery on devices without a wakeup-source.
+            kotlinx.coroutines.delay(5000)
         }
     }
 
@@ -198,6 +202,16 @@ fun SettingsScreen() {
     val mediaLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { g -> scope.launch { vm.setPermissions(currentPerms.copy(media = g)) } }
+    // U-H9: multi-permission launcher for READ_MEDIA_IMAGES + READ_MEDIA_VIDEO
+    // on Android 13+. We mirror the granted state into the single `media`
+    // boolean — if BOTH are granted we report true, otherwise false (so the
+    // row continues to show “DENIED” until the user grants both).
+    val mediaMultiLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val allGranted = result.values.all { it }
+        scope.launch { vm.setPermissions(currentPerms.copy(media = allGranted)) }
+    }
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { g -> scope.launch { vm.setPermissions(currentPerms.copy(notifications = g)) } }
@@ -344,12 +358,31 @@ fun SettingsScreen() {
                             granted = perms.media,
                             onOpen = {
                                 Log.i(TAG, "Requesting Photos & videos permission")
-                                val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                                    Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-                                if (ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED) {
-                                    openAppSettings(ctx)
+                                // U-H9: request BOTH READ_MEDIA_IMAGES and
+                                // READ_MEDIA_VIDEO on Android 13+. Previously
+                                // only READ_MEDIA_IMAGES was requested, so
+                                // gallery scans that include videos were
+                                // silently permission-blocked.
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    val permsToCheck = arrayOf(
+                                        Manifest.permission.READ_MEDIA_IMAGES,
+                                        Manifest.permission.READ_MEDIA_VIDEO,
+                                    )
+                                    val allGranted = permsToCheck.all {
+                                        ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
+                                    }
+                                    if (allGranted) {
+                                        openAppSettings(ctx)
+                                    } else {
+                                        mediaMultiLauncher.launch(permsToCheck)
+                                    }
                                 } else {
-                                    mediaLauncher.launch(perm)
+                                    val perm = Manifest.permission.READ_EXTERNAL_STORAGE
+                                    if (ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED) {
+                                        openAppSettings(ctx)
+                                    } else {
+                                        mediaLauncher.launch(perm)
+                                    }
                                 }
                             },
                         )
@@ -434,9 +467,13 @@ fun SettingsScreen() {
                             onImport = {
                                 scope.launch {
                                     val ok = vm.importConfig()
+                                    // U-H8: surface the actual import path in
+                                    // the success toast so the user can find
+                                    // the file via a file manager / `adb pull`.
+                                    val importPath = File(ctx.getExternalFilesDir(null), ".xomniclaw/xomniclaw.json").absolutePath
                                     Toast.makeText(
                                         ctx,
-                                        if (ok) "Imported config from /sdcard/.xomniclaw/xomniclaw.json"
+                                        if (ok) "Imported config from $importPath"
                                         else "Import failed — file not found or invalid",
                                         Toast.LENGTH_LONG,
                                     ).show()
@@ -449,6 +486,7 @@ fun SettingsScreen() {
                         PrivacyDisclosureCard(
                             accepted = privacyAccepted ?: false,
                             onAccept = { scope.launch { vm.acceptPrivacy() } },
+                            onRevoke = { scope.launch { vm.revokePrivacy() } },
                         )
                         OmniDivider()
                         ApiKeyRotationCard(vm = vm)
@@ -473,7 +511,7 @@ fun SettingsScreen() {
  * providers — this satisfies basic privacy-compliance expectations.
  */
 @Composable
-private fun PrivacyDisclosureCard(accepted: Boolean, onAccept: () -> Unit) {
+private fun PrivacyDisclosureCard(accepted: Boolean, onAccept: () -> Unit, onRevoke: () -> Unit) {
     Column(Modifier.padding(vertical = 8.dp)) {
         Text(
             text = "Cloud LLM Privacy Notice",
@@ -497,6 +535,16 @@ private fun PrivacyDisclosureCard(accepted: Boolean, onAccept: () -> Unit) {
             OmniButton(
                 text = "I Understand — Accept",
                 onClick = onAccept,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            // U-M10: allow the user to revoke their acceptance at any time.
+            // Re-enabling cloud LLM calls requires re-accepting the disclosure.
+            Spacer(Modifier.height(12.dp))
+            OmniButton(
+                text = "Revoke Acceptance",
+                onClick = onRevoke,
+                primary = false,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -540,10 +588,15 @@ private fun ApiKeyRotationCard(vm: SettingsViewModel) {
         Spacer(Modifier.height(12.dp))
 
         keys.forEach { key ->
+            // U-H10: cache EncryptedSharedPreferences reads in `remember(key)`
+            // so they DON'T re-run on every recomposition. needsRotation /
+            // getLastRotationTime both hit SecureStorage, which decrypts the
+            // prefs file each call.
+            val rotationInfo = remember(key) { vm.needsRotation(key) to vm.getLastRotationTime(key) }
             RotationRow(
                 label = keyLabels[key] ?: key,
-                needsRotation = vm.needsRotation(key),
-                lastRotationTime = vm.getLastRotationTime(key),
+                needsRotation = rotationInfo.first,
+                lastRotationTime = rotationInfo.second,
                 onRotate = {
                     scope.launch {
                         loadingKey = key
@@ -637,15 +690,15 @@ private fun ModelConfigEditor(
     onDirty: (Boolean) -> Unit = {}
 ) {
     var localBaseUrl by rememberSaveable { mutableStateOf(cfg.baseUrl) }
-    var localApiKey by rememberSaveable { mutableStateOf(cfg.apiKey) }
+    var localApiKey by remember { mutableStateOf(cfg.apiKey) }
     var localModel by rememberSaveable { mutableStateOf(cfg.model) }
     var localTemp by rememberSaveable { mutableStateOf(cfg.temperature.toString()) }
     var localMaxTokens by rememberSaveable { mutableStateOf(cfg.maxTokens.toString()) }
     var localSttBaseUrl by rememberSaveable { mutableStateOf(cfg.sttBaseUrl) }
-    var localSttApiKey by rememberSaveable { mutableStateOf(cfg.sttApiKey) }
+    var localSttApiKey by remember { mutableStateOf(cfg.sttApiKey) }
     var localSttModel by rememberSaveable { mutableStateOf(cfg.sttModel) }
     var localVlmBaseUrl by rememberSaveable { mutableStateOf(cfg.vlmBaseUrl) }
-    var localVlmApiKey by rememberSaveable { mutableStateOf(cfg.vlmApiKey) }
+    var localVlmApiKey by remember { mutableStateOf(cfg.vlmApiKey) }
     var localVlmModel by rememberSaveable { mutableStateOf(cfg.vlmModel) }
 
     // State to toggle custom model text input visibility
@@ -946,6 +999,11 @@ private fun ModelConfigEditor(
                     vlmApiKey = localVlmApiKey,
                     vlmModel = localVlmModel.trim(),
                 ))
+                // U-H5: reset the userEdited guard so a later cfg emission
+                // (DataStore re-emit, process-death restoration) can re-sync
+                // the local fields with the freshly-saved values instead of
+                // being silently dropped.
+                userEdited = false
                 onDirty(false)
             },
             primary = dirty,
@@ -971,8 +1029,16 @@ private fun ChannelConfigEditor(
 
     var discordEnabled by remember { mutableStateOf(cfg.discordWebhook.isNotEmpty()) }
 
+    // U-H4: tracks whether the user has unsaved local edits to the webhook.
+    // While true, the LaunchedEffect(cfg) sync below is skipped so an external
+    // config emission (process-death restoration, preset/backup flow) doesn't
+    // clobber the typed-but-unsaved value.
+    var userEdited by rememberSaveable { mutableStateOf(false) }
+
     // Synchronize local states when external config updates
     LaunchedEffect(cfg) {
+        // U-H4: don't overwrite the user's unsaved edits.
+        if (userEdited) return@LaunchedEffect
         localDiscordWebhook = cfg.discordWebhook
         discordEnabled = cfg.discordWebhook.isNotEmpty()
     }
@@ -984,7 +1050,11 @@ private fun ChannelConfigEditor(
     LaunchedEffect(
         localDiscordWebhook,
     ) {
-        onDirty(computeDirty())
+        // U-H4: remember that the user has unsaved edits so a later cfg
+        // emission doesn't reset the field out from under them.
+        val dirty = computeDirty()
+        userEdited = dirty
+        onDirty(dirty)
     }
 
     Column(Modifier.padding(16.dp)) {

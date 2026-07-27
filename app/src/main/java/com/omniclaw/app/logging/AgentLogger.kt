@@ -34,9 +34,16 @@ class AgentLogger @Inject constructor() {
     )
 
     fun logError(loc: ErrorLocation) {
-        val sanitized = redactSecrets(loc.message)
-        Log.w(TAG, "[${loc.sessionId}#${loc.step}] ${loc.action} @ ${loc.className}.${loc.methodName}:${loc.lineNumber} — $sanitized")
-        
+        // D-H10: redact EVERY string field, not just `message`. The action,
+        // class, and method names can also contain secrets (e.g. an action
+        // string like "call Gemini with key AIza..." would previously leak the
+        // key via Logcat). D-L3: use Log.e (not Log.w) so error-level filtering
+        // tools (crash reporters, Logcat severity filters) treat this as an
+        // error rather than a warning.
+        val a = redactSecrets(loc.action)
+        val c = redactSecrets(loc.className)
+        val m = redactSecrets(loc.message)
+        Log.e(TAG, "[${loc.sessionId}#${loc.step}] $a @ $c.${loc.methodName}:${loc.lineNumber} — $m")
     }
 
     fun logWarning(sessionId: String, step: Int, msg: String) {
@@ -49,39 +56,53 @@ class AgentLogger @Inject constructor() {
     }
 
     /**
-     * Redact common API-key patterns from log messages to prevent secret
-     * leakage via Logcat. Catches:
-     *   - sk-<20+ alphanumeric chars> (OpenAI / OpenRouter style)
-     *   - AIza<30+ alphanumeric chars> (Google / Gemini API key style)
-     *   - Bearer <token> in Authorization headers
-     *   - x-goog-api-key: <token> (Gemini REST header form)
-     *   - api_key=<value> query params
-     *   - Discord / Slack / Teams webhook URLs (the token is in the URL path)
-     *   - Feishu / Lark app_secret query params or JSON fields
-     *   - Generic long hex/base64 tokens (≥32 chars) flagged as "token"
+     * Redact common API-key / credential patterns from log messages to prevent
+     * secret leakage via Logcat (D-H9).
+     *
+     * Order matters: more specific patterns run first so their context (e.g.
+     * `Bearer `, `x-goog-api-key:`) is preserved in the redaction; the generic
+     * long-token pattern runs near the end so it only catches what the specific
+     * patterns missed. Email and phone (loose) run last.
+     *
+     * False-positive policy: the 32-hex, generic-long-token, and phone patterns
+     * are intentionally broad — they may redact non-secret strings (UUIDs,
+     * timestamps, version numbers). That's the safer failure mode for a logger.
+     * If a known-safe pattern surfaces (e.g. session IDs in a specific format),
+     * add an allowlist regex that runs BEFORE these patterns and replaces the
+     * matching substring with a placeholder that the redaction patterns won't
+     * touch (e.g. `<<UUID:$1>>`).
      */
+    private val SECRET_PATTERNS = listOf(
+        // Provider-specific API key prefixes (longest-match-first within each family).
+        Regex("sk-or-[A-Za-z0-9_\\-]+"),       // OpenRouter
+        Regex("sk-ant-[A-Za-z0-9_\\-]+"),      // Anthropic
+        Regex("sk-[A-Za-z0-9_\\-]+"),          // OpenAI (also catches the two above; listed after for clarity)
+        Regex("AIza[A-Za-z0-9_\\-]{30,}"),     // Google / Gemini
+        Regex("nvapi-[A-Za-z0-9_\\-]+"),       // NVIDIA
+        Regex("xox[bpoa]-[A-Za-z0-9-]+"),       // Slack
+        Regex("gh[pousr]_[A-Za-z0-9]{30,}"),   // GitHub
+        Regex("AKIA[A-Z0-9]{16}"),             // AWS access key ID
+        Regex("eyJ[A-Za-z0-9_\\-]+\\.eyJ[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+"), // JWT
+        Regex("[A-Fa-f0-9]{32}"),              // 32-hex (GLM/Zhipu, Minimax, MD5)
+        // Header / param forms.
+        Regex("Bearer\\s+[A-Za-z0-9_\\-\\.=]+"),
+        Regex("x-goog-api-key:\\s*[A-Za-z0-9_\\-]+"),
+        Regex("api_key[\"']?\\s*[:=]\\s*[\"']?[A-Za-z0-9_\\-]+", RegexOption.IGNORE_CASE),
+        Regex("\"apiKey\"\\s*:\\s*\"[^\"]+\"", RegexOption.IGNORE_CASE),
+        Regex("webhooks/\\d+/[A-Za-z0-9_\\-]+"),
+        Regex("app_secret[\"']?\\s*[:=]\\s*[\"']?[A-Za-z0-9_\\-]+", RegexOption.IGNORE_CASE),
+        // Generic catch-alls (intentionally last — most aggressive).
+        Regex("[A-Za-z0-9+/=]{40,}"),          // generic long base64/hex token
+        Regex("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}"), // email
+        Regex("\\+?\\d{1,3}?[-.\\s]?\\(?\\d{1,4}?\\)?[-.\\s]?\\d{1,4}[-.\\s]?\\d{1,9}"), // phone (loose — may false-positive on dates/timestamps)
+    )
+
     private fun redactSecrets(msg: String): String {
-        var s = msg
-        // Specific credential patterns first (longest match wins).
-        s = Regex("(?i)x-goog-api-key\\s*[:=]?\\s*[A-Za-z0-9_\\-]{16,}").replace(s, "x-goog-api-key: ***REDACTED***")
-        s = Regex("(?i)(api[_-]?key=)[A-Za-z0-9_\\-]{8,}").replace(s, "$1***REDACTED***")
-        s = Regex("(?i)Bearer\\s+[A-Za-z0-9_\\-\\.=]{16,}").replace(s, "Bearer ***REDACTED***")
-        // Generic fallback patterns.
-        s = Regex("(?i)sk-[A-Za-z0-9_\\-]{16,}").replace(s, "sk-***REDACTED***")
-        s = Regex("(?i)AIza[A-Za-z0-9_\\-]{30,}").replace(s, "AIza***REDACTED***")
-        // Webhook URLs: the token is in the path. Discord: /webhooks/<id>/<token>.
-        // Slack: /services/T.../B.../<token>. Teams: /incoming-webhook/<token>.
-        s = Regex("(?i)https?://[^\\s/]*(?:discord|slack|hooks\\.slack|teams|webhook)[^\\s]*", RegexOption.IGNORE_CASE)
-            .replace(s) { m ->
-                // Keep the host so logs are still useful; mask the path.
-                val url = m.value
-                val schemeEnd = url.indexOf("://") + 3
-                val pathStart = url.indexOf('/', schemeEnd)
-                if (pathStart < 0) url else url.substring(0, pathStart) + "/***REDACTED***"
-            }
-        // Feishu/Lark app_secret in JSON or query form.
-        s = Regex("(?i)(app_secret[\"'\\s:=]+)[A-Za-z0-9_\\-]{8,}").replace(s, "$1***REDACTED***")
-        return s
+        var redacted = msg
+        for (p in SECRET_PATTERNS) {
+            redacted = p.replace(redacted, "[REDACTED]")
+        }
+        return redacted
     }
 
     /**

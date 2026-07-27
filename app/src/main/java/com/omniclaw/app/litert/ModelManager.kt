@@ -76,6 +76,17 @@ class ModelManager @Inject constructor(
                 tmpFile.delete()
                 throw LiteRtModelException("Asset '$assetPath' extracted as empty file — model not found in APK")
             }
+            // V-M14: pinned-hash verification. If EXPECTED_HASHES pins this
+            // asset, the extracted bytes must match the pinned SHA-256 — this
+            // catches APK tampering, asset corruption, and MITM-injected
+            // models (if models were ever downloaded, which they're not today
+            // but the pin survives as defense-in-depth). Unpinned assets skip
+            // verification (return true) so dev/CI builds without hashes work.
+            if (!verifyChecksum(tmpFile, assetPath)) {
+                throw LiteRtModelException(
+                    "Model checksum mismatch for '$assetPath' — refusing to load tampered/corrupt model"
+                )
+            }
             // Atomic rename — prevents partial files from being used after a crash.
             if (!tmpFile.renameTo(outFile)) {
                 tmpFile.delete()
@@ -90,6 +101,42 @@ class ModelManager @Inject constructor(
         Log.i(TAG, "Extracted LiteRT model '$assetPath' -> ${outFile.absolutePath} (${outFile.length()} bytes)")
         synchronized(lock) { cache[modelPath] = outFile }
         return outFile
+    }
+
+    /**
+     * V-M14: SHA-256 of [file] vs the pinned hash in [EXPECTED_HASHES].
+     *
+     * Returns true if the asset is unpinned (no hash recorded) — verification
+     * is opt-in per asset so dev builds without filled-in hashes still work.
+     *
+     * BUILD-TIME TODO: fill in [EXPECTED_HASHES] with real SHA-256 hex digests
+     * of each bundled model before release. Compute with:
+     *   `sha256sum app/src/main/assets/models/<name>.tflite`
+     * Without pinned hashes, this check is a no-op and provides no tamper
+     * resistance — it exists primarily as scaffolding so the verification
+     * path is wired end-to-end.
+     */
+    private fun verifyChecksum(file: File, assetPath: String): Boolean {
+        val expected = EXPECTED_HASHES[assetPath] ?: return true  // no pin = skip
+        val actual = sha256(file)
+        if (!actual.equals(expected, ignoreCase = true)) {
+            Log.e(TAG, "Model checksum mismatch for $assetPath: expected=$expected actual=$actual")
+            return false
+        }
+        return true
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(8192)
+            var n = input.read(buf)
+            while (n > 0) {
+                digest.update(buf, 0, n)
+                n = input.read(buf)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**
@@ -146,6 +193,18 @@ class ModelManager @Inject constructor(
 
     companion object {
         private const val TAG = "ModelManager"
+
+        /**
+         * V-M14: pinned SHA-256 hashes (hex) for bundled model assets. Keys are
+         * the asset paths used in [resolveToFile] (after the "assets://" prefix
+         * is stripped). Entries WITHOUT a hash are not verified.
+         *
+         * BUILD-TIME TODO: fill these in before release. Example:
+         *   "models/gemma-2b-q4.tflite" to "abc123def..."
+         *
+         * Compute with: `sha256sum app/src/main/assets/models/<name>.tflite`
+         */
+        private val EXPECTED_HASHES: Map<String, String> = emptyMap()
     }
 }
 

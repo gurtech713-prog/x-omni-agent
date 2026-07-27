@@ -130,7 +130,17 @@ class SuccessMonitor @Inject constructor(
             // service were recorded as "success". Applies to ALL action types
             // (H-07): a dead accessibility service makes every action
             // unverifiable, not just taps.
-            if (snap.isBlank() || snap.contains("not connected", ignoreCase = true)) {
+            //
+            // A-M2 FIX: match the EXACT sentinel returned by
+            // DeviceScheduler.snapshot() instead of the loose `contains("not
+            // connected")` substring. The substring form matched legitimate
+            // UI text (e.g. a "Wi-Fi not connected" settings row) and
+            // mis-classified a successful tap on such a row as a dead-service
+            // failure. DeviceScheduler.snapshot() returns the exact string
+            // "(accessibility service not connected)" — see DeviceScheduler.kt
+            // snapshot() and snapshotBlocking() — so the equality check is
+            // unambiguous.
+            if (snap.isBlank() || snap == "(accessibility service not connected)") {
                 state.consecutiveFailures++
                 return@synchronized VerifyResult(false, "misclick_or_dead_service", fp)
             }

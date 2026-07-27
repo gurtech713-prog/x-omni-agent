@@ -1,5 +1,6 @@
 package com.omniclaw.app.data.memory
 
+import android.util.Log
 import com.omniclaw.app.data.local.MemoryDao
 import com.omniclaw.app.data.local.MemoryEntity
 import com.omniclaw.app.data.model.MemoryEntry
@@ -11,6 +12,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -30,6 +32,10 @@ class MemoryRepositoryImpl @Inject constructor(
     private val dao: MemoryDao,
 ) : MemoryRepository {
 
+    companion object {
+        private const val TAG = "MemoryRepository"
+    }
+
     // M-32: hold the SupervisorJob separately so close() can cancel the
     // collector scope. Previously the anonymous scope was never cancelled,
     // leaking the repository's coroutines for the process lifetime.
@@ -43,8 +49,15 @@ class MemoryRepositoryImpl @Inject constructor(
 
     override val entries: StateFlow<List<MemoryEntry>> = run {
         val initial = MutableStateFlow<List<MemoryEntry>>(emptyList())
+        // D-M11: wrap the collector in `.catch` so a transient DB error (e.g.
+        // SQLiteFullException, transient corruption that Room auto-recovers from)
+        // doesn't silently kill the collector and leave `entries` stale forever.
+        // Previously the collector would throw, the SupervisorJob would swallow
+        // the exception, and the UI would show no memories even after the DB
+        // recovered — with no log entry explaining why.
         scope.launch {
             dao.observeAll().map { entities -> entities.map { it.toDomain() } }
+                .catch { e -> Log.e(TAG, "memory collector failed", e) }
                 .collect { list -> initial.value = list }
         }
         initial.asStateFlow()
@@ -54,7 +67,12 @@ class MemoryRepositoryImpl @Inject constructor(
         scope.launch {
             dao.upsert(
                 MemoryEntity(
-                    id = UUID.randomUUID().toString().take(8),
+                    // D-H2: full UUID (122 bits of entropy). The previous
+                    // UUID.take(8) yielded only 32-bit IDs whose birthday bound
+                    // (~65k entries) collided for long-term users; combined with
+                    // @Insert(onConflict = REPLACE) a collision silently
+                    // overwrote an existing memory row.
+                    id = UUID.randomUUID().toString(),
                     kind = kind.name,
                     content = content,
                     createdAt = System.currentTimeMillis(),

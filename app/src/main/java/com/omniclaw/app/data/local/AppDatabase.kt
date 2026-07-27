@@ -9,10 +9,12 @@ import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.omniclaw.app.data.model.ChatMessage
+import com.omniclaw.app.data.model.ToolCall
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
 @Database(
@@ -50,7 +52,7 @@ class DatabaseProvider @Inject constructor(
      */
     val db: AppDatabase by lazy {
         Room.databaseBuilder(ctx, AppDatabase::class.java, "omniclaw.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_3_5)
             // Write-Ahead Logging: enables concurrent readers + 1 writer.
             // Critical for the agent loop (writer) + chat UI (reader) to not
             // block each other. Default on modern Android, but we set it
@@ -231,6 +233,110 @@ class DatabaseProvider @Inject constructor(
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE chat_messages ADD COLUMN toolCallsJson TEXT")
                 db.execSQL("ALTER TABLE chat_messages ADD COLUMN thoughtsJson TEXT")
+            }
+        }
+
+        /**
+         * D-H8: combined 3 → 5 migration.
+         *
+         * Room picks the shortest migration path, so a device sitting on v3 that
+         * upgrades straight to v5 runs MIGRATION_3_5 (not MIGRATION_3_4 then
+         * MIGRATION_4_5). The original MIGRATION_3_4 extracted only the
+         * primary `toolCallId` from each message's tool_calls list and
+         * permanently dropped:
+         *   - toolCall.name / args / result / ok / durationMs
+         *   - the entire `thoughts` reasoning list
+         * for every session that took the 3→4→5 path. This combined migration
+         * creates the chat_messages table with the v5 schema (including
+         * toolCallsJson / thoughtsJson columns) up-front and serializes the
+         * full toolCalls + thoughts lists as JSON so the agent's
+         * self-learning loop (which replays past tool results) survives the
+         * migration.
+         *
+         * MIGRATION_3_4 + MIGRATION_4_5 are kept registered for devices that
+         * happen to stop at v4 (e.g. an older build was installed and then
+         * upgraded two releases later) — Room runs them only if the current
+         * schema version is exactly 3 → 4 or 4 → 5, never in addition to
+         * MIGRATION_3_5.
+         */
+        val MIGRATION_3_5 = object : Migration(3, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Create chat_messages with the full v5 schema (all columns
+                // including toolCallsJson, thoughtsJson) in one step.
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_messages (
+                        id TEXT NOT NULL PRIMARY KEY,
+                        sessionId TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        toolCallId TEXT,
+                        toolCallsJson TEXT,
+                        thoughtsJson TEXT,
+                        FOREIGN KEY (sessionId) REFERENCES sessions(id) ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_chat_messages_sessionId ON chat_messages(sessionId)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_chat_messages_timestamp ON chat_messages(timestamp)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_chat_messages_role ON chat_messages(role)"
+                )
+
+                // Extract every message with FULL toolCalls + thoughts preserved.
+                val toolCallSerializer = ListSerializer(ToolCall.serializer())
+                val thoughtsSerializer = ListSerializer(String.serializer())
+                db.query("SELECT id, messagesJson FROM sessions").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val sessionId = cursor.getString(0)
+                        val messagesJson = cursor.getString(1) ?: continue
+                        if (messagesJson.isBlank()) continue
+
+                        val messages = try {
+                            lenientJson.decodeFromString(
+                                ListSerializer(ChatMessage.serializer()),
+                                messagesJson,
+                            )
+                        } catch (e: Exception) {
+                            Log.w(
+                                "AppDatabase",
+                                "MIGRATION_3_5: failed to parse messagesJson for session $sessionId",
+                                e,
+                            )
+                            continue
+                        }
+
+                        for (message in messages) {
+                            val toolCallId = message.toolCalls.firstOrNull()?.id
+                            val toolCallsJson = if (message.toolCalls.isEmpty()) null
+                                else lenientJson.encodeToString(toolCallSerializer, message.toolCalls)
+                            val thoughtsJson = if (message.thoughts.isEmpty()) null
+                                else lenientJson.encodeToString(thoughtsSerializer, message.thoughts)
+                            db.execSQL(
+                                """
+                                INSERT OR REPLACE INTO chat_messages
+                                (id, sessionId, role, content, timestamp, toolCallId, toolCallsJson, thoughtsJson)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """.trimIndent(),
+                                arrayOf(
+                                    message.id,
+                                    sessionId,
+                                    message.role.name,
+                                    message.content,
+                                    message.timestamp,
+                                    toolCallId,
+                                    toolCallsJson,
+                                    thoughtsJson,
+                                )
+                            )
+                        }
+                    }
+                }
             }
         }
     }

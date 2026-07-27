@@ -9,6 +9,30 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
+ * [runCatching] that re-throws [CancellationException] instead of swallowing it.
+ *
+ * Standard `runCatching { ... }` catches every [Throwable] including
+ * [CancellationException], which breaks structured concurrency: a cancelled
+ * coroutine (parent scope timeout, user stop, supersession) gets converted
+ * into a `Result.failure` and the cancellation never propagates. This helper
+ * restores the contract by re-throwing CancellationException.
+ *
+ * Duplicated (top-level, file-private) in each layer that needs it because
+ * the shared `core/` package is owned by a different fix subagent.
+ *
+ * NOTE: ServiceGateway's runCatching call sites currently wrap non-suspend
+ * service start/stop calls, so the helper is defined for forward-compatibility
+ * (suspend callers added later) and for consistency with the other layers.
+ */
+private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
+
+/**
  * Service gateway abstraction layer.
  *
  * Decouples the agent loop from direct service dependencies, making testing

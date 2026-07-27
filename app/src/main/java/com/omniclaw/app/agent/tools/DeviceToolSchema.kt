@@ -3,10 +3,10 @@ package com.omniclaw.app.agent.tools
 import com.omniclaw.app.data.model.ToolSpec
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Hermes-style structured tool schema for device automation.
@@ -75,11 +75,19 @@ object DeviceToolSchema {
             runCatching { json.parseToJsonElement(argumentsJson).jsonObject }.getOrNull()
                 ?: return Parsed("", null, done = false, valid = false)
 
-        val thought = obj["thought"]?.jsonPrimitive?.contentOrNull.orEmpty()
-        val action = obj["action"]?.jsonPrimitive?.contentOrNull?.lowercase()?.trim()
+        // A-H2 FIX: use `as? JsonPrimitive` (fail-closed) instead of
+        // `.jsonPrimitive` (which throws on non-primitive values). If the LLM
+        // returns `{"thought": {"nested": "object"}}` or `{"thought": [1,2,3]}`,
+        // the previous `.jsonPrimitive` threw IllegalStateException, which
+        // surfaced as a 500-style crash in the agent loop. `as? JsonPrimitive`
+        // returns null for non-primitive payloads, and `?.contentOrNull`
+        // yields an empty string — the caller then treats the action as
+        // invalid (valid == false) and reports a grounded error to the LLM.
+        val thought = (obj["thought"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        val action = (obj["action"] as? JsonPrimitive)?.contentOrNull?.lowercase()?.trim()
             ?: return Parsed(thought, null, done = false, valid = false)
 
-        fun int(key: String): Int? = obj[key]?.jsonPrimitive?.intOrNull
+        fun int(key: String): Int? = (obj[key] as? JsonPrimitive)?.intOrNull
 
         if (action == "done") return Parsed(thought, null, done = true, valid = true)
 
@@ -93,8 +101,8 @@ object DeviceToolSchema {
                 if (x == null || y == null || x2 == null || y2 == null) null
                 else DeviceAction.Swipe(x, y, x2, y2)
             }
-            "type" -> obj["text"]?.jsonPrimitive?.contentOrNull?.let { DeviceAction.Type(it) }
-            "launch" -> obj["package"]?.jsonPrimitive?.contentOrNull?.let { DeviceAction.Launch(it) }
+            "type" -> (obj["text"] as? JsonPrimitive)?.contentOrNull?.let { DeviceAction.Type(it) }
+            "launch" -> (obj["package"] as? JsonPrimitive)?.contentOrNull?.let { DeviceAction.Launch(it) }
             "back" -> DeviceAction.Back
             "home" -> DeviceAction.Home
             "screenshot" -> DeviceAction.Screenshot

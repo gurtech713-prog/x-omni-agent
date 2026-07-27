@@ -13,8 +13,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -29,6 +31,12 @@ class ScheduleViewModel @Inject constructor(
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val serializer = ListSerializer(ScheduledTask.serializer())
     private val storeFile: File by lazy { File(ctx.filesDir, "scheduled_tasks.json") }
+
+    // Serializes durable IO writes so a rapid sequence of create/update/delete
+    // can't interleave on the IO dispatcher (U-H6). The StateFlow is already
+    // updated synchronously, so the UI is immediate; this only guards the
+    // file backup.
+    private val persistMutex = Mutex()
 
     private val _tasks = MutableStateFlow<List<ScheduledTask>>(emptyList())
     val tasks: StateFlow<List<ScheduledTask>> = _tasks.asStateFlow()
@@ -47,7 +55,7 @@ class ScheduleViewModel @Inject constructor(
         persist()
         if (task.enabled) {
             Log.d(TAG, "Task ${task.id} is enabled; scheduling now")
-            schedule(task)
+            viewModelScope.launch(Dispatchers.IO) { schedule(task) }
         }
     }
 
@@ -59,7 +67,7 @@ class ScheduleViewModel @Inject constructor(
         // Reschedule if enabled, cancel if newly disabled.
         if (updated.enabled) {
             Log.d(TAG, "Task ${updated.id} is enabled; scheduling/updating schedule")
-            schedule(updated)
+            viewModelScope.launch(Dispatchers.IO) { schedule(updated) }
         } else {
             Log.d(TAG, "Task ${updated.id} is disabled; cancelling schedule")
             ScheduledTaskWorker.cancel(ctx, updated.id)
@@ -73,7 +81,7 @@ class ScheduleViewModel @Inject constructor(
                 val updated = it.copy(enabled = !it.enabled)
                 Log.d(TAG, "Task $id toggled state. New enabled: ${updated.enabled}")
                 if (updated.enabled) {
-                    schedule(updated)
+                    viewModelScope.launch(Dispatchers.IO) { schedule(updated) }
                 } else {
                     ScheduledTaskWorker.cancel(ctx, updated.id)
                 }
@@ -92,17 +100,16 @@ class ScheduleViewModel @Inject constructor(
 
     /**
      * Update run stats (lastRunAt, nextRunAt, runCount) after a task fires.
-     * Called by [ScheduledTaskWorker] via a future hook. Persisted so the
-     * stats survive app restarts.
+     *
+     * `suspend` so the caller (`ScheduledTaskWorker`, wired by Task 1) can
+     * invoke it from its own coroutine scope without forcing a nested
+     * viewModelScope.launch on every fire (U-C4). Persisted so the stats
+     * survive app restarts.
      */
-    fun recordRun(id: String, nextRunAt: Long?) {
+    suspend fun recordRun(id: String, nextRunAt: Long?) {
         Log.i(TAG, "Recording execution run for task ID=$id. Next run scheduled at $nextRunAt")
-        _tasks.value = _tasks.value.map {
-            if (it.id == id) it.copy(
-                lastRunAt = System.currentTimeMillis(),
-                nextRunAt = nextRunAt,
-                runCount = it.runCount + 1,
-            ) else it
+        _tasks.update { tasks ->
+            tasks.map { if (it.id == id) it.copy(lastRunAt = System.currentTimeMillis(), nextRunAt = nextRunAt, runCount = it.runCount + 1) else it }
         }
         persist()
     }
@@ -153,20 +160,27 @@ class ScheduleViewModel @Inject constructor(
         // a different _tasks.value by the time the IO dispatcher runs the
         // write, and the last writer would win with a stale view. The
         // StateFlow is already updated synchronously, so the UI is immediate;
-        // this file is just the durable backup.
+        // this file is just the durable backup. The persistMutex (U-H6)
+        // serializes the writes so two concurrent updates can't interleave.
         val snapshot = _tasks.value
         val file = storeFile
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                file.writeText(json.encodeToString(serializer, snapshot))
-                Log.d(TAG, "Persisted ${snapshot.size} tasks to storage file.")
-            }.onFailure {
-                Log.e(TAG, "Failed to persist tasks to storage file: ${it.message}", it)
+            persistMutex.withLock {
+                runCatching {
+                    file.writeText(json.encodeToString(serializer, snapshot))
+                    Log.d(TAG, "Persisted ${snapshot.size} tasks to storage file.")
+                }.onFailure {
+                    Log.e(TAG, "Failed to persist tasks to storage file: ${it.message}", it)
+                }
             }
         }
     }
 
     private fun seed(): List<ScheduledTask> {
+        // Seed all tasks with enabled = false (U-M12) so the very first launch
+        // doesn't immediately start scheduling background work the user didn't
+        // opt into. The user can flip the toggle per task after reviewing the
+        // prompt directive.
         val now = System.currentTimeMillis()
         return listOf(
             ScheduledTask(
@@ -175,10 +189,9 @@ class ScheduleViewModel @Inject constructor(
                 scheduleKind = ScheduleKind.WEEKLY,
                 weekdays = setOf(4),  // Calendar.WEDNESDAY = 4 (Sun=1)
                 timeOfDay = "10:00",
-                enabled = true,
+                enabled = false,
                 prompt = "Open Reddit, search 'budget travel tips', summarize the top 3 posts.",
-                nextRunAt = now + 12 * 3600_000L,
-                runCount = 4,
+                runCount = 0,
             ),
             ScheduledTask(
                 id = UUID.randomUUID().toString().take(8),
@@ -195,11 +208,9 @@ class ScheduleViewModel @Inject constructor(
                 scheduleKind = ScheduleKind.INTERVAL,
                 intervalMinutes = 60,
                 timeOfDay = "",
-                enabled = true,
+                enabled = false,
                 prompt = "Take a screenshot of the home screen and log the current battery + storage usage to memory.",
-                lastRunAt = now - 30 * 60_000L,
-                nextRunAt = now + 30 * 60_000L,
-                runCount = 38,
+                runCount = 0,
             ),
         )
     }

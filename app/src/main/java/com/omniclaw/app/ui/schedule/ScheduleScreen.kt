@@ -1,6 +1,7 @@
 package com.omniclaw.app.ui.schedule
 
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.core.tween
@@ -63,14 +64,48 @@ import com.omniclaw.app.ui.components.OmniButton
 import com.omniclaw.app.ui.components.OmniDivider
 import com.omniclaw.app.ui.components.OmniEmptyState
 import com.omniclaw.app.ui.components.OmniTopBar
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.runtime.saveable.Saver
+import kotlinx.serialization.json.Json
 
 private const val TAG = "ScheduleScreen"
+
+// U-M7: Saver that serializes a ScheduledTask? to a JSON string for
+// rememberSaveable. ScheduledTask is @Serializable so we can round-trip it
+// through the serializer — survives rotation / process death so the user's
+// open Edit dialog isn't lost mid-edit.
+private val ScheduledTaskSaver = Saver<ScheduledTask?, String>(
+    save = { it?.let { Json.encodeToString(ScheduledTask.serializer(), it) } ?: "" },
+    restore = {
+        if (it.isEmpty()) null
+        else runCatching { Json.decodeFromString(ScheduledTask.serializer(), it) }.getOrNull()
+    }
+)
 
 @Composable
 fun ScheduleScreen() {
     val vm: ScheduleViewModel = hiltViewModel()
     val list by vm.tasks.collectAsStateWithLifecycle()
-    var editing by remember { mutableStateOf<ScheduledTask?>(null) }
+    // U-M7: rememberSaveable + JSON-string Saver so the open EditTaskDialog
+    // (and the task being edited) survives configuration changes / process
+    // death instead of silently dropping the user's draft.
+    var editing by rememberSaveable(stateSaver = ScheduledTaskSaver) { mutableStateOf<ScheduledTask?>(null) }
+    // U-H1: confirm before destructive deletes — mirror SessionsScreen pattern.
+    var pendingDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // U-H3: per-screen BackHandler that consumes back when a dialog is open
+    // and dismisses it, preventing the OmniApp-level BackHandler from
+    // navigating to Chat out from under the user.
+    val anyDialogOpen = pendingDeleteId != null || editing != null
+    BackHandler(enabled = anyDialogOpen) {
+        if (pendingDeleteId != null) {
+            Log.d(TAG, "Back press consumed: dismissing delete-task dialog")
+            pendingDeleteId = null
+        } else if (editing != null) {
+            Log.d(TAG, "Back press consumed: dismissing edit-task dialog")
+            editing = null
+        }
+    }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "ScheduleScreen composed")
@@ -121,7 +156,7 @@ fun ScheduleScreen() {
                         },
                         onDelete = {
                             Log.i(TAG, "Delete task clicked for: ${t.id}")
-                            vm.delete(t.id)
+                            pendingDeleteId = t.id
                         },
                         onEdit = {
                             Log.i(TAG, "Edit task clicked for: ${t.id}")
@@ -148,6 +183,56 @@ fun ScheduleScreen() {
             onDismiss = {
                 Log.d(TAG, "EditTaskDialog dismissed/cancelled")
                 editing = null
+            },
+        )
+    }
+
+    // U-H1: delete confirmation dialog
+    pendingDeleteId?.let { id ->
+        AlertDialog(
+            onDismissRequest = {
+                Log.d(TAG, "Delete task dialog dismissed")
+                pendingDeleteId = null
+            },
+            shape = RoundedCornerShape(0.dp),
+            containerColor = MaterialTheme.colorScheme.background,
+            modifier = Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+            title = {
+                Text(
+                    "Delete task?",
+                    fontFamily = OmniMono,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            },
+            text = {
+                Text(
+                    "This will permanently delete the scheduled task.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                OmniButton(
+                    text = "DELETE",
+                    onClick = {
+                        Log.i(TAG, "Delete task confirmed for: $id")
+                        vm.delete(id)
+                        pendingDeleteId = null
+                    },
+                    primary = true
+                )
+            },
+            dismissButton = {
+                OmniButton(
+                    text = "CANCEL",
+                    onClick = {
+                        Log.d(TAG, "Delete task cancelled")
+                        pendingDeleteId = null
+                    },
+                    primary = false
+                )
             },
         )
     }
@@ -334,13 +419,18 @@ private fun EditTaskDialog(
     onSave: (ScheduledTask) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var title by rememberSaveable(task.id) { mutableStateOf(task.title) }
-    var prompt by rememberSaveable(task.id) { mutableStateOf(task.prompt) }
-    var kindName by rememberSaveable(task.id) { mutableStateOf(task.scheduleKind.name) }
-    var interval by rememberSaveable(task.id) { mutableStateOf((task.intervalMinutes ?: 30).toString()) }
-    var timeOfDay by rememberSaveable(task.id) { mutableStateOf(task.timeOfDay.ifBlank { "09:00" }) }
-    var enabled by rememberSaveable(task.id) { mutableStateOf(task.enabled) }
-    var weekdaysStr by rememberSaveable(task.id) {
+    // U-L9: use a stable key ("new-task-draft") for unsaved new tasks so the
+    // user's draft survives opening NEW, cancelling, and opening NEW again —
+    // a fresh UUID per click would otherwise reset all rememberSaveable
+    // fields each time.
+    val draftKey = if (isNew) "new-task-draft" else task.id
+    var title by rememberSaveable(draftKey) { mutableStateOf(task.title) }
+    var prompt by rememberSaveable(draftKey) { mutableStateOf(task.prompt) }
+    var kindName by rememberSaveable(draftKey) { mutableStateOf(task.scheduleKind.name) }
+    var interval by rememberSaveable(draftKey) { mutableStateOf((task.intervalMinutes ?: 30).toString()) }
+    var timeOfDay by rememberSaveable(draftKey) { mutableStateOf(task.timeOfDay.ifBlank { "09:00" }) }
+    var enabled by rememberSaveable(draftKey) { mutableStateOf(task.enabled) }
+    var weekdaysStr by rememberSaveable(draftKey) {
         mutableStateOf(task.weekdays.sorted().joinToString(","))
     }
     val kind = runCatching { ScheduleKind.valueOf(kindName) }.getOrDefault(ScheduleKind.INTERVAL)
@@ -348,13 +438,29 @@ private fun EditTaskDialog(
         weekdaysStr.split(',').mapNotNull { it.trim().toIntOrNull() }.toSet()
     }
 
+    // U-M5: validate timeOfDay against HH:mm 24-hour format. The schedule()
+    // path silently coerces invalid times, so the user wouldn't see a clear
+    // error until the WorkManager fire was skipped.
+    val timeOfDayRegex = remember { Regex("^([01]?\\d|2[0-3]):[0-5]\\d$") }
+    val timeOfDayValid = kind != ScheduleKind.INTERVAL && timeOfDayRegex.matches(timeOfDay)
+    // U-M6: enforce minimum 15-minute interval (matches ScheduleViewModel's
+    // coerceAtLeast(15)).
+    val intervalMinutes = interval.toIntOrNull()
+    val intervalValid = kind != ScheduleKind.INTERVAL ||
+        (intervalMinutes != null && intervalMinutes >= 15)
+    val canSave = timeOfDayValid && intervalValid
+
     var kindDropdownExpanded by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         shape = RoundedCornerShape(0.dp),
         containerColor = MaterialTheme.colorScheme.background,
-        modifier = Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+        // U-M18: imePadding so the dialog rises above the on-screen keyboard
+        // when the user is typing in the Title / Prompt / Time fields.
+        modifier = Modifier
+            .imePadding()
+            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
         title = {
             Text(
                 text = if (isNew) "New scheduled task" else "Edit task",
@@ -474,12 +580,17 @@ private fun EditTaskDialog(
                     OutlinedTextField(
                         value = interval,
                         onValueChange = { interval = it.filter { c -> c.isDigit() } },
-                        label = { Text("Interval (minutes)", fontFamily = OmniMono, fontSize = 10.sp) },
+                        label = { Text("Interval (minutes, min 15)", fontFamily = OmniMono, fontSize = 10.sp) },
                         keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
                             keyboardType = androidx.compose.ui.text.input.KeyboardType.Number,
                         ),
                         singleLine = true,
                         shape = RoundedCornerShape(0.dp),
+                        // U-M6: surface the minimum-15 constraint inline.
+                        isError = !intervalValid,
+                        supportingText = if (!intervalValid) {
+                            { Text("Minimum 15 minutes", fontFamily = OmniMono, fontSize = 9.sp) }
+                        } else null,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = MaterialTheme.colorScheme.onBackground,
                             unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
@@ -493,6 +604,11 @@ private fun EditTaskDialog(
                         label = { Text("Time of day (HH:mm)", fontFamily = OmniMono, fontSize = 10.sp) },
                         singleLine = true,
                         shape = RoundedCornerShape(0.dp),
+                        // U-M5: surface the HH:mm 24-hour format constraint inline.
+                        isError = !timeOfDayValid,
+                        supportingText = if (!timeOfDayValid) {
+                            { Text("Use HH:mm 24-hour, e.g. 09:00 or 23:30", fontFamily = OmniMono, fontSize = 9.sp) }
+                        } else null,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = MaterialTheme.colorScheme.onBackground,
                             unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
@@ -588,6 +704,9 @@ private fun EditTaskDialog(
                         )
                     )
                 },
+                // U-M5 + U-M6: disable SAVE while the inputs are invalid so
+                // the user can't silently save a malformed schedule.
+                enabled = canSave,
                 primary = true
             )
         },

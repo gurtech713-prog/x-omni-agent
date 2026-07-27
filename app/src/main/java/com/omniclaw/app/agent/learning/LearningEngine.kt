@@ -22,6 +22,26 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
+ * [runCatching] that re-throws [CancellationException] instead of swallowing it.
+ *
+ * Standard `runCatching { ... }` catches every [Throwable] including
+ * [CancellationException], which breaks structured concurrency: a cancelled
+ * coroutine (parent scope timeout, user stop, supersession) gets converted
+ * into a `Result.failure` and the cancellation never propagates. This helper
+ * restores the contract by re-throwing CancellationException.
+ *
+ * Duplicated (top-level, file-private) in each layer that needs it because
+ * the shared `core/` package is owned by a different fix subagent.
+ */
+private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
+
+/**
  * The self-learning engine — the "Hermes" brain of the agent.
  *
  * Three responsibilities:
@@ -87,7 +107,7 @@ class LearningEngine @Inject constructor(
             // without a racy [] + containsKey pair (audit M-51).
             if (lessonCache.containsKey(key)) return@withContext lessonCache[key]
         }
-        val lessons = runCatching { lessonDao.forScreen(screenFingerprint, limit = 5, minConfidence = minConfidence) }
+        val lessons = runCatchingCancellable { lessonDao.forScreen(screenFingerprint, limit = 5, minConfidence = minConfidence) }
             .getOrDefault(emptyList())
         val result = if (lessons.isEmpty()) null else buildString {
             appendLine()
@@ -129,11 +149,11 @@ class LearningEngine @Inject constructor(
         // step fetches fresh lessons from Room instead of stale cached entries.
         clearLessonCache(sessionId)
         val now = System.currentTimeMillis()
-        val existing = runCatching {
+        val existing = runCatchingCancellable {
             lessonDao.findExisting(screenFingerprint, actionSignature, outcome.name)
         }.getOrNull()
         if (existing != null) {
-            runCatching { lessonDao.reinforce(existing.id, now) }
+            runCatchingCancellable { lessonDao.reinforce(existing.id, now) }
             return@withContext
         }
         val lessonText = when (outcome) {
@@ -147,7 +167,10 @@ class LearningEngine @Inject constructor(
                 "Action '$actionSignature' was tried on this screen."
         }
         val entity = LessonEntity(
-            id = UUID.randomUUID().toString().take(12),
+            // A-M7 FIX: full UUID (was .take(12)) — truncated UUIDs collided
+            // across rapid invocations, overwriting existing lessons via
+            // LessonDao.upsert (which uses `id` as the primary key).
+            id = UUID.randomUUID().toString(),
             screenFingerprint = screenFingerprint,
             actionSignature = actionSignature,
             outcome = outcome.name,
@@ -157,7 +180,7 @@ class LearningEngine @Inject constructor(
             lastSeenAt = now,
             sourceSessionId = sessionId,
         )
-        runCatching { lessonDao.upsert(entity) }
+        runCatchingCancellable { lessonDao.upsert(entity) }
     }
 
     /**
@@ -214,7 +237,7 @@ class LearningEngine @Inject constructor(
             val userPrompt = recorder.getUserPrompt(sessionId) ?: ""
             val finalStatus = recorder.getFinalStatus(sessionId) ?: "UNKNOWN"
 
-            val cfg = runCatching { settings.modelConfig.first() }.getOrNull() ?: return@withContext
+            val cfg = runCatchingCancellable { settings.modelConfig.first() }.getOrNull() ?: return@withContext
             // Skip reflection if no API key is configured (e.g. first run, or LiteRT
             // without a working model — reflection needs a capable LLM).
             if (cfg.provider != com.omniclaw.app.data.prefs.LlmProvider.LITERT &&
@@ -223,7 +246,7 @@ class LearningEngine @Inject constructor(
             val trajectory = formatTrajectoryForReflection(steps, userPrompt, finalStatus)
             val reflectionPrompt = buildReflectionPrompt(trajectory, finalStatus)
 
-            runCatching {
+            runCatchingCancellable {
                 val result = llm.complete(
                     provider = cfg.provider,
                     baseUrl = cfg.baseUrl,
@@ -274,12 +297,12 @@ class LearningEngine @Inject constructor(
         if (steps.size < 3) return@withContext  // too short to be a reusable skill
 
         val userPrompt = recorder.getUserPrompt(sessionId) ?: ""
-        val cfg = runCatching { settings.modelConfig.first() }.getOrNull() ?: return@withContext
+        val cfg = runCatchingCancellable { settings.modelConfig.first() }.getOrNull() ?: return@withContext
         if (cfg.provider != com.omniclaw.app.data.prefs.LlmProvider.LITERT &&
             cfg.apiKey.isBlank()) return@withContext
 
         val trajectory = formatTrajectoryForSkill(steps, userPrompt)
-        runCatching {
+        runCatchingCancellable {
             val result = llm.complete(
                 provider = cfg.provider,
                 baseUrl = cfg.baseUrl,
@@ -298,7 +321,9 @@ class LearningEngine @Inject constructor(
                 maxTokens = 400,
             )
             val content = result.text
-            val id = "auto-${UUID.randomUUID().toString().take(8)}"
+            // A-M7 FIX: full UUID (was .take(8)) — truncated auto-skill IDs
+            // collided across sessions, overwriting previously-created skills.
+            val id = "auto-${UUID.randomUUID().toString()}"
             val dir = java.io.File(ctx.filesDir, "skills/$id").apply { mkdirs() }
             java.io.File(dir, "SKILL.md").writeText(content)
             logger.logInfo(sessionId, 0, "auto-skill: created $id from ${steps.size}-step trajectory")
@@ -395,12 +420,12 @@ class LearningEngine @Inject constructor(
             }
             val now = System.currentTimeMillis()
             // Check if a lesson with the same fingerprint + action + outcome exists.
-            val existing = runCatching {
+            val existing = runCatchingCancellable {
                 lessonDao.findExisting(defaultFingerprint, actionSig, outcome.name)
             }.getOrNull()
             if (existing != null) {
                 // Update the lesson text with the LLM's (richer) description and reinforce.
-                runCatching {
+                runCatchingCancellable {
                     lessonDao.upsert(existing.copy(
                         lessonText = text,
                         confidence = existing.confidence + 1,
@@ -409,7 +434,8 @@ class LearningEngine @Inject constructor(
                 }
             } else {
                 val entity = LessonEntity(
-                    id = UUID.randomUUID().toString().take(12),
+                    // A-M7 FIX: full UUID (was .take(12)).
+                    id = UUID.randomUUID().toString(),
                     screenFingerprint = defaultFingerprint,
                     actionSignature = actionSig,
                     outcome = outcome.name,
@@ -419,12 +445,25 @@ class LearningEngine @Inject constructor(
                     lastSeenAt = now,
                     sourceSessionId = sessionId,
                 )
-                runCatching { lessonDao.upsert(entity) }
+                runCatchingCancellable { lessonDao.upsert(entity) }
             }
         }
     }
 
-    /** Extract a normalized action signature from a lesson text, or null. */
+    /** Extract a normalized action signature from a lesson text, or null.
+     *
+     * A-M8 FIX: delegate to [EpisodeRecorder.normalizeAction] for the actual
+     * whitespace-and-case normalization, so this function and EpisodeRecorder
+     * agree on what counts as "the same action". The previous inline
+     * `.lowercase().replace(Regex("\\s+"), "")` was incompatible with
+     * EpisodeRecorder.normalizeAction after its A-C3 fix (which now preserves
+     * whitespace inside quoted strings) — so a `type("hello world")` action
+     * recorded during the episode had signature `type("hello world")` but
+     * the same text extracted from a reflection lesson was normalized to
+     * `type("helloworld")`, never matching the recorded signature. Lesson
+     * reinforcement fell back to creating duplicates instead of incrementing
+     * the confidence of the existing entry.
+     */
     private fun extractActionSignature(text: String): String? {
         // Match tap(x,y), swipe(x1,y1,x2,y2), type("..."), launch(...), back, home, skill:...
         val patterns = listOf(
@@ -436,7 +475,7 @@ class LearningEngine @Inject constructor(
         )
         for (p in patterns) {
             val match = p.find(text)
-            if (match != null) return match.value.trim().lowercase().replace(Regex("\\s+"), "")
+            if (match != null) return recorder.normalizeAction(match.value)
         }
         return null
     }

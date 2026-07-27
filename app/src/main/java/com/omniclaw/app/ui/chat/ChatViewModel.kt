@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -90,7 +91,15 @@ class ChatViewModel @Inject constructor(
         } else {
             baseMessages
         }
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    }
+        // U-M13: combine re-emits on every event token (each Thought delta
+        // updates eventList). Without distinctUntilChanged, stateIn republishes
+        // a structurally-equal list when an event flips a non-message field,
+        // allocating a fresh List<ChatMessage> and triggering a LazyColumn
+        // recomposition for nothing. ChatMessage is a data class so structural
+        // equality short-circuits the allocation.
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /** Append [e] to the bounded [eventBuffer] and republish [events] (M-37). */
     private fun appendEvent(e: AgentLoop.Event) {
@@ -120,26 +129,55 @@ class ChatViewModel @Inject constructor(
                 if (activeId == null || e.sessionId == activeId) {
                     appendEvent(e)
 
-                    // On-device Text-To-Speech integration:
-                    // Only trigger TTS on the FINAL thought of each step
-                    // (isFinal = true). During streaming, intermediate Thought
-                    // events fire for every token delta — calling TTS on each
-                    // would invoke the engine dozens of times per second,
-                    // each interrupting the previous, producing garbled audio
-                    // and stressing the TTS engine. The isFinal flag is set
-                    // by AgentLoop after the LLM call completes.
+                    // CHAT-FLOW FIX (Bug 4): TTS strategy.
                     //
-                    // We also skip the ellipsis check (previously the only
-                    // guard) because it was ineffective — streaming deltas
-                    // don't end with "…", they end with whatever the LLM
-                    // last emitted.
-                    if (e is AgentLoop.Event.Thought && e.isFinal && uiPrefs.value.ttsEnabled) {
-                        Log.d(TAG, "Triggering TTS speak (final thought, step ${e.step}): ${e.text}")
-                        ttsManager.speak(e.text)
+                    // PREVIOUSLY: TTS fired on EVERY Thought(isFinal=true),
+                    // which fires once per step. For a 5-step device task, TTS
+                    // spoke 5 times — once per intermediate "THOUGHT: I'll tap
+                    // X / ACTION: tap(...)". Worse, the raw text including
+                    // "THOUGHT:" and "ACTION:" scaffolding was passed verbatim
+                    // to the TTS engine, so the user heard "T-H-O-U-G-H-T colon
+                    // … A-C-T-I-O-N colon tap 100 200".
+                    //
+                    // NOW: TTS fires ONLY on Event.Completed (the terminal
+                    // event of a conversational turn), and only the cleaned
+                    // reply text is spoken. Intermediate step thoughts are
+                    // silent (they're internal reasoning, not user-facing
+                    // replies). For multi-step device tasks, the user hears
+                    // only the final summary at the end.
+                    if (e is AgentLoop.Event.Completed && uiPrefs.value.ttsEnabled) {
+                        val cleaned = cleanThoughtForSpeech(e.finalText)
+                        if (cleaned.isNotBlank()) {
+                            Log.d(TAG, "Triggering TTS speak (Completed, cleaned): $cleaned")
+                            ttsManager.speak(cleaned)
+                        }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Strip the canonical "THOUGHT:" / "ACTION:" scaffolding from a thought
+     * before passing it to TTS or display. The agent loop's internal format
+     * (e.g. "THOUGHT: Sure, here's the answer.\nACTION: done") is meant for
+     * parsing, not for the user's ears.
+     *
+     * CHAT-FLOW FIX (Bug 4): TTS previously spoke the raw scaffolding verbatim,
+     * producing garbled audio like "T-H-O-U-G-H-T colon … A-C-T-I-O-N colon done".
+     */
+    private fun cleanThoughtForSpeech(raw: String): String {
+        if (raw.isBlank()) return ""
+        val lines = raw.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .filterNot { it.startsWith("THOUGHT:", ignoreCase = true) }
+            .filterNot { it.startsWith("ACTION:", ignoreCase = true) }
+            .filterNot { it.startsWith("PLAN:", ignoreCase = true) }
+            .filterNot { it.startsWith("OBSERVATION:", ignoreCase = true) }
+            .filterNot { it.startsWith("[VISION", ignoreCase = true) }
+            .toList()
+        return lines.joinToString(" ").trim()
     }
 
     fun newSession(): String {
@@ -154,44 +192,49 @@ class ChatViewModel @Inject constructor(
 
     fun open(id: String) {
         Log.i(TAG, "Opening session with ID: $id")
+        // CHAT-FLOW FIX (Bug 11): set _activeId SYNCHRONOUSLY before the
+        // coroutine hop. Previously _activeId was set inside viewModelScope.launch,
+        // so if the user navigated to a session and typed+sends within the
+        // same frame window, send() read the OLD _activeId.value and
+        // dispatched the message to the previous session. The launch block
+        // now only handles the not-found → null case + clearEvents().
+        _activeId.value = id
         viewModelScope.launch {
             val session = sessions.getByIdSnapshot(id) ?: sessions.getById(id)
             if (session == null) {
                 Log.w(TAG, "open($id) called for a session that doesn't exist (deleted?) — clearing activeId")
                 _activeId.value = null
-            } else {
-                _activeId.value = id
             }
+            // Clear the event log so step/thought/tool-call entries from the
+            // previously active session don't bleed into the newly opened one.
             clearEvents()
         }
     }
 
     fun send(text: String) {
+        // CHAT-FLOW FIX (Bug 7): validate non-empty before doing anything.
+        // OverlayService (voice), DeepLinkManager, and ScheduledTaskWorker all
+        // call send() directly without the Composer's isNotBlank() guard.
+        // An empty prompt creates a session, appends an empty USER message,
+        // and sends an empty prompt to the LLM, which returns a confused or
+        // empty response.
+        if (text.isBlank()) {
+            Log.w(TAG, "send() called with blank text — ignoring")
+            return
+        }
         ttsManager.stop()
-        clearEvents()
-        // CHAT-2 FIX: create a fresh session if the active one is terminal
-        // (DONE / FAILED / STOPPED). Previously, sending a message into a
-        // completed session appended the user message + set status=RUNNING,
-        // but AgentLoop.start() then re-launched the loop which called
-        // isStopRequested() — that check saw the (briefly-RUNNING) status
-        // and proceeded, BUT the session's prior messages (including the
-        // final "DONE" assistant message) were still in history, confusing
-        // the LLM. Worse, if the user sent a second message while the first
-        // was still RUNNING, both messages landed in the same session and
-        // the loop only saw the latest prompt — the first prompt was lost
-        // (no re-run because the loop was already active).
+        // CHAT-FLOW FIX (Bug 2 + Bug 10): DO NOT clearEvents() here
+        // unconditionally. Previously clearEvents() ran synchronously on
+        // the Main thread BEFORE the launch block decided whether to reuse
+        // or create a session. If a session was actively streaming (e.g. the
+        // supersession path, or any non-Composer entry point such as voice
+        // input), the streaming-thought bubble vanished instantly because
+        // uiMessages' combine saw `eventList.lastOrNull() == null`.
         //
-        // The correct UX: once a session is terminal, the next user message
-        // starts a NEW session (preserving the old one in the Sessions list
-        // for reference). This matches how ChatGPT / Claude / every chat app
-        // behaves — a "done" conversation is archived, and the user starts
-        // fresh.
-        // M-38 FIX: the getByIdSnapshot() lookups (and newSession()/create())
-        // touch the session store synchronously. send() is invoked from the
-        // Compose Composer on the Main thread, so doing that work inline risks
-        // an ANR. Move it into the viewModelScope.launch block (the same block
-        // that already runs agent.start) so the DB access no longer happens on
-        // the synchronous Main-thread entry path.
+        // Now: only clear events in the new-session branch. For the reuse
+        // branch, the agent loop's own events will refresh the buffer
+        // naturally; prior steps' thoughts/tool-calls remain visible (which
+        // is what the user expects in an ongoing conversation).
         viewModelScope.launch {
             val existingId = _activeId.value
             val existingSession = existingId?.let { sessions.getByIdSnapshot(it) }
@@ -202,6 +245,10 @@ class ChatViewModel @Inject constructor(
             } == true
             val id = if (existingId == null || existingSession == null || existingIsTerminal) {
                 Log.d(TAG, "Creating a new session for message: $text")
+                // CHAT-FLOW FIX (Bug 2): only clear the event log when
+                // actually starting a new session. The reuse path preserves
+                // prior step/thought events for ongoing-conversation context.
+                clearEvents()
                 newSession()
             } else {
                 existingId

@@ -38,7 +38,7 @@ class SttClient @Inject constructor(
         if (cfg.sttBaseUrl.isBlank()) return@withContext null
 
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody("audio/mp4".toMediaType()))
+            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody(audioMimeType(audioFile).toMediaType()))
             .addFormDataPart("model", cfg.sttModel)
             .build()
 
@@ -84,11 +84,25 @@ class SttClient @Inject constructor(
             val text = obj["text"]?.jsonPrimitive?.contentOrNull
             if (text != null) return text.trim()
         }
-        // Fallback: regex extract the "text" field.
-        val m = Regex("\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(body)
-        return m?.groupValues?.getOrNull(1)
+        // Fallback: regex extract the LAST "text" field. Some providers return
+        // {"segments":[{"text":"a"},...],"text":"b"} where the top-level text
+        // is the joined transcript; if structured parsing fails, the LAST text
+        // field in the JSON is the most likely full-transcript value.
+        val matches = Regex("\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").findAll(body)
+        return matches.lastOrNull()?.groupValues?.getOrNull(1)
             ?.replace("\\\"", "\"")
             ?.replace("\\\\", "\\")
             ?.trim()
+    }
+
+    // V-M18: infer the multipart MIME from the file extension instead of
+    // hardcoding "audio/mp4". Mirrors StreamingSttClient.audioMimeType.
+    private fun audioMimeType(file: File): String = when (file.extension.lowercase()) {
+        "m4a", "mp4" -> "audio/mp4"
+        "wav" -> "audio/wav"
+        "ogg" -> "audio/ogg"
+        "flac" -> "audio/flac"
+        "mp3" -> "audio/mpeg"
+        else -> "application/octet-stream"
     }
 }

@@ -159,10 +159,17 @@ class MultiTierMemory @Inject constructor() {
         return score
     }
 
-    /** Clear all in-memory tiers for [sessionId] (on session end). */
+    /**
+     * Clear all in-memory tiers for [sessionId] (on session end).
+     *
+     * V-M9: also clears the TASK tier keyed by the same id. Many callers
+     * use the session id as the task id when running a single task per
+     * session; previously those task entries leaked across sessions.
+     */
     fun clearSession(sessionId: String) {
         shortTerm.remove(sessionId)
         working.remove(sessionId)
+        task.remove(sessionId)
     }
 
     /** Clear task memory for [taskId]. */

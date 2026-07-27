@@ -36,17 +36,33 @@ class SemanticSearchEngine @Inject constructor(
         val embedding = buildEmbedding(tf)
         documents[docId] = DocEntry(docId, content, tokens, tf, embedding)
         embeddingCache.put(docId, embedding)
+        // V-M12: invalidate the IDF cache — adding a document changes the
+        // document frequency of every term it contains, so cached IDFs are
+        // now stale. Existing document embeddings were computed with the
+        // old IDFs and are an approximation; for a memory-index of <10k
+        // entries the drift is acceptable.
+        invalidateIdfCache()
     }
 
     /** Remove a document from the index. */
     fun remove(docId: String) {
         documents.remove(docId)
         embeddingCache.remove(docId)
+        invalidateIdfCache()
     }
 
     /**
      * Search the index for [query], returning the top [k] doc IDs by
      * cosine similarity to the query embedding.
+     *
+     * V-M12: both the query embedding AND each document's embedding are
+     * (re)computed here using the CURRENT corpus state, so IDF weights
+     * reflect the latest document set. The `embedding` field cached on
+     * each [DocEntry] is computed at index time and goes stale as soon
+     * as the next document is added — using it would zero-out scores
+     * for the first document in a fresh corpus (its terms all have df=N=1
+     * → idf=ln(2/2)=0). Recomputing per-search is O(n × dims) and cheap
+     * for memory indices of <10k entries.
      */
     fun search(query: String, k: Int = 5): List<SearchResult> {
         val queryTokens = tokenize(query)
@@ -55,29 +71,66 @@ class SemanticSearchEngine @Inject constructor(
 
         return documents.values
             .map { doc ->
+                val docEmbedding = buildEmbedding(doc.tf)
                 SearchResult(
                     docId = doc.id,
                     content = doc.content,
-                    score = cosineSimilarity(queryEmbedding, doc.embedding),
+                    score = cosineSimilarity(queryEmbedding, docEmbedding),
                 )
             }
             .sortedByDescending { it.score }
             .take(k)
     }
 
+    /**
+     * V-M11: batched search — runs [search] for each query and returns the
+     * per-query top-k results. Provided as a convenience for callers that
+     * need to score multiple queries against the same index (e.g. retrieving
+     * context for several candidate agent actions at once).
+     *
+     * NOTE: this is still O(n × |queries|). For production scale (>10k docs
+     * or >100 queries per turn), integrate an ANN index (FAISS, HNSW) keyed
+     * by the same embedding space — the [EmbeddingCache] already holds the
+     * per-doc vectors needed to seed such an index.
+     */
+    fun searchBatch(queries: List<String>, k: Int = 5): List<List<SearchResult>> =
+        queries.map { q -> search(q, k) }
+
     /** Clear the entire index. */
     fun clear() {
         documents.clear()
         embeddingCache.clear()
+        invalidateIdfCache()
     }
 
     val size: Int get() = documents.size
 
     // ---- Internal ----
 
+    // V-M12: per-term IDF cache. TF alone treats common words (e.g. "photo")
+    // with the same weight as rare words (e.g. "parrot"); multiplying by IDF
+    // down-weights terms that appear in most documents so they contribute
+    // less to the cosine similarity. The cache is invalidated on index/remove.
+    private val idfLock = Any()
+    private val idfCache = mutableMapOf<String, Float>()
+
+    private fun invalidateIdfCache() = synchronized(idfLock) { idfCache.clear() }
+
+    private fun idf(term: String): Float = synchronized(idfLock) {
+        idfCache.getOrPut(term) {
+            val df = documents.values.count { doc -> term in doc.tf }
+            if (df == 0) 0f else kotlin.math.ln((documents.size + 1f) / (df + 1f))
+        }
+    }
+
     private fun tokenize(text: String): List<String> {
+        // V-M10: use Unicode-aware character classes (\p{L} letters, \p{N}
+        // digits) instead of [a-z0-9] so non-ASCII content (CJK, accented
+        // Latin, Cyrillic, etc.) survives tokenization. The previous regex
+        // would strip every non-ASCII char to a space, losing e.g. "café" →
+        // "caf " and Chinese text entirely.
         return text.lowercase()
-            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("[^\\p{L}\\p{N}\\s]"), " ")
             .split(Regex("\\s+"))
             .filter { it.length > 2 }  // skip very short tokens
             .filter { it !in STOP_WORDS }
@@ -94,14 +147,20 @@ class SemanticSearchEngine @Inject constructor(
      * Build a dense embedding from a TF map. Uses a hash-based projection
      * into a fixed-dimensional space (default 256 dims) so we don't need
      * a vocabulary. This is a cheap approximation of a real embedding model.
+     *
+     * V-M12: weights are now TF×IDF, not plain TF. This down-weights terms
+     * that appear in most documents so they contribute less to cosine
+     * similarity — the class KDoc claims TF-IDF and now it actually is.
      */
     private fun buildEmbedding(tf: Map<String, Float>, dims: Int = 256): FloatArray {
         val vec = FloatArray(dims)
         for ((word, weight) in tf) {
+            val tfidf = weight * idf(word)
+            if (tfidf == 0f) continue
             val hash = word.hashCode()
             for (d in 0 until dims) {
                 val proj = ((hash shr (d % 32)) and 1) - 0.5f
-                vec[d] += proj * weight
+                vec[d] += proj * tfidf
             }
         }
         // L2 normalize.

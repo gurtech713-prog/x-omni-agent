@@ -107,8 +107,17 @@ class SessionRepositoryImpl @Inject constructor(
                 val dbSessions = rows.map { row ->
                     row.session.toDomain().copy(messages = row.messages.map { it.toDomain() })
                 }
+                // D-H1: preserve memory-only sessions (those whose DB row hasn't
+                // been written yet — e.g. a freshly-created session whose upsert
+                // is still in flight, or a tombstoned-but-not-yet-deleted session).
+                // The previous implementation replaced the in-memory list 1-for-1
+                // with dbSessions, dropping any session the DB didn't yet know
+                // about — which made rapid create→append sequences look flappy in
+                // the UI (session briefly disappeared between DB emissions).
                 _sessions.update { currentList ->
-                    dbSessions.map { dbSession ->
+                    val dbIds = dbSessions.map { it.id }.toSet()
+                    val memoryOnly = currentList.filter { it.id !in dbIds }
+                    memoryOnly + dbSessions.map { dbSession ->
                         val currentSession = currentList.firstOrNull { it.id == dbSession.id }
                         if (currentSession != null) {
                             val combined = (currentSession.messages + dbSession.messages).distinctBy { m -> m.id }
@@ -225,6 +234,9 @@ class SessionRepositoryImpl @Inject constructor(
     }
 
     override fun setStatus(id: String, status: SessionStatus) {
+        // D-L4: skip mutators for tombstoned sessions so a stale call from a
+        // cancelled agent loop doesn't resurrect a session the user deleted.
+        if (id in tombstones) return
         _sessions.update { list ->
             list.map { s ->
                 if (s.id == id) s.copy(status = status, lastActiveAt = System.currentTimeMillis()) else s
@@ -236,6 +248,7 @@ class SessionRepositoryImpl @Inject constructor(
     }
 
     override fun incSteps(id: String, by: Int) {
+        if (id in tombstones) return  // D-L4
         _sessions.update { list ->
             list.map { s ->
                 if (s.id == id) s.copy(stepCount = s.stepCount + by) else s
@@ -245,6 +258,7 @@ class SessionRepositoryImpl @Inject constructor(
     }
 
     override fun addTokens(id: String, n: Long) {
+        if (id in tombstones) return  // D-L4
         _sessions.update { list ->
             list.map { s ->
                 if (s.id == id) s.copy(tokenUsage = s.tokenUsage + n) else s
@@ -264,6 +278,7 @@ class SessionRepositoryImpl @Inject constructor(
      * forever, making the Sessions list unusable for finding past conversations.
      */
     override fun setTitle(id: String, title: String) {
+        if (id in tombstones) return  // D-L4
         val truncated = title.trim().take(80).ifBlank { "Untitled session" }
         _sessions.update { list ->
             list.map { s ->
@@ -283,18 +298,36 @@ class SessionRepositoryImpl @Inject constructor(
         _sessions.update { list -> list.filter { it.id != id } }
         scope.launch {
             // Hold the per-session mutex across the DB delete so a concurrent
-            // appendMessage can't slip in between the in-memory and DB deletes;
-            // only drop the mutex mapping once the delete has committed.
+            // appendMessage can't slip in between the in-memory and DB deletes.
+            // D-M1: keep `sessionMutexes.remove(id)` INSIDE the withLock block —
+            // previously it ran outside the lock, so a concurrent appendMessage
+            // that had already grabbed the (now-removed) mutex from a NEW
+            // computeIfAbsent could still write after delete() returned,
+            // resurrecting the session. Holding the remove inside the lock
+            // guarantees no other coroutine can acquire a fresh mutex for this
+            // id while we're still tearing it down.
             mutexFor(id).withLock {
                 sessionDao.delete(id)
                 chatMessageDao.deleteBySession(id)
+                sessionMutexes.remove(id)
             }
-            sessionMutexes.remove(id)
+            // CHAT-FLOW FIX (Bug 12): remove the tombstone now that the DB
+            // delete has completed. Without this, the tombstones set grew
+            // unboundedly across many session deletions (one UUID string per
+            // delete, never freed) — a slow memory leak over the app's
+            // lifetime. By the time we reach here, any in-flight appendMessage
+            // has either observed the tombstone (and skipped) or completed
+            // before our `_sessions.update` filter ran — both safe.
+            tombstones.remove(id)
         }
     }
 
     override fun clearAll() {
-        sessionMutexes.clear()
+        // D-H6: do NOT clear `sessionMutexes` here. Clearing the map would
+        // break mutual exclusion for an in-flight appendMessage (it would grab
+        // a fresh mutex from computeIfAbsent and race with clearAll's delete).
+        // The map entries are tiny (one Mutex each) and are naturally GC'd
+        // once their owning session is gone and no coroutine references them.
         tombstones.clear()
         _sessions.update { emptyList() }
         scope.launch {

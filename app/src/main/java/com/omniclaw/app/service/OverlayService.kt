@@ -39,6 +39,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
@@ -93,6 +95,11 @@ class OverlayService : Service() {
             }
         }.onFailure { e ->
             Log.e(TAG, "Failed to promote OverlayService to foreground: ${e.message}", e)
+            // S-H4: don't continue onCreate if foreground promotion failed —
+            // the system would kill us within the 5s ANR window. Bail out so
+            // we don't attach the bubble view to a service about to die.
+            stopSelf()
+            return
         }
 
         bubble = buildBubble()
@@ -152,6 +159,12 @@ class OverlayService : Service() {
             private var rawStartY = 0f
             private var moved = false
             @Volatile private var recording = false
+            // S-H5: serialize start/stop so ACTION_UP's stop() always waits
+            // for ACTION_DOWN's start() to finish first. Without this, a
+            // quick press-and-release races: start() is still running when
+            // UP fires, `recording` is still false, so stop() is never
+            // called and the recorder is left running.
+            private val recorderMutex = Mutex()
 
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
@@ -175,24 +188,30 @@ class OverlayService : Service() {
                             vibrate(50)
                             return true
                         }
+                        // S-H5: set `recording` synchronously here so the
+                        // subsequent ACTION_UP knows to launch a stop()
+                        // call — even if the start coroutine hasn't run yet.
+                        recording = true
                         // Start recording on IO — MediaRecorder.start() touches the
                         // mic hardware and must not run on the main thread (H-18).
                         // Bubble text is updated back on the main thread.
                         scope.launch(Dispatchers.IO) {
-                            val started = audioRecorder.start() != null
-                            recording = started
-                            withContext(Dispatchers.Main) {
-                                if (started) {
-                                    (v as TextView).text = "REC"
-                                    v.announceForAccessibility("Recording")
-                                    vibrate(20)
-                                } else {
-                                    // start() failed (mic busy or hardware error)
-                                    android.widget.Toast.makeText(
-                                        this@OverlayService,
-                                        "Could not start recording. Microphone may be in use.",
-                                        android.widget.Toast.LENGTH_SHORT,
-                                    ).show()
+                            recorderMutex.withLock {
+                                val started = audioRecorder.start() != null
+                                if (!started) recording = false
+                                withContext(Dispatchers.Main) {
+                                    if (started) {
+                                        (v as TextView).text = "REC"
+                                        v.announceForAccessibility("Recording")
+                                        vibrate(20)
+                                    } else {
+                                        // start() failed (mic busy or hardware error)
+                                        android.widget.Toast.makeText(
+                                            this@OverlayService,
+                                            "Could not start recording. Microphone may be in use.",
+                                            android.widget.Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
                                 }
                             }
                         }
@@ -206,25 +225,35 @@ class OverlayService : Service() {
                         if (recording) {
                             (v as TextView).text = "PUSH"
                             val wasMoved = moved
+                            recording = false
                             // Stop recording on IO — MediaRecorder.stop() encodes and
                             // writes the file, which must not block the UI (H-18).
+                            // S-H5: serialize with the start coroutine so we never
+                            // call stop() before start() has actually begun. The
+                            // mutex is released by the start coroutine once it has
+                            // either succeeded (recording actually started) or
+                            // failed (stop() is then a no-op on an idle recorder).
                             scope.launch(Dispatchers.IO) {
-                                val audioFile = audioRecorder.stop()
-                                if (!wasMoved && audioFile != null) {
-                                    withContext(Dispatchers.Main) { vibrate(15) }
-                                    transcribeAndDispatch(audioFile)
+                                recorderMutex.withLock {
+                                    val audioFile = audioRecorder.stop()
+                                    if (!wasMoved && audioFile != null) {
+                                        withContext(Dispatchers.Main) { vibrate(15) }
+                                        transcribeAndDispatch(audioFile)
+                                    }
                                 }
                             }
-                            recording = false
                         }
                         if (!moved) v.performClick()
                     }
                     MotionEvent.ACTION_CANCEL -> {
                         if (recording) {
                             (v as TextView).text = "PUSH"
-                            // Cancel on IO for the same reason as start/stop (H-18).
-                            scope.launch(Dispatchers.IO) { audioRecorder.cancel() }
                             recording = false
+                            // Cancel on IO for the same reason as start/stop (H-18).
+                            // S-H5: serialize with start for the same reason as stop.
+                            scope.launch(Dispatchers.IO) {
+                                recorderMutex.withLock { audioRecorder.cancel() }
+                            }
                         }
                     }
                 }

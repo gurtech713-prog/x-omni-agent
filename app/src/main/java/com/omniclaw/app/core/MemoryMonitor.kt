@@ -37,11 +37,23 @@ class MemoryMonitor @Inject constructor(
         val total = runtime.totalMemory()
         val free = runtime.freeMemory()
         val used = total - free
-        
-        val activityManager = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+
+        // U-L7: safe-cast the system service — previously `as ActivityManager`
+        // would ClassCastException if some OEM / test context returned a
+        // different implementation. Returning a degraded MemoryInfo (no
+        // system-level lowMemory / availMem signal) is preferable to crashing.
+        val activityManager = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return MemoryInfo(
+                totalMemory = total,
+                freeMemory = free,
+                usedMemory = used,
+                memoryClass = 0,
+                isLowMemory = false,
+                isCriticalMemory = false,
+            )
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
-        
+
         return MemoryInfo(
             totalMemory = total,
             freeMemory = free,

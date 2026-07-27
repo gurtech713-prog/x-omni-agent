@@ -88,11 +88,9 @@ class NodeSearchEngine(
                 val matched = runCatching { predicate.matches(node) }.getOrDefault(false)
                 if (matched) {
                     // Don't recycle the match — caller owns it. Recycle the
-                    // remaining stack frames first.
-                    while (stack.isNotEmpty()) {
-                        val leftover = stack.removeLast()
-                        if (leftover.ownedBySearch) runCatching { leftover.node.recycle() }
-                    }
+                    // remaining stack frames first; the finally block will be
+                    // a no-op since the stack is now empty.
+                    recycleRemaining(stack)
                     return node
                 }
 
@@ -118,6 +116,10 @@ class NodeSearchEngine(
             }
         } catch (e: Exception) {
             Log.w(TAG, "findFirst traversal failed: ${e.message}")
+        } finally {
+            // S-H1: guaranteed cleanup of any frames still on the stack when
+            // the search aborts (maxNodes cap, exception, or early return).
+            recycleRemaining(stack)
         }
         return null
     }
@@ -178,6 +180,10 @@ class NodeSearchEngine(
             }
         } catch (e: Exception) {
             Log.w(TAG, "findAll traversal failed: ${e.message}")
+        } finally {
+            // S-H1: guaranteed cleanup of any frames still on the stack when
+            // the search aborts (maxNodes cap, exception, or early return).
+            recycleRemaining(stack)
         }
         return results
     }
@@ -232,6 +238,18 @@ class NodeSearchEngine(
 
     /** Match scrollable nodes. */
     val scrollable = NodePredicate { it.isScrollable }
+
+    /**
+     * Recycle every search-owned frame still on [stack]. Used in the `finally`
+     * blocks of [findFirst] / [findAll] so we never leak native nodes when a
+     * search aborts (maxNodes cap, exception, or early return).
+     */
+    private fun recycleRemaining(stack: ArrayDeque<NodeFrame>) {
+        while (stack.isNotEmpty()) {
+            val f = stack.removeLast()
+            if (f.ownedBySearch) runCatching { f.node.recycle() }
+        }
+    }
 
     private data class NodeFrame(
         val node: AccessibilityNodeInfo,

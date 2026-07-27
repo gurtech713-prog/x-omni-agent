@@ -1,6 +1,7 @@
 package com.omniclaw.app.ui.memory
 
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.core.tween
@@ -83,9 +84,32 @@ fun MemoryScreen() {
     val lessons by lessonsVm.lessons.collectAsStateWithLifecycle()
     val skills by vm.skills.collectAsStateWithLifecycle()
     val df = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
-    var pendingClear by remember { mutableStateOf<ClearTarget?>(null) }
+    // U-M9: rememberSaveable + Saver so the open confirmation dialog survives
+    // configuration changes / process death — a screen rotation no longer
+    // silently dismisses the "Clear working memory?" prompt.
+    var pendingClear by rememberSaveable(stateSaver = ClearTargetSaver) {
+        mutableStateOf<ClearTarget?>(null)
+    }
+    // U-H2: confirm individual memory-row deletes (forget) before destroying
+    // the entry — matches the SessionsScreen delete pattern. The trash-icon
+    // click sets pendingForgetId; the dialog confirms the actual forget().
+    var pendingForgetId by rememberSaveable { mutableStateOf<String?>(null) }
     var activeTab by rememberSaveable { mutableStateOf(MemoryTab.MEMORIES) }
     var selectedKindFilter by rememberSaveable { mutableStateOf<MemoryKind?>(null) }
+
+    // U-H3: per-screen BackHandler that consumes back when a dialog is open
+    // and dismisses it, preventing the OmniApp-level BackHandler from
+    // navigating to Chat out from under the user.
+    val anyDialogOpen = pendingClear != null || pendingForgetId != null
+    BackHandler(enabled = anyDialogOpen) {
+        if (pendingClear != null) {
+            Log.d(TAG, "Back press consumed: dismissing clear-confirmation dialog")
+            pendingClear = null
+        } else if (pendingForgetId != null) {
+            Log.d(TAG, "Back press consumed: dismissing forget-memory dialog")
+            pendingForgetId = null
+        }
+    }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "MemoryScreen composed")
@@ -168,12 +192,10 @@ fun MemoryScreen() {
                 }
                 OmniDivider()
 
-                val filteredEntries = if (selectedKindFilter != null) {
-                    list.filter { it.kind == selectedKindFilter }
-                } else {
-                    list
+                val filteredEntries = remember(list, selectedKindFilter) {
+                    if (selectedKindFilter != null) list.filter { it.kind == selectedKindFilter } else list
                 }
-                val grouped = filteredEntries.groupBy { it.kind }
+                val grouped = remember(filteredEntries) { filteredEntries.groupBy { it.kind } }
 
                 if (filteredEntries.isEmpty()) {
                     OmniEmptyState(
@@ -192,7 +214,7 @@ fun MemoryScreen() {
                                     MemoryRow(m, df.format(Date(m.createdAt))) { action ->
                                         when (action) {
                                             MemoryRowAction.Pin -> vm.pin(m.id, !m.pinned)
-                                            MemoryRowAction.Forget -> vm.forget(m.id)
+                                            MemoryRowAction.Forget -> pendingForgetId = m.id
                                         }
                                     }
                                 }
@@ -316,6 +338,56 @@ fun MemoryScreen() {
             },
         )
     }
+
+    // U-H2: per-row forget confirmation dialog
+    pendingForgetId?.let { id ->
+        AlertDialog(
+            onDismissRequest = {
+                Log.d(TAG, "Forget memory dialog dismissed")
+                pendingForgetId = null
+            },
+            shape = RoundedCornerShape(0.dp),
+            containerColor = MaterialTheme.colorScheme.background,
+            modifier = Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+            title = {
+                Text(
+                    "Forget memory?",
+                    fontFamily = OmniMono,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            },
+            text = {
+                Text(
+                    "This will permanently remove the memory entry. This cannot be undone.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                OmniButton(
+                    text = "FORGET",
+                    onClick = {
+                        Log.i(TAG, "Forget memory confirmed for: $id")
+                        vm.forget(id)
+                        pendingForgetId = null
+                    },
+                    primary = true
+                )
+            },
+            dismissButton = {
+                OmniButton(
+                    text = "CANCEL",
+                    onClick = {
+                        Log.d(TAG, "Forget memory cancelled")
+                        pendingForgetId = null
+                    },
+                    primary = false
+                )
+            },
+        )
+    }
 }
 
 @Composable
@@ -415,6 +487,12 @@ private enum class ClearTarget(val label: String, val message: String) {
     Working("working memory", "This will remove all working-memory entries. Long-term memories, facts, and pinned entries are kept. This cannot be undone."),
     Lessons("all lessons", "This will remove all learned lessons the agent has accumulated across sessions. This cannot be undone."),
 }
+
+// U-M9: Saver that serializes a ClearTarget? to a String for rememberSaveable.
+private val ClearTargetSaver = androidx.compose.runtime.saveable.Saver<ClearTarget?, String>(
+    save = { it?.name ?: "" },
+    restore = { if (it.isEmpty()) null else runCatching { ClearTarget.valueOf(it) }.getOrNull() }
+)
 
 private enum class MemoryRowAction { Pin, Forget }
 
@@ -550,8 +628,9 @@ private fun SkillRow(skill: Skill, onToggle: (Boolean) -> Unit) {
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
-                Spacer(Modifier.width(8.dp))
-                OmniBadge(skill.id, filled = false)
+                // U-L10: removed OmniBadge(skill.id, ...) — the internal skill
+                // id is opaque to the user (UUID-ish / hyphenated slug) and
+                // just added visual noise next to the human-readable name.
             }
             Spacer(Modifier.size(4.dp))
             Text(

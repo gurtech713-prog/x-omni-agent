@@ -2,6 +2,7 @@ package com.omniclaw.app.ui.sessions
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.omniclaw.app.agent.AgentLoop
 import com.omniclaw.app.behavior.BehaviorRecorder
 import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.session.SessionRepository
@@ -17,6 +18,7 @@ import javax.inject.Inject
 class SessionsViewModel @Inject constructor(
     private val sessionRepo: SessionRepository,
     private val behaviorRecorder: BehaviorRecorder,
+    private val agent: AgentLoop,
 ) : ViewModel() {
 
     private val _sessions = MutableStateFlow<List<Session>>(emptyList())
@@ -74,22 +76,20 @@ class SessionsViewModel @Inject constructor(
     }
 
     fun stop(sessionId: String) {
-        sessionRepo.stop(sessionId)
+        viewModelScope.launch {
+            agent.stop(sessionId)
+            sessionRepo.stop(sessionId)
+        }
     }
 
     fun delete(sessionId: String) {
         viewModelScope.launch {
+            agent.stop(sessionId)
             sessionRepo.delete(sessionId)
         }
     }
 
     fun deleteSession(sessionId: String) = delete(sessionId)
-
-    fun clearAllSessions() {
-        viewModelScope.launch {
-            sessionRepo.clearAll()
-        }
-    }
 
     fun startRecording() {
         behaviorRecorder.startRecording()

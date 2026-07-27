@@ -1,8 +1,11 @@
 package com.omniclaw.app.gallery
 
 import android.content.ContentUris
+import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
 import com.omniclaw.app.data.memory.MemoryRepository
@@ -108,15 +111,31 @@ class GalleryScanner @Inject constructor(
             MediaStore.Images.Media.HEIGHT,
             MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
         )
-        val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC LIMIT $limit"
+        // V-M5: the `LIMIT` clause inside sortOrder is silently ignored on
+        // Android < 30 (the SQLite shim strips it) and may not be honored by
+        // all MediaStore implementations even on 30+. Use the official Bundle
+        // API on R+; fall back to plain sortOrder (no LIMIT) on older devices
+        // and post-filter the cursor to the first `limit` rows.
+        val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         return try {
-            ctx.contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                selectionArgs,
-                sortOrder,
-            )?.use { c ->
+            val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val args = Bundle().apply {
+                    putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
+                    putStringArray(
+                        ContentResolver.QUERY_ARG_SORT_COLUMNS,
+                        arrayOf(MediaStore.Images.Media.DATE_TAKEN),
+                    )
+                    putInt(
+                        ContentResolver.QUERY_ARG_SORT_DIRECTION,
+                        1, // ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
+                    )
+                }
+                ctx.contentResolver.query(uri, projection, args, null)
+            } else {
+                val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC"
+                ctx.contentResolver.query(uri, projection, selection, selectionArgs, sortOrder)
+            }
+            cursor?.use { c ->
                 val idIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val nameIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                 val dateIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
@@ -124,7 +143,9 @@ class GalleryScanner @Inject constructor(
                 val wIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
                 val hIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
                 val bIdx = c.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
-                while (c.moveToNext()) {
+                // V-M5: post-filter for the older-API path (no Bundle LIMIT).
+                // Stop iterating once we've collected `limit` rows.
+                while (c.moveToNext() && out.size < limit) {
                     out.add(
                         Photo(
                             id = c.getLong(idIdx),
@@ -135,7 +156,7 @@ class GalleryScanner @Inject constructor(
                             width = c.getInt(wIdx),
                             height = c.getInt(hIdx),
                             bucket = c.getString(bIdx).orEmpty(),
-                        )
+                        ),
                     )
                 }
             }

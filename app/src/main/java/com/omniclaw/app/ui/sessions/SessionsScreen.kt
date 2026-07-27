@@ -1,6 +1,7 @@
 package com.omniclaw.app.ui.sessions
 
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -82,8 +83,31 @@ fun SessionsScreen(onSelectSession: (String) -> Unit) {
     var showSaveDialog by rememberSaveable { mutableStateOf(false) }
     var saveName by rememberSaveable { mutableStateOf("") }
     var saveTrigger by rememberSaveable { mutableStateOf("") }
-    var pendingDeleteId by remember { mutableStateOf<String?>(null) }
+    // U-M8: rememberSaveable so the open delete-confirmation dialog survives
+    // configuration changes / process death — a rotation no longer silently
+    // dismisses the prompt and lets the user accidentally tap DELETE on the
+    // row underneath.
+    var pendingDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var activeTab by rememberSaveable { mutableStateOf(SessionsTab.ACTIVE_SESSIONS) }
+
+    // U-H3: per-screen BackHandler that consumes back when a dialog is open
+    // and dismisses it, preventing the OmniApp-level BackHandler from
+    // navigating to Chat out from under the user. The AlertDialog's own
+    // onDismissRequest handles the same case when the dialog window itself
+    // has focus, but the OmniApp BackHandler (registered on the Activity's
+    // dispatcher) can fire first on some Compose versions / device themes.
+    val anyDialogOpen = pendingDeleteId != null || showSaveDialog
+    BackHandler(enabled = anyDialogOpen) {
+        if (pendingDeleteId != null) {
+            Log.d(TAG, "Back press consumed: dismissing delete-session dialog")
+            pendingDeleteId = null
+        } else if (showSaveDialog) {
+            Log.d(TAG, "Back press consumed: dismissing save-behavior dialog")
+            showSaveDialog = false
+            saveName = ""
+            saveTrigger = ""
+        }
+    }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "SessionsScreen composed")

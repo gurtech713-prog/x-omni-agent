@@ -31,7 +31,11 @@
 -dontwarn dagger.hilt.**
 
 # ─── Compose ─────────────────────────────────────────────────────────
--keep class androidx.compose.** { *; }
+# V-M17: REMOVED `-keep class androidx.compose.** { *; }` — the Compose
+# compiler + runtime ship their own consumer ProGuard rules via META-INF/proguard,
+# and an explicit broad -keep defeats R8's class/field pruning for unused
+# Compose code paths, bloating the release APK. The -dontwarn below is kept
+# because some Compose preview/tooling references are only resolvable at runtime.
 -dontwarn androidx.compose.**
 
 # ─── Coroutines ──────────────────────────────────────────────────────
@@ -39,8 +43,12 @@
 -dontwarn kotlinx.coroutines.**
 
 # ─── Room (added for persistence) ────────────────────────────────────
--keep class androidx.room.** { *; }
--keep class * extends androidx.room.RoomDatabase { *; }
+# V-M17: REMOVED `-keep class androidx.room.** { *; }` and the broad
+# `extends RoomDatabase` keep — Room's runtime jar ships consumer ProGuard
+# rules (META-INF/proguard/androidx-room.pro) that keep exactly what's
+# needed (generated Impl classes, DAO interfaces, etc.). Our explicit keep
+# was duplicating those and preventing R8 from pruning unused Room helpers.
+-keep class * extends androidx.room.RoomDatabase { <init>(...); }
 -dontwarn androidx.room.**
 
 # ─── AndroidX Security (EncryptedSharedPreferences) ──────────────────
@@ -50,8 +58,12 @@
 -dontwarn com.google.crypto.tink.**
 
 # ─── WorkManager ─────────────────────────────────────────────────────
--keep class androidx.work.** { *; }
--keep class * extends androidx.work.ListenableWorker { *; }
+# V-M17: REMOVED `-keep class androidx.work.** { *; }` — WorkManager ships
+# its own consumer rules. The explicit `extends ListenableWorker` keep is
+# KEPT (narrowed to <init> only) because our HiltWorker subclasses are
+# instantiated by reflection from the worker class name stored in the
+# WorkDatabase.
+-keep class * extends androidx.work.ListenableWorker { <init>(...); }
 
 # ─── LiteRT (on-device ML, formerly TFLite) ──────────────────────────
 # The interpreter is loaded via reflection; keep the public API surface.

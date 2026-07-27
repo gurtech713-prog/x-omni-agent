@@ -35,19 +35,27 @@ class DeepLinkHandler @Inject constructor(
         fun isOmniClawDeepLink(intent: Intent?): Boolean {
             if (intent == null) return false
             val uri = intent.data ?: return false
-            return uri.scheme == SCHEME || 
-                   uri.host?.contains("omniclaw") == true
+            // S-M2: exact host equality (or strict *.omniclaw.app suffix) —
+            // the previous `contains("omniclaw")` check was spoofable by any
+            // attacker-controlled domain like "evil-omniclaw.example.com".
+            return uri.scheme == SCHEME ||
+                uri.host == "omniclaw.app" ||
+                uri.host?.endsWith(".omniclaw.app") == true
         }
         
         fun extractSessionId(intent: Intent?): String? {
             if (intent == null) return null
             val uri = intent.data ?: return null
             
-            return when {
+            // S-M3: treat empty/blank session IDs as missing so callers fall
+            // through to the INVALID result instead of routing to a no-op
+            // session-open with an empty ID.
+            val id = when {
                 uri.scheme == SCHEME -> uri.getQueryParameter("id")
                 uri.path?.contains("/session/") == true -> uri.lastPathSegment
                 else -> null
             }
+            return id?.takeIf { it.isNotBlank() }
         }
     }
     

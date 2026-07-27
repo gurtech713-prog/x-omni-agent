@@ -38,7 +38,15 @@ import kotlin.math.sqrt
  * relying on accidental single-thread confinement.
  */
 class VoiceActivityDetector(
-    private val speechThreshold: Float = 0.02f,
+    // V-L3: raised from 0.02f to 0.05f. The old threshold (~-34 dB) triggered
+    // on ambient noise (HVAC, keyboard taps, pocket rustle) and produced
+    // spurious speech detections. 0.05f (~-26 dB) is still well below normal
+    // speaking volume (~-15 to -20 dB at arm's length) but ignores most
+    // environmental noise.
+    private val speechThreshold: Float = 0.05f,
+    // V-L3: kept silenceThreshold at 0.008f (~-42 dB) — this is below ambient
+    // noise on most devices, so genuine silence (mic off / muted) is detected
+    // without false-positives from background hum.
     private val silenceThreshold: Float = 0.008f,
     private val speechOnsetMs: Long = 80L,
     private val silenceOffsetMs: Long = 700L,

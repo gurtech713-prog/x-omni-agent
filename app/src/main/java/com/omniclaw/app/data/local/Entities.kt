@@ -140,23 +140,4 @@ class Converters {
     @TypeConverter
     fun toStringList(list: List<String>): String =
         Json.encodeToString(ListSerializer(String.serializer()), list)
-
-    /**
-     * Deserialize messages from JSON string.
-     * Used during migration to extract messages from sessions.messagesJson.
-     */
-    fun deserializeMessages(messagesJson: String): List<com.omniclaw.app.data.model.ChatMessage> {
-        if (messagesJson.isBlank()) return emptyList()
-        return runCatching {
-            Json.decodeFromString(ListSerializer(com.omniclaw.app.data.model.ChatMessage.serializer()), messagesJson)
-        }.getOrDefault(emptyList())
-    }
-
-    /**
-     * Serialize messages to JSON string.
-     * Kept for backward compatibility with old schema.
-     */
-    fun serializeMessages(messages: List<com.omniclaw.app.data.model.ChatMessage>): String {
-        return Json.encodeToString(ListSerializer(com.omniclaw.app.data.model.ChatMessage.serializer()), messages)
-    }
 }

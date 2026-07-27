@@ -96,9 +96,18 @@ class AccessibilityDiagnostics @Inject constructor() {
 
     fun log(category: String, message: String, severity: DiagnosticEvent.Severity = DiagnosticEvent.Severity.INFO) {
         val event = DiagnosticEvent(System.currentTimeMillis(), category, message, severity)
-        eventLog.addFirst(event)
-        eventLogSize.incrementAndGet()
-        while (eventLogSize.get() > maxLogSize) { eventLog.pollLast(); eventLogSize.decrementAndGet() }
+        // S-L3: the addFirst + size-check + pollLast sequence must be atomic —
+        // concurrent log() calls could otherwise race past the size cap (each
+        // thread reads the same `eventLogSize`, both addFirst, both see > cap,
+        // both pollLast — net result: no trimming and unbounded growth).
+        synchronized(eventLog) {
+            eventLog.addFirst(event)
+            eventLogSize.incrementAndGet()
+            while (eventLogSize.get() > maxLogSize) {
+                eventLog.pollLast()
+                eventLogSize.decrementAndGet()
+            }
+        }
         val priority = when (severity) {
             DiagnosticEvent.Severity.INFO -> Log.INFO
             DiagnosticEvent.Severity.WARN -> Log.WARN

@@ -17,6 +17,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -63,11 +64,17 @@ class LlmClient @Inject constructor(
     /**
      * Dedicated client for SSE streaming (audit M-29). OkHttp readTimeout fires
      * between byte reads, so the shared 60s client kills long-running streams
-     * (reasoning models, slow tool calls) mid-generation. readTimeout(0) disables
-     * the read timeout for streaming only; complete() keeps the injected client.
+     * (reasoning models, slow tool calls) mid-generation.
+     *
+     * D-M8: readTimeout was 0 (infinite), which let a stalled SSE connection
+     * hang the stream forever — the agent's per-step timeout would never fire
+     * on the HTTP side. Capped at 120s so a server that stops sending bytes
+     * without closing the socket is treated as a network failure rather than
+     * an infinite wait. This matches the streaming-friendly behavior of most
+     * production LLM SDKs.
      */
     private val streamingHttp: OkHttpClient by lazy {
-        http.newBuilder().readTimeout(0, java.util.concurrent.TimeUnit.SECONDS).build()
+        http.newBuilder().readTimeout(120, java.util.concurrent.TimeUnit.SECONDS).build()
     }
 
     @Serializable
@@ -127,9 +134,13 @@ class LlmClient @Inject constructor(
             // 429 rate-limit: surface Retry-After so the caller's retry loop can honor it.
             if (resp.code == 429) {
                 val retryAfter = resp.header("Retry-After")?.toIntOrNull()
-                throw RateLimitException(retryAfterSeconds = retryAfter, body = body)
+                throw RateLimitException(retryAfterSeconds = retryAfter, body = "HTTP 429")
             }
-            throw LlmException("HTTP ${resp.code}: ${body.take(500)}")
+            // D-H5: do NOT include the response body in the exception message —
+            // some providers echo the request body (including the Bearer token
+            // or the user's prompt) back in the error response, which would
+            // then leak via Logcat / crash reports. Keep only the HTTP code.
+            throw LlmException("HTTP ${resp.code}")
         }
         parseCompletion(body)
     }
@@ -175,13 +186,18 @@ class LlmClient @Inject constructor(
             override fun onResponse(c: Call, r: Response) {
                 r.use { resp ->
                     if (!resp.isSuccessful) {
-                        val errBody = resp.body?.string().orEmpty()
+                        // D-H5: drain the error body so the connection can be
+                        // reused (OkHttp requires the body to be read or closed
+                        // before the connection is returned to the pool), but do
+                        // NOT include it in the exception — it may contain the
+                        // echoed request (prompt, Bearer token) and leak via Logcat.
+                        runCatching { resp.body?.string() }
                         if (resp.code == 429) {
                             val retryAfter = resp.header("Retry-After")?.toIntOrNull()
-                            channel.close(RateLimitException(retryAfter, errBody))
+                            channel.close(RateLimitException(retryAfter, "HTTP 429"))
                             return
                         }
-                        channel.close(LlmException("HTTP ${resp.code}: ${errBody.take(500)}"))
+                        channel.close(LlmException("HTTP ${resp.code}"))
                         return
                     }
                     val src = resp.body?.source()
@@ -201,9 +217,11 @@ class LlmClient @Inject constructor(
                             }.getOrNull() ?: continue
                             val deltaObj = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
                                 ?.get("delta")?.jsonObject
-                            val deltaContent = deltaObj?.get("content")?.jsonPrimitive?.content.orEmpty()
-                            val deltaReasoning = deltaObj?.get("reasoning_content")?.jsonPrimitive?.content.orEmpty()
-                            val deltaReasoningAlt = deltaObj?.get("reasoning")?.jsonPrimitive?.content.orEmpty()
+                            // D-M3: use `as? JsonPrimitive` for the same reason as parseCompletion —
+                            // a non-primitive `content` field would crash the stream mid-flight.
+                            val deltaContent = (deltaObj?.get("content") as? JsonPrimitive)?.content.orEmpty()
+                            val deltaReasoning = (deltaObj?.get("reasoning_content") as? JsonPrimitive)?.content.orEmpty()
+                            val deltaReasoningAlt = (deltaObj?.get("reasoning") as? JsonPrimitive)?.content.orEmpty()
                             val delta = deltaContent.ifEmpty { deltaReasoning.ifEmpty { deltaReasoningAlt } }
 
                             if (delta.isNotEmpty()) {
@@ -230,7 +248,7 @@ class LlmClient @Inject constructor(
                 }
             }
         })
-    }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST).flowOn(Dispatchers.IO)
+    }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.SUSPEND).flowOn(Dispatchers.IO)
 
     private fun parseCompletion(body: String): CompletionResult {
         val obj = runCatching { json.parseToJsonElement(body).jsonObject }.getOrElse {
@@ -239,27 +257,31 @@ class LlmClient @Inject constructor(
         val firstChoice = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
             ?: throw LlmException("No choices in response: ${body.take(200)}")
         val msgObj = firstChoice["message"] as? JsonObject
-        val content = msgObj?.get("content")?.jsonPrimitive?.content.orEmpty()
-        val reasoning = msgObj?.get("reasoning_content")?.jsonPrimitive?.content.orEmpty()
-        val reasoningAlt = msgObj?.get("reasoning")?.jsonPrimitive?.content.orEmpty()
+        // D-M3: use `as? JsonPrimitive` so a non-primitive `content` field (e.g.
+        // a provider that returns content as an array of text parts) doesn't
+        // crash with ClassCastException. We degrade gracefully to empty string
+        // and let the caller's empty-response handling take over.
+        val content = (msgObj?.get("content") as? JsonPrimitive)?.content.orEmpty()
+        val reasoning = (msgObj?.get("reasoning_content") as? JsonPrimitive)?.content.orEmpty()
+        val reasoningAlt = (msgObj?.get("reasoning") as? JsonPrimitive)?.content.orEmpty()
         val text = content.ifEmpty { reasoning.ifEmpty { reasoningAlt } }
-        val finish = firstChoice["finish_reason"]?.jsonPrimitive?.content.orEmpty()
+        val finish = (firstChoice["finish_reason"] as? JsonPrimitive)?.content.orEmpty()
         val usageObj = obj["usage"] as? JsonObject
         val usage = LlmUsage(
-            promptTokens = usageObj?.get("prompt_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
-            completionTokens = usageObj?.get("completion_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
-            totalTokens = usageObj?.get("total_tokens")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
+            promptTokens = (usageObj?.get("prompt_tokens") as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L,
+            completionTokens = (usageObj?.get("completion_tokens") as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L,
+            totalTokens = (usageObj?.get("total_tokens") as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L,
         )
         // Structured tool calls (Hermes-style function-calling). Empty for plain
         // text completions or providers that ignore the tools schema.
         val toolCalls = msgObj?.get("tool_calls")?.jsonArray?.mapNotNull { el ->
             val o = el.jsonObject
             val fn = o["function"]?.jsonObject ?: return@mapNotNull null
-            val name = fn["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            val name = (fn["name"] as? JsonPrimitive)?.content ?: return@mapNotNull null
             LlmToolCall(
-                id = o["id"]?.jsonPrimitive?.content ?: java.util.UUID.randomUUID().toString(),
+                id = (o["id"] as? JsonPrimitive)?.content ?: java.util.UUID.randomUUID().toString(),
                 name = name,
-                arguments = fn["arguments"]?.jsonPrimitive?.content ?: "{}",
+                arguments = (fn["arguments"] as? JsonPrimitive)?.content ?: "{}",
             )
         }.orEmpty()
         return CompletionResult(text, usage, finish, toolCalls)

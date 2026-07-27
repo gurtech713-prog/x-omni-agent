@@ -200,6 +200,33 @@ class TextToSpeechManager @Inject constructor(
         _isSpeaking.value = false
     }
 
+    /**
+     * V-M3: lifecycle hook for the SettingsViewModel / ProcessLifecycleObserver.
+     *
+     * TTS is initialized eagerly on construction and held for the app's life.
+     * That's correct when TTS is enabled, but if the user disables TTS in
+     * Settings the engine keeps a system service binding open. This helper lets
+     * the settings toggle path release the engine as soon as TTS is turned off.
+     *
+     * The next [speak] (if TTS is re-enabled later) lazily re-initializes via
+     * [ensureInitialized] — but note that [ensureInitialized] short-circuits
+     * while `shuttingDown` is true, so [resetShutdownFlag] must be called first
+     * to allow re-init.
+     */
+    fun shutdownIfDisabled(ttsEnabled: Boolean) {
+        if (!ttsEnabled) shutdown()
+    }
+
+    /**
+     * V-M3: clear the [shuttingDown] flag so [ensureInitialized] can construct
+     * a fresh engine after [shutdownIfDisabled]. Call from the settings toggle
+     * path BEFORE the next speak() when re-enabling TTS.
+     */
+    @Synchronized
+    fun resetShutdownFlag() {
+        shuttingDown = false
+    }
+
     companion object {
         private const val TAG = "TextToSpeechManager"
     }

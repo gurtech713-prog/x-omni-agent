@@ -36,12 +36,20 @@ class SkillRepositoryImpl @Inject constructor(
         val loaded = loadFromAssets() + loadFromFilesDir()
         // Merge: loaded entries take priority over seed entries with the same ID;
         // seed entries with no asset/file counterpart are kept as fallbacks.
-        val loadedIds = loaded.map { it.id }.toSet()
-        val merged = loaded + _skills.value.filter { it.id !in loadedIds }
-        // Apply persisted enabled/disabled state on top of the merge so the
-        // user's toggles survive reload + restart.
-        val savedState = loadEnabledState()
-        _skills.value = merged.map { it.copy(enabled = savedState[it.id] ?: it.enabled) }
+        //
+        // D-M5: use the atomic `_skills.update { ... }` CAS loop instead of
+        // direct assignment. The previous `_skills.value = ...` was a
+        // read-then-write: under a concurrent `setEnabled` call (which also
+        // `_skills.update`s) the slower write would silently clobber the
+        // faster one, dropping either the reload or the toggle.
+        _skills.update { current ->
+            val loadedIds = loaded.map { it.id }.toSet()
+            val merged = loaded + current.filter { it.id !in loadedIds }
+            // Apply persisted enabled/disabled state on top of the merge so the
+            // user's toggles survive reload + restart.
+            val savedState = loadEnabledState()
+            merged.map { it.copy(enabled = savedState[it.id] ?: it.enabled) }
+        }
     }
 
     override fun getById(id: String): Skill? = _skills.value.firstOrNull { it.id == id }
@@ -78,9 +86,18 @@ class SkillRepositoryImpl @Inject constructor(
             // crash mid-write can't leave a truncated skill_enabled.json that
             // loadEnabledState would parse as an empty map (silently re-enabling
             // every skill the user disabled).
+            //
+            // D-M6: previously the result of `tmp.renameTo(enabledStateFile)`
+            // was discarded. On some Android filesystems (e.g. sdcardfs via
+            // scoped storage) rename can fail even when both paths are valid —
+            // silently losing the toggle. We now fall back to a direct write +
+            // tmp delete so the state is still persisted.
             val tmp = File(enabledStateFile.parentFile, "skill_enabled.json.tmp")
             tmp.writeText(text)
-            tmp.renameTo(enabledStateFile)
+            if (!tmp.renameTo(enabledStateFile)) {
+                enabledStateFile.writeText(text)
+                tmp.delete()
+            }
         }
     }
 

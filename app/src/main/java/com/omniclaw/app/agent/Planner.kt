@@ -26,14 +26,32 @@ import javax.inject.Singleton
 class Planner @Inject constructor(
     private val llm: UnifiedLlmClient,
 ) {
-    data class PlanStep(val id: Int, val intent: String, private var done: Boolean = false) {
+    data class PlanStep(val id: Int, val intent: String, val done: Boolean = false) {
         val isDone: Boolean get() = done
-        fun markDone() { done = true }
+        // A-L3 FIX: `done` is now a `val` (was `private var`) and `markDone()`
+        // returns a NEW copy with `done = true` instead of mutating `this`.
+        // Mutating a data-class field from inside a `fun` was a hidden side-
+        // effect that broke `copy()` semantics, made PlanStep instances non-
+        // safely-shareable across coroutines, and surprised the planner's
+        // prompt-renderer which cached references. Callers MUST capture the
+        // returned copy (see e.g. AgentLoop's `plan.markNextStepDone()`).
+        fun markDone(): PlanStep = copy(done = true)
     }
 
     data class Plan(val goal: String, val steps: MutableList<PlanStep>) {
         val nextStep: PlanStep? get() = steps.firstOrNull { !it.isDone }
         val isComplete: Boolean get() = steps.isNotEmpty() && steps.all { it.isDone }
+
+        // A-L3 FIX: helper that replaces the next-undone step in-place with
+        // its `markDone()` copy. The previous caller pattern
+        // `plan?.nextStep?.let { it.markDone() }` discarded the returned copy
+        // — which was a no-op once markDone stopped mutating `this`. Routing
+        // through this helper ensures the new copy is actually stored back
+        // into the steps list so the next `nextStep` lookup sees the update.
+        fun markNextStepDone() {
+            val idx = steps.indexOfFirst { !it.isDone }
+            if (idx >= 0) steps[idx] = steps[idx].markDone()
+        }
     }
 
     private val json = Json { ignoreUnknownKeys = true }

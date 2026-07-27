@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.omniclaw.app.litert.InferenceScheduler
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -13,7 +14,7 @@ import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.File
 import java.io.FileOutputStream
-import java.nio.FloatBuffer
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -86,61 +87,101 @@ class LiteRtEngine @Inject constructor(
 
     /**
      * Get the input tensor shape (as int array) for a model.
+     *
+     * D-C1: acquire the per-model [LoadedModel.mutex] while reading the tensor
+     * shape so a concurrent [unload] can't close the interpreter mid-call
+     * (which would otherwise throw IllegalStateException / use-after-free in
+     * native code).
      */
     suspend fun inputShape(modelPath: String, index: Int = 0): IntArray? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val loaded = getOrLoad(modelPath, useGpu = false, useNnapi = false)
-                loaded.interpreter.getInputTensor(index).shape()
+                loaded.mutex.withLock { loaded.interpreter.getInputTensor(index).shape() }
             }.getOrNull()
         }
 
     /**
      * Get the output tensor shape (as int array) for a model.
+     *
+     * D-C1: acquire the per-model [LoadedModel.mutex] while reading the tensor
+     * shape so a concurrent [unload] can't close the interpreter mid-call.
+     *
+     * D-H3: the shape probe historically loaded a second (non-NNAPI) interpreter
+     * per model and left it cached — wasting RAM. We now (a) memoize the result
+     * in [shapeCache] so the probe only runs once per (model,index), and
+     * (b) call [unload] immediately after the probe to release the probe
+     * interpreter back to the OS.
      */
-    suspend fun outputShape(modelPath: String, index: Int = 0): IntArray? =
-        withContext(Dispatchers.IO) {
+    suspend fun outputShape(modelPath: String, index: Int = 0): IntArray? {
+        val cacheKey = "$modelPath#$index"
+        shapeCache[cacheKey]?.let { return it }
+        val shape = withContext(Dispatchers.IO) {
             runCatching {
                 val loaded = getOrLoad(modelPath, useGpu = false, useNnapi = false)
-                loaded.interpreter.getOutputTensor(index).shape()
+                loaded.mutex.withLock { loaded.interpreter.getOutputTensor(index).shape() }
             }.getOrNull()
         }
+        // Unload the probe interpreter (and any sibling variants) to free memory
+        // — the probe loads a CPU-only interpreter that the caller usually does
+        // not need (the real inference path goes through runIntSingle / scheduler).
+        runCatching { unload(modelPath) }
+        shapeCache[cacheKey] = shape
+        return shape
+    }
 
     /** Release all cached variants of a model. */
     suspend fun unload(modelPath: String) {
         val pathPrefix = modelPath.removePrefix("assets://").lowercase()
-        val removed = cacheMutex.withLock {
-            val toRemove = cache.entries.filter { it.key.startsWith("$pathPrefix|") }.map { it.key }
-            toRemove.mapNotNull { cache.remove(it) }
-        }
-        removed.forEach {
-            // Drain any in-flight inference before closing (H-24): the Interpreter
-            // is not thread-safe, so closing while another coroutine holds the
-            // per-model mutex inside run() would be a native use-after-free.
-            it.mutex.withLock {
-                runCatching { it.interpreter.close() }
-                it.gpuDelegate?.close()
-                it.nnApiDelegate?.close()
+        // Remove all variants (gpu=*, nnapi=*) for this model path. ConcurrentHashMap
+        // entries are CompletableDeferred<LoadedModel>; we await each so we can
+        // close the underlying interpreter + delegates safely. A still-pending
+        // load (rare — only if unload races with a getOrLoad that just won the
+        // putIfAbsent) will throw on await, which runCatching swallows.
+        val toRemove = cache.keys.filter { it.startsWith("$pathPrefix|") }
+        val removed = toRemove.mapNotNull { cache.remove(it) }
+        removed.forEach { deferred ->
+            runCatching {
+                val loaded = deferred.await()
+                // Drain any in-flight inference before closing (H-24): the Interpreter
+                // is not thread-safe, so closing while another coroutine holds the
+                // per-model mutex inside run() would be a native use-after-free.
+                loaded.mutex.withLock {
+                    runCatching { loaded.interpreter.close() }
+                    loaded.gpuDelegate?.close()
+                    loaded.nnApiDelegate?.close()
+                }
             }
         }
     }
 
-    /** Release all cached models. */
+    /**
+     * Release all cached models.
+     *
+     * D-L6: do NOT call `scheduler.shutdown()` here — the scheduler is shared
+     * with the rest of the app and shutting it down would break subsequent
+     * inference calls. Only the local cache is released.
+     */
     suspend fun unloadAll() {
-        val all = cacheMutex.withLock {
+        val all = synchronized(evictionLock) {
             val copy = cache.values.toList()
             cache.clear()
             copy
         }
-        all.forEach {
-            // Drain any in-flight inference before closing (H-24) — see unload().
-            it.mutex.withLock {
-                runCatching { it.interpreter.close() }
-                it.gpuDelegate?.close()
-                it.nnApiDelegate?.close()
+        all.forEach { deferred ->
+            // Drain any in-flight load + in-flight inference before closing
+            // (H-24) — see unload(). A deferred that hasn't completed yet will
+            // throw once we completeExceptionally below, so guard with runCatching.
+            runCatching {
+                val loaded = deferred.await()
+                loaded.mutex.withLock {
+                    runCatching { loaded.interpreter.close() }
+                    loaded.gpuDelegate?.close()
+                    loaded.nnApiDelegate?.close()
+                }
             }
         }
-        runCatching { scheduler.shutdown() }
+        shapeCache.clear()
     }
 
     /** True if LiteRT native libs loaded successfully. */
@@ -175,38 +216,106 @@ class LiteRtEngine @Inject constructor(
         val mutex = Mutex()
     }
 
-    private val cache = mutableMapOf<String, LoadedModel>()
-    private val cacheMutex = Mutex()
+    /**
+     * Per-key load coordination. Each entry is a [CompletableDeferred] that is
+     * completed by the coroutine that wins the `putIfAbsent` race for that key;
+     * concurrent loaders of the SAME key `await()` the winner instead of
+     * double-constructing an Interpreter. Concurrent loaders of DIFFERENT keys
+     * no longer block each other (the previous `cacheMutex.withLock` held the
+     * lock across multi-second Interpreter construction, serializing all
+     * loads — D-H4).
+     */
+    private val cache = ConcurrentHashMap<String, CompletableDeferred<LoadedModel>>()
+
+    /**
+     * Caps the number of cached interpreter variants (D-H4). Each variant can
+     * hold hundreds of MB of native memory; an unbounded cache would OOM on a
+     * device that loads multiple model families. Eviction is FIFO-ish (we drop
+     * an arbitrary key via `cache.keys.first()`) — true LRU would require a
+     * LinkedHashMap wrapper, which is overkill for a cap of 2.
+     */
+    private val maxEntries = 2
+    private val evictionLock = Any()
+
+    /**
+     * Cached output-shape probe results (D-H3). Keyed by `"$modelPath#$index"`.
+     */
+    private val shapeCache = ConcurrentHashMap<String, IntArray?>()
 
     private suspend fun getOrLoad(modelPath: String, useGpu: Boolean, useNnapi: Boolean): LoadedModel {
         val key = normalizeKey(modelPath, useGpu, useNnapi)
-        // Hold cacheMutex across the entire load (M-26). This serializes concurrent
-        // loads but guarantees two coroutines can't both miss the cache and both
-        // construct an Interpreter for the same key (the previous check-then-load
-        // outside the lock was a TOCTOU race that double-loaded models).
-        return cacheMutex.withLock {
-            cache[key]?.let { return@withLock it }
+        // Fast path: already loaded.
+        cache[key]?.await()?.let { return it }
+        // Slow path: try to claim the loader slot for this key.
+        val deferred = CompletableDeferred<LoadedModel>()
+        val winner = cache.putIfAbsent(key, deferred) ?: deferred
+        if (winner !== deferred) return winner.await()
+        try {
+            // Bounded cache (D-H4): evict the oldest variant if we'd exceed the cap.
+            // We collect the deferreds to evict INSIDE the synchronized block (which
+            // only touches the ConcurrentHashMap — no suspend calls), then close them
+            // OUTSIDE the lock. Closing requires `await()` + `mutex.withLock`, both
+            // of which are suspend calls — calling them inside `synchronized` would
+            // hold the JVM monitor across suspension and throw
+            // IllegalMonitorStateException when the coroutine resumes on a different
+            // thread (the monitor is per-thread, not per-coroutine).
+            val toEvict: List<CompletableDeferred<LoadedModel>> = synchronized(evictionLock) {
+                val evicted = mutableListOf<CompletableDeferred<LoadedModel>>()
+                while (cache.size > maxEntries) {
+                    // `cache.keys` is ConcurrentHashMap's KeySetView (Iterable<String>).
+                    // We pick an arbitrary key — true LRU would require a LinkedHashMap,
+                    // but for a cap of 2 any eviction policy is sufficient to prevent
+                    // unbounded growth.
+                    val oldestKey = cache.keys.first()
+                    cache.remove(oldestKey)?.let { evicted.add(it) }
+                }
+                evicted
+            }
+            for (evictedDeferred in toEvict) {
+                runCatching {
+                    val evicted = evictedDeferred.await()
+                    evicted.mutex.withLock {
+                        runCatching { evicted.interpreter.close() }
+                        evicted.gpuDelegate?.close()
+                        evicted.nnApiDelegate?.close()
+                    }
+                }
+            }
             val file = resolveToFile(modelPath)
             val options = Interpreter.Options()
+            // D-C5: wrap delegate construction + Interpreter creation in try/catch
+            // so a failure (e.g. GPU delegate OOM, NNAPI unsupported on this ABI)
+            // closes the delegates we already created. Without this, every failed
+            // construction leaked one or both delegates' native memory.
             var gpuDelegate: GpuDelegate? = null
             var nnApiDelegate: NnApiDelegate? = null
-            if (useNnapi) {
-                runCatching {
-                    nnApiDelegate = NnApiDelegate()
-                    options.addDelegate(nnApiDelegate)
-                }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
+            try {
+                if (useNnapi) {
+                    runCatching {
+                        nnApiDelegate = NnApiDelegate()
+                        options.addDelegate(nnApiDelegate)
+                    }.onFailure { Log.w(TAG, "NNAPI delegate unavailable: ${it.message}") }
+                }
+                if (useGpu) {
+                    runCatching {
+                        gpuDelegate = GpuDelegate()
+                        options.addDelegate(gpuDelegate)
+                    }.onFailure { Log.w(TAG, "GPU delegate unavailable: ${it.message}") }
+                }
+                options.setNumThreads(2)
+                val interpreter = Interpreter(file, options)
+                val loaded = LoadedModel(file, interpreter, gpuDelegate, nnApiDelegate)
+                deferred.complete(loaded)
+                return loaded
+            } catch (t: Throwable) {
+                runCatching { gpuDelegate?.close() }
+                runCatching { nnApiDelegate?.close() }
+                throw t
             }
-            if (useGpu) {
-                runCatching {
-                    gpuDelegate = GpuDelegate()
-                    options.addDelegate(gpuDelegate)
-                }.onFailure { Log.w(TAG, "GPU delegate unavailable: ${it.message}") }
-            }
-            options.setNumThreads(2)
-            val interpreter = Interpreter(file, options)
-            val loaded = LoadedModel(file, interpreter, gpuDelegate, nnApiDelegate)
-            cache[key] = loaded
-            loaded
+        } catch (t: Throwable) {
+            cache.remove(key)
+            deferred.completeExceptionally(t)
+            throw t
         }
     }
 
@@ -229,7 +338,16 @@ class LiteRtEngine @Inject constructor(
         // Preserve the asset's subdirectory structure (M-27): flattening '/' to '_'
         // made distinct assets like "models/a/m.tflite" and "models/a_m.tflite"
         // collide on the same extracted file.
-        val outFile = File(outDir, assetPath)
+        //
+        // D-M4: canonicalize the resolved file path and verify it stays inside
+        // outDir. Without this, a modelPath containing ".." (e.g.
+        // "models/../../databases/omniclaw.db") could traverse out of the
+        // litert_models directory and overwrite arbitrary app files.
+        val outFile = File(outDir, assetPath).canonicalFile
+        val canonicalOutDir = outDir.canonicalFile
+        require(outFile.path.startsWith(canonicalOutDir.path + File.separator)) {
+            "Refusing to resolve model path outside litert_models: $modelPath"
+        }
         outFile.parentFile?.mkdirs()
         // Validate the extracted file is non-empty AND its size matches the
         // asset's size — a partial extract (e.g. crash during copy, full disk)

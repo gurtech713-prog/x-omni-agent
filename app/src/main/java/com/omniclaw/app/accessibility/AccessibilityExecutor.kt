@@ -58,6 +58,23 @@ class AccessibilityExecutor @Inject constructor(
 
     private fun svc(): AccessibilityService? = service ?: deviceScheduler?.boundService
 
+    // S-L4: reuse a single GestureManager per bound service instance so the
+    // totalGestures / successfulGestures / cancelledGestures / timedOutGestures
+    // counters accumulate across dispatches instead of resetting to zero on
+    // every tap/swipe. Re-creates the manager only when the underlying service
+    // reference changes (connect/disconnect cycle).
+    @Volatile private var gmForService: AccessibilityService? = null
+    @Volatile private var gmCache: GestureManager? = null
+
+    private fun gestureManager(svc: AccessibilityService): GestureManager {
+        val cached = gmCache
+        if (cached != null && gmForService === svc) return cached
+        val gm = GestureManager(svc, policy = AccessibilityRetryPolicy.Default)
+        gmForService = svc
+        gmCache = gm
+        return gm
+    }
+
     /**
      * Capture a flat text snapshot of the current accessibility tree.
      *
@@ -71,10 +88,9 @@ class AccessibilityExecutor @Inject constructor(
             metrics.recordSnapshot(0)
             return "(accessibility service not connected)"
         }
-        if (s !is AccessibilityService) {
-            metrics.recordSnapshot(0)
-            return "(accessibility service not connected)"
-        }
+        // S-L5: removed the redundant `s !is AccessibilityService` check —
+        // svc() already returns AccessibilityService?, so a non-null s is
+        // guaranteed to be an AccessibilityService. The check was dead code.
         val start = System.currentTimeMillis()
         val result = snapshotWithRootRecovery(s)
         metrics.recordSnapshot(System.currentTimeMillis() - start)
@@ -95,7 +111,10 @@ class AccessibilityExecutor @Inject constructor(
                 }
             }
             diagnostics.recordNullRoot()
-            delay(50L)
+            // S-M6: honor the retry policy's backoff schedule instead of a
+            // flat 50ms — matches GestureManager's behavior and lets the
+            // root recover from a transient null (common mid-animation).
+            delay(policy.delayForAttempt(attempt))
         }
         diagnostics.recordRootRecovery()
         return "(empty tree — root null after ${policy.maxAttempts} retries)"
@@ -117,7 +136,10 @@ class AccessibilityExecutor @Inject constructor(
         return when (action) {
             is DeviceAction.Tap -> {
                 val start = System.currentTimeMillis()
-                val gm = GestureManager(svc, policy = AccessibilityRetryPolicy.Default)
+                // S-L4: reuse the cached GestureManager instead of building a
+                // fresh one per dispatch — otherwise the per-instance gesture
+                // stats reset to zero on every tap/swipe.
+                val gm = gestureManager(svc)
                 val ok = gm.tap(action.x, action.y)
                 metrics.recordTap(System.currentTimeMillis() - start, ok)
                 if (ok) waitForStabilization()
@@ -125,7 +147,7 @@ class AccessibilityExecutor @Inject constructor(
             }
             is DeviceAction.Swipe -> {
                 val start = System.currentTimeMillis()
-                val gm = GestureManager(svc, policy = AccessibilityRetryPolicy.Default)
+                val gm = gestureManager(svc)
                 val ok = gm.swipe(action.x1, action.y1, action.x2, action.y2)
                 metrics.recordSwipe(System.currentTimeMillis() - start, ok)
                 if (ok) waitForStabilization()
@@ -211,13 +233,19 @@ class AccessibilityExecutor @Inject constructor(
                 svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             }.getOrDefault(false)
             if (ok) {
-                if (state.isDialogVisible) {
-                    diagnostics.recordDialogDismissal()
-                    windowTracker.clearDialog()
-                }
+                // S-H7: a single BACK press almost always dismisses only the
+                // topmost layer (keyboard first, then dialog underneath).
+                // Clearing both flags here desyncs the tracker from reality —
+                // the next snapshot would still see the dialog and re-trigger
+                // dismissal. Clear only the topmost layer; if both are visible
+                // the next dispatch() call will handle the dialog.
                 if (state.isKeyboardVisible) {
                     diagnostics.recordKeyboardDismissal()
                     windowTracker.clearKeyboard()
+                    // Don't clear dialog — it may still be visible underneath.
+                } else if (state.isDialogVisible) {
+                    diagnostics.recordDialogDismissal()
+                    windowTracker.clearDialog()
                 }
             }
         }
@@ -255,7 +283,8 @@ class AccessibilityExecutor @Inject constructor(
      * next snapshot from capturing a mid-animation state.
      */
     private suspend fun waitForStabilization() {
-        val cap = 600L
+        // S-M5: cap at 1500ms to match the docstring above (was 600ms).
+        val cap = 1500L
         val start = System.currentTimeMillis()
         var prev = quickFingerprint()
         delay(50)
@@ -439,9 +468,14 @@ class AccessibilityExecutor @Inject constructor(
             sb.append(" bounds=[${rect.left},${rect.top},${rect.right},${rect.bottom}]")
         }
         sb.appendLine()
+        // S-M8: cap the number of children expanded per node to prevent
+        // pathological trees (e.g. a RecyclerView with 10k items) from
+        // blowing up the snapshot. Matches OmniAccessibilityService's caps.
+        val childCap = if (depth < 10) 200 else if (depth < 20) 100 else 50
         val childCount = runCatching { node.childCount }.getOrDefault(0)
-        val children = ArrayList<AccessibilityNodeInfo>(childCount)
-        for (i in 0 until childCount) {
+        val limit = minOf(childCount, childCap)
+        val children = ArrayList<AccessibilityNodeInfo>(limit)
+        for (i in 0 until limit) {
             runCatching { node.getChild(i) }.getOrNull()?.let { children.add(it) }
         }
         children.forEach { appendNode(sb, it, depth + 1) }

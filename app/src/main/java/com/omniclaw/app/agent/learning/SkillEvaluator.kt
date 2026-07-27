@@ -25,8 +25,13 @@ class SkillEvaluator @Inject constructor(
 ) {
     data class LessonQualityScore(
         val accuracy: Float,      // % of times lesson was applied correctly
-        val relevance: Float,     // % of times lesson was relevant to screen
-        val successRate: Float,   // % of sessions improved after applying lesson
+        // A-L8 FIX: `relevance` and `successRate` are now nullable (were
+        // hardcoded placeholder Floats 0.8f / 0.7f). The placeholders lied to
+        // consumers — the engine doesn't actually track these metrics yet, so
+        // UIs displayed "80% relevant / 70% success" for every lesson. null
+        // lets consumers render "—" for unknown values instead of fake data.
+        val relevance: Float?,
+        val successRate: Float?,
         val totalApplications: Int,
         val successfulApplications: Int,
     )
@@ -43,17 +48,23 @@ class SkillEvaluator @Inject constructor(
         if (applications == 0) {
             return@withContext LessonQualityScore(
                 accuracy = 0f,
-                relevance = 0f,
-                successRate = 0f,
+                relevance = null,
+                successRate = null,
                 totalApplications = 0,
                 successfulApplications = 0,
             )
         }
         
         LessonQualityScore(
-            accuracy = successes.toFloat() / applications,
-            relevance = 0.8f, // Placeholder - would need more complex tracking
-            successRate = 0.7f, // Placeholder - would need session comparison
+            // A-L9 FIX: clamp accuracy to [0, 1]. With per-lesson counters
+            // updated from multiple call sites (recordDirectLesson,
+            // reflectOnEpisode, trackImprovementMetrics) the success count
+            // could exceed the application count via a race or a retroactive
+            // application increment, yielding accuracy > 1.0 (e.g. 1.25) —
+            // which broke UIs that rendered the value as "125%".
+            accuracy = (successes.toFloat() / applications).coerceIn(0f, 1f),
+            relevance = null,   // A-L8: not tracked yet — surface as unknown.
+            successRate = null, // A-L8: not tracked yet — surface as unknown.
             totalApplications = applications,
             successfulApplications = successes,
         )

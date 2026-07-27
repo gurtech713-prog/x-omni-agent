@@ -158,19 +158,25 @@ class BehaviorRecorder @Inject constructor(
         val s = name.trim()
         return when {
             s.startsWith("tap", ignoreCase = true) -> {
+                // S-M1: return null on regex mismatch instead of dispatching
+                // a tap(0,0) — a tap at the origin is a real gesture that
+                // would land on whatever happens to be in the top-left corner.
                 val m = Regex("(?i)tap\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)").find(s)
-                val x = m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-                val y = m?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0
+                    ?: return null
+                val x = m.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+                val y = m.groupValues.getOrNull(2)?.toIntOrNull() ?: return null
                 com.omniclaw.app.agent.tools.DeviceAction.Tap(x, y)
             }
             s.startsWith("swipe", ignoreCase = true) -> {
+                // S-M1: same rationale as tap — don't synthesize a swipe from
+                // (0,0) to (0,0); that's a no-op swipe at the origin.
                 val m = Regex("(?i)swipe\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)").find(s)
-                com.omniclaw.app.agent.tools.DeviceAction.Swipe(
-                    m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(3)?.toIntOrNull() ?: 0,
-                    m?.groupValues?.getOrNull(4)?.toIntOrNull() ?: 0,
-                )
+                    ?: return null
+                val x1 = m.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+                val y1 = m.groupValues.getOrNull(2)?.toIntOrNull() ?: return null
+                val x2 = m.groupValues.getOrNull(3)?.toIntOrNull() ?: return null
+                val y2 = m.groupValues.getOrNull(4)?.toIntOrNull() ?: return null
+                com.omniclaw.app.agent.tools.DeviceAction.Swipe(x1, y1, x2, y2)
             }
             s.startsWith("type", ignoreCase = true) -> {
                 // FIX #11: Use lazy/non-greedy quantifier with explicit closing quote.

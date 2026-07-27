@@ -1,6 +1,7 @@
 package com.omniclaw.app.data.backup
 
 import android.content.Context
+import android.util.Log
 import com.omniclaw.app.data.local.AppDatabase
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -33,28 +34,37 @@ class DatabaseBackupManager @Inject constructor(
     @ApplicationContext private val ctx: Context,
     private val db: AppDatabase,
 ) {
+
+    companion object {
+        private const val TAG = "DatabaseBackupManager"
+        private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
+        private const val PBKDF2_ITERATIONS = 65536
+        private const val KEY_BITS = 256
+        private const val GCM_TAG_BITS = 128
+        private const val SALT_BYTES = 16
+        private const val IV_BYTES = 12
+    }
+
     /**
      * Export database to an encrypted backup file.
      *
      * The backup is encrypted with AES-GCM using a key derived from the
      * user-supplied [passphrase] via PBKDF2 (see [deriveKey]).
+     *
+     * D-H7: the entire checkpoint + copy is wrapped in `db.runInTransaction { }`
+     * so Room's write lock is held for the duration of the copy. This prevents
+     * the agent loop (or any other writer) from committing new rows into the
+     * main DB / WAL file mid-copy, which would previously produce a backup
+     * that was internally inconsistent (some rows from before the copy started,
+     * some from after). Trade-off: there is a brief write stall for the duration
+     * of the copy (typically <1s for a few-MB DB) — UI reads continue to work
+     * because Room's WAL allows concurrent readers.
      */
     suspend fun exportDatabase(passphrase: String): File? = withContext(Dispatchers.IO) {
         try {
             val dbFile = File(ctx.getDatabasePath("omniclaw.db").path)
             if (!dbFile.exists()) return@withContext null
-
-            // The DB runs in WAL mode, so recent writes may still live in the
-            // sidecar `omniclaw.db-wal` file. Checkpoint (TRUNCATE) flushes the WAL
-            // into the main file so a single-file copy is a complete, consistent
-            // snapshot. Run the checkpoint through Room's own open helper (rather
-            // than a separate SQLiteDatabase handle) so it is coordinated with
-            // Room's writer and can't race with an in-flight Room write that would
-            // otherwise tear the copy. Best-effort: if the checkpoint fails we still
-            // copy the main file rather than aborting the backup.
-            runCatching {
-                db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE);").close()
-            }
 
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val backupDir = File(ctx.getExternalFilesDir(null), "backups").apply { mkdirs() }
@@ -69,17 +79,38 @@ class DatabaseBackupManager @Inject constructor(
             val cipher = Cipher.getInstance(CIPHER_TRANSFORMATION).apply {
                 init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
             }
-            FileOutputStream(backupFile).use { fos ->
-                fos.write(salt)
-                fos.write(iv)
-                CipherOutputStream(fos, cipher).use { cos ->
-                    dbFile.inputStream().use { input -> input.copyTo(cos) }
+
+            // D-H7: hold Room's write lock for the duration of the checkpoint +
+            // copy so concurrent writes can't tear the snapshot. Reads still
+            // proceed via WAL.
+            db.runInTransaction {
+                // The DB runs in WAL mode, so recent writes may still live in the
+                // sidecar `omniclaw.db-wal` file. Checkpoint (TRUNCATE) flushes the
+                // WAL into the main file so a single-file copy is a complete,
+                // consistent snapshot. Run the checkpoint through Room's own open
+                // helper (rather than a separate SQLiteDatabase handle) so it is
+                // coordinated with Room's writer. Best-effort: if the checkpoint
+                // fails we still copy the main file rather than aborting the backup.
+                runCatching {
+                    db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE);").close()
+                }
+                FileOutputStream(backupFile).use { fos ->
+                    fos.write(salt)
+                    fos.write(iv)
+                    CipherOutputStream(fos, cipher).use { cos ->
+                        dbFile.inputStream().use { input -> input.copyTo(cos) }
+                    }
                 }
             }
 
             backupFile
         } catch (e: Exception) {
-            e.printStackTrace()
+            // D-L2: use Log.e (not printStackTrace) so the failure surfaces in
+            // Logcat with a proper tag + stacktrace, and is captured by crash
+            // reporters. printStackTrace() writes to stderr which is lost on
+            // Android (no stderr in a normal app process) and never reaches
+            // Logcat.
+            Log.e(TAG, "exportDatabase failed", e)
             null
         }
     }
@@ -111,15 +142,5 @@ class DatabaseBackupManager @Inject constructor(
             "Refusing to delete a file outside the backups directory: ${file.path}"
         }
         return runCatching { target.delete() }.getOrDefault(false)
-    }
-
-    companion object {
-        private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
-        private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
-        private const val PBKDF2_ITERATIONS = 65536
-        private const val KEY_BITS = 256
-        private const val GCM_TAG_BITS = 128
-        private const val SALT_BYTES = 16
-        private const val IV_BYTES = 12
     }
 }

@@ -15,8 +15,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okio.ByteString.Companion.toByteString
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -151,7 +153,7 @@ class StreamingSttClient @Inject constructor(
             .replaceFirst("https://", "wss://")
             .replace("/audio/transcriptions", "/audio/transcriptions/stream")
 
-        val partials = MutableSharedFlow<String>(extraBufferCapacity = 64)
+        val partials = MutableSharedFlow<String>(extraBufferCapacity = 256)
         // Thread-safe close/failure signalling between OkHttp's dispatcher
         // thread and this channelFlow coroutine. A plain `var closed` polled in
         // a loop could be cached in a register by the JIT and never re-read,
@@ -170,7 +172,14 @@ class StreamingSttClient @Inject constructor(
                     json.parseToJsonElement(text).jsonObject["text"]?.jsonPrimitive?.contentOrNull
                 }.getOrNull()
                 if (partial != null) {
-                    runCatching { partials.tryEmit(partial) }
+                    // V-M13: log drops so a saturated upstream is visible in
+                    // Logcat instead of vanishing silently. The buffer was
+                    // bumped from 64 → 256 to reduce the drop probability under
+                    // fast partial streams; tryEmit is used because we're in a
+                    // non-suspending OkHttp callback.
+                    if (!partials.tryEmit(partial)) {
+                        Log.w(TAG, "STT partial dropped due to buffer overflow")
+                    }
                 }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -184,48 +193,66 @@ class StreamingSttClient @Inject constructor(
             }
         })
 
-        // Upload the audio file in 16 KB binary frames. Many streaming STT
-        // endpoints (and proxies like nginx) enforce a ~1 MB max frame size and
-        // close the connection with code 1009 if a multi-MB frame is sent in a
-        // single shot (L-04). A small delay between frames keeps the sender from
-        // outrunning the network; EOF is signalled by ws.close(1000, "EOF").
-        val bytes = runCatching { audioFile.readBytes() }.getOrNull()
-        if (bytes == null) {
-            send(SttResult.UnknownFailure("Could not read audio file"))
-            ws.cancel()
-            return@channelFlow
-        }
-        val chunkSize = 16 * 1024
-        var offset = 0
-        while (offset < bytes.size) {
-            val end = minOf(offset + chunkSize, bytes.size)
-            ws.send(bytes.toByteString(offset, end - offset))
-            offset = end
-            kotlinx.coroutines.delay(10)
-        }
-        ws.close(1000, "EOF")
-
-        // Collect partials until the socket closes.
-        val transcript = StringBuilder()
-        kotlinx.coroutines.coroutineScope {
-            val collectJob = launch {
-                partials.collect { partial ->
-                    transcript.append(partial)
-                    send(SttResult.Segment(partial, 0L, 0L))
+        // V-H3: ensure the WebSocket is always cancelled on flow cancellation
+        // (e.g. collector scope disposed mid-upload) — without this, an
+        // abandoned stream leaks an open socket on OkHttp's dispatcher.
+        try {
+            // V-H4: stream the file in 16 KB frames instead of loading the
+            // entire audio file into memory via readBytes(). Many streaming STT
+            // endpoints (and proxies like nginx) enforce a ~1 MB max frame size
+            // and close the connection with code 1009 if a multi-MB frame is
+            // sent in a single shot (L-04). EOF is signalled by ws.close(1000, "EOF").
+            audioFile.inputStream().use { input ->
+                val chunk = ByteArray(16 * 1024)
+                while (true) {
+                    val read = input.read(chunk)
+                    if (read <= 0) break
+                    // V-L10: adaptive delay — only back off when OkHttp's send
+                    // queue is full (returns false). When the queue has room,
+                    // skip the delay so a fast network doesn't pay an artificial
+                    // 10ms-per-chunk tax (a 5MB file would otherwise take ~3s
+                    // of pure sleep to upload).
+                    if (ws.send(chunk.toByteString(0, read))) {
+                        // queued immediately — no delay
+                    } else {
+                        delay(10)
+                    }
                 }
             }
-            // Suspend on the close signal from onClosed/onFailure instead of
-            // polling a plain flag (H-16). await() is cancellation-aware, so a
-            // cancelled collector still unwinds cleanly.
-            closedSignal.await()
-            collectJob.cancel()
-        }
+            ws.close(1000, "EOF")
 
-        failure.get()?.let {
-            send(SttResult.NetworkFailure(it.message ?: "WebSocket STT failed"))
-            return@channelFlow
+            // Collect partials until the socket closes.
+            val transcript = StringBuilder()
+            kotlinx.coroutines.coroutineScope {
+                val collectJob = launch {
+                    partials.collect { partial ->
+                        transcript.append(partial)
+                        send(SttResult.Segment(partial, 0L, 0L))
+                    }
+                }
+                // Suspend on the close signal from onClosed/onFailure instead of
+                // polling a plain flag (H-16). await() is cancellation-aware, so a
+                // cancelled collector still unwinds cleanly.
+                // V-H5: overall timeout — a stuck WebSocket (e.g. server accepts
+                // the upload but never sends onClosed) must not wedge this flow
+                // forever. Emit a Timeout result and complete.
+                withTimeoutOrNull(60_000) { closedSignal.await() }
+                    ?: run {
+                        collectJob.cancel()
+                        send(SttResult.Timeout("Streaming STT timed out after 60s"))
+                        return@coroutineScope
+                    }
+                collectJob.cancel()
+            }
+
+            failure.get()?.let {
+                send(SttResult.NetworkFailure(it.message ?: "WebSocket STT failed"))
+                return@channelFlow
+            }
+            send(SttResult.Success(text = transcript.toString().trim()))
+        } finally {
+            runCatching { ws.cancel() }
         }
-        send(SttResult.Success(text = transcript.toString().trim()))
     }.flowOn(Dispatchers.IO)
 
     /**
@@ -259,7 +286,7 @@ class StreamingSttClient @Inject constructor(
         language: String?,
     ): String {
         val bodyBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody("audio/mp4".toMediaType()))
+            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody(audioMimeType(audioFile).toMediaType()))
             .addFormDataPart("model", model)
             .apply { if (language != null) addFormDataPart("language", language) }
             .build()
@@ -312,6 +339,18 @@ class StreamingSttClient @Inject constructor(
             base.endsWith("/audio/transcriptions/", ignoreCase = true) -> base.trimEnd('/')
             else -> "$base/audio/transcriptions"
         }
+    }
+
+    // V-M18: infer the multipart MIME from the file extension instead of
+    // hardcoding "audio/mp4". Some providers (notably Whisper) reject a
+    // declared audio/mp4 for an actual .wav upload with HTTP 400.
+    private fun audioMimeType(file: File): String = when (file.extension.lowercase()) {
+        "m4a", "mp4" -> "audio/mp4"
+        "wav" -> "audio/wav"
+        "ogg" -> "audio/ogg"
+        "flac" -> "audio/flac"
+        "mp3" -> "audio/mpeg"
+        else -> "application/octet-stream"
     }
 
     /** HTTP exception carrying the status code + truncated body. */

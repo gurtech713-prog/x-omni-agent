@@ -163,6 +163,15 @@ class ScreenCaptureService : Service() {
                 imageReader?.surface,
                 null, mainHandler,
             )
+            // S-M9: createVirtualDisplay can return null on permission denial
+            // or surface-format mismatch — without this guard we'd log "Screen
+            // capture started" and silently produce no frames.
+            if (virtualDisplay == null) {
+                Log.w(TAG, "createVirtualDisplay returned null — stopping service")
+                if (instance === this) instance = null
+                stopSelf()
+                return
+            }
             Log.i(TAG, "Screen capture started: ${width}x${height}")
         } catch (e: Exception) {
             Log.w(TAG, "startCapture failed: ${e.message}")

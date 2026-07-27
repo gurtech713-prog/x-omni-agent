@@ -89,7 +89,12 @@ class HaloOverlayService : Service() {
                 startForeground(NOTIF_ID, notif)
             }
         }.onFailure { e ->
-            Log.e(TAG, "Failed to promote HaloOverlayService to foreground: ${'$'}{e.message}", e)
+            Log.e(TAG, "Failed to promote HaloOverlayService to foreground: ${e.message}", e)
+            // S-H3: don't continue onCreate if foreground promotion failed —
+            // the system would kill us within the 5s ANR window. Bail out so
+            // we don't attach the overlay view to a service about to die.
+            stopSelf()
+            return
         }
         halo = HaloView(this).also { it.attach() }
         // Subscribe to agent events to drive the halo state.
@@ -113,7 +118,7 @@ class HaloOverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Display any status text pushed via ServiceGateway.showHaloStatus (audit M-44).
+        // Display any status text pushed via HaloOverlayService.showStatus.
         val status = intent?.getStringExtra(EXTRA_STATUS)
         if (!status.isNullOrEmpty()) {
             halo?.showStatus(status)
@@ -313,7 +318,7 @@ class HaloOverlayService : Service() {
             }
         }
 
-        /** Display a dynamic status line pushed via ServiceGateway.showHaloStatus (audit M-44). */
+        /** Display a dynamic status line pushed via [showStatus]. */
         fun showStatus(text: String) {
             setState(HaloState.RUNNING, "AGENT", text)
             subtitleText?.text = text

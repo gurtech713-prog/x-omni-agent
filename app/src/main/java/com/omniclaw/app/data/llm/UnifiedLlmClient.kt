@@ -71,9 +71,12 @@ class UnifiedLlmClient @Inject constructor(
             // Model format: "local-<family>:<path>"
             //   family = tokenizer to use (gemma, tinyllama, etc.)
             //   path   = LiteRT model file (assets:// or absolute)
+            //
+            // D-L5: temperature is not forwarded — LocalLlmClient uses greedy
+            // decode and does not yet sample. See LocalLlmClient.complete KDoc.
             val (family, path) = parseLocalModelSpec(model)
             try {
-                local.complete(path, family, messages, temperature, maxTokens)
+                local.complete(path, family, messages, maxTokens)
             } catch (e: LiteRtException) {
                 Log.w(TAG, "LiteRT failed, no fallback configured: ${e.message}")
                 throw e
@@ -107,9 +110,12 @@ class UnifiedLlmClient @Inject constructor(
             // Streaming not yet exposed — return a single-element flow with
             // the full completion. Callers that want token-by-token should
             // call LocalLlmClient directly.
+            //
+            // D-L5: temperature is not forwarded — LocalLlmClient uses greedy
+            // decode and does not yet sample.
             kotlinx.coroutines.flow.flow {
                 val (family, path) = parseLocalModelSpec(model)
-                val result = local.complete(path, family, messages, temperature, maxTokens)
+                val result = local.complete(path, family, messages, maxTokens)
                 emit(result.text)
             }
         }

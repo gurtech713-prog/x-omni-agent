@@ -37,10 +37,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -51,6 +53,28 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
+
+/**
+ * [runCatching] that re-throws [CancellationException] instead of swallowing it.
+ *
+ * Standard `runCatching { ... }` catches every [Throwable] including
+ * [CancellationException], which breaks structured concurrency: a cancelled
+ * coroutine (user-requested stop, session supersession, parent scope timeout)
+ * gets converted into a `Result.failure` and the cancellation never propagates
+ * to the parent scope. This helper restores the contract by re-throwing
+ * CancellationException and only catching other throwables.
+ *
+ * Duplicated (top-level, file-private) in each layer that needs it because the
+ * shared `core/` package is owned by a different fix subagent; duplicating the
+ * one-liner keeps file-boundary scopes clean.
+ */
+private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
 
 /**
  * Observation -> Reasoning -> Execution loop.
@@ -70,6 +94,26 @@ import javax.inject.Singleton
  * action signatures. Failures converge — the LLM is shown the failure and
  * asked to retry with a different plan.
  */
+
+/**
+ * Marker [CancellationException] used by [AgentLoop.start] to cancel a running
+ * [AgentLoop.runLoop] when a new run is taking over the same session.
+ *
+ * The [runLoop] catch block checks `if (e is SupersessionCancellation)` to
+ * distinguish supersession from user-initiated stop:
+ *   - **Supersession**: the new runLoop owns the session — don't touch status,
+ *     don't emit `Event.Stopped`, don't run reflection. Exit silently.
+ *   - **User stop** (plain `CancellationException`): emit `Stopped`, set
+ *     `SessionStatus.STOPPED`, finish the episode, run reflection.
+ *
+ * Without this distinction, a second `send()` while the first turn is still
+ * streaming would clobber the session status to `STOPPED`, and the new
+ * runLoop's `isStopRequested()` check would return `true` on its first
+ * iteration — silently dropping the user's new prompt.
+ */
+private class SupersessionCancellation(sessionId: String) :
+    CancellationException("Superseded by a new run for session $sessionId")
+
 @Singleton
 class AgentLoop @Inject constructor(
     @ApplicationContext private val ctx: Context,
@@ -210,11 +254,24 @@ class AgentLoop @Inject constructor(
             // SINGLE critical section — splitting it across two withLock blocks
             // allowed two rapid start() calls to both launch a runLoop before
             // either registered, spawning two concurrent loops for one session.
+            //
+            // CHAT-FLOW FIX (supersession vs user-stop):
+            // Use a typed SupersessionCancellation marker so the catch block in
+            // runLoop can distinguish "I'm being cancelled because a new run is
+            // taking over this session" from "the user clicked Stop". Previously
+            // both used a plain CancellationException, so the catch block
+            // unconditionally set status=STOPPED — which then made the new
+            // runLoop's isStopRequested() check return true on its very first
+            // iteration, silently dropping the user's new prompt.
             startMutex.withLock {
                 runningJobs[session.id]?.let { existing ->
-                    existing.cancel(CancellationException("Superseded by a new run for session ${session.id}"))
-                    runCatching { existing.join() }
+                    existing.cancel(SupersessionCancellation(session.id))
+                    runCatchingCancellable { existing.join() }
                 }
+                // Defensive: re-assert RUNNING after the join, in case the
+                // superseded run's catch block raced and set STOPPED before we
+                // got here. The new run owns the session now.
+                sessions.setStatus(session.id, SessionStatus.RUNNING)
                 val job = scope.launch { runLoop(session.id, prompt) }
                 runningJobs[session.id] = job
             }
@@ -228,7 +285,7 @@ class AgentLoop @Inject constructor(
         // waiting for readTimeout (120s).
         val job = runningJobs[sessionId]
         job?.cancel(CancellationException("User requested stop for session $sessionId"))
-        if (job != null) runCatching { job.join() }
+        if (job != null) runCatchingCancellable { job.join() }
         sessions.stop(sessionId)
         verifier.reset(sessionId)
         _events.tryEmit(Event.Stopped(sessionId))
@@ -258,13 +315,35 @@ class AgentLoop @Inject constructor(
                 }
                 _events.tryEmit(Event.Failed(sessionId, warn))
                 sessions.setStatus(sessionId, SessionStatus.FAILED)
+                // A-C1 FIX: Mirror the cancellation + exception branches so the
+                // episode is marked FAILED and the post-session learning pipeline
+                // (reflection + auto-skill) still runs. Previously the session
+                // timeout branch only emitted Failed + set status, leaving the
+                // episode in RUNNING state and skipping reflection entirely —
+                // so a timed-out session was never learned from.
+                episodeRecorder.finish(sessionId, "FAILED")
+                scope.launch { runCatchingCancellable { learning.runPostSessionPipeline(sessionId) } }
             }
         } catch (e: CancellationException) {
-            // Cooperative cancellation — user requested stop or session was superseded.
-            _events.tryEmit(Event.Stopped(sessionId))
-            sessions.setStatus(sessionId, SessionStatus.STOPPED)
-            episodeRecorder.finish(sessionId, "STOPPED")
-            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
+            // CHAT-FLOW FIX: distinguish supersession from user-stop.
+            //
+            // SupersessionCancellation means a NEW runLoop is taking over this
+            // session — we must NOT touch the session status (the new runLoop
+            // already re-asserted RUNNING in start()) and must NOT emit
+            // Event.Stopped (the new runLoop will emit its own events). The
+            // superseded run simply exits silently so the new run can proceed
+            // without its prompt being dropped by a stale STOPPED flag.
+            //
+            // Any other CancellationException is a user-initiated stop — emit
+            // Stopped, set status, finish the episode, run reflection.
+            if (e is SupersessionCancellation) {
+                Log.i(TAG, "Session $sessionId superseded by a new run — exiting silently")
+            } else {
+                _events.tryEmit(Event.Stopped(sessionId))
+                sessions.setStatus(sessionId, SessionStatus.STOPPED)
+                episodeRecorder.finish(sessionId, "STOPPED")
+                scope.launch { runCatchingCancellable { learning.runPostSessionPipeline(sessionId) } }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Agent loop crashed: ${e.message}", e)
             scope.launch {
@@ -281,7 +360,7 @@ class AgentLoop @Inject constructor(
             _events.tryEmit(Event.Failed(sessionId, e.message ?: "Crash"))
             sessions.setStatus(sessionId, SessionStatus.FAILED)
             episodeRecorder.finish(sessionId, "FAILED")
-            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
+            scope.launch { runCatchingCancellable { learning.runPostSessionPipeline(sessionId) } }
         } finally {
             // Decrement active session count; stop the foreground service + Halo
             // when no sessions are running anymore.
@@ -317,7 +396,7 @@ class AgentLoop @Inject constructor(
             clearHistoryCache(sessionId)
             learning.clearLessonCache(sessionId)
             episodeRecorder.finish(sessionId, "DONE")
-            scope.launch { runCatching { learning.runPostSessionPipeline(sessionId) } }
+            scope.launch { runCatchingCancellable { learning.runPostSessionPipeline(sessionId) } }
             return
         }
 
@@ -388,15 +467,33 @@ class AgentLoop @Inject constructor(
             val history = buildHistory(sessionId)
 
             // ---- Dual-track observation: structured tree preferred, vision fallback ----
-            var observation = scheduler.snapshot()
+            // # STRATEGY CHANGE: No screenshots during pure chat.
+            //
+            // On step 1, classify the user's prompt: if it looks conversational
+            // (question, explanation, drafting, greeting, etc.), SKIP the entire
+            // observation pipeline — no accessibility snapshot, no MediaProjection
+            // frame pull, no screenshot, no VLM call. The LLM doesn't need any
+            // screen context to answer "What is the capital of France?"
+            //
+            // On step ≥ 2 (i.e. the LLM has emitted a non-`done` ACTION and we're
+            // now mid-automation), we DO observe — but only via the cheap
+            // accessibility tree snapshot, and only fall back to screenshot+VLM
+            // if the tree is empty/sparse AND a VLM key is configured.
+            //
+            // This eliminates the privacy-invasive screenshot-then-VLM cycle
+            // that previously fired on EVERY chat message whenever the
+            // accessibility service wasn't connected.
+            val isLikelyChatOnly = step == 1 && promptLooksConversational(prompt)
+            var observation = if (isLikelyChatOnly) "" else scheduler.snapshot()
             var usedVision = false
             // Heuristic: if the tree is empty / very short / looks unparseable, ask the VLM (if VLM API key is configured).
-            if (cfg.vlmApiKey.isNotBlank() && (observation.isBlank() || observation.length < 80 || observation.contains("accessibility service not connected", ignoreCase = true))) {
+            // SKIPPED entirely for chat-only turns — no screenshot, no VLM call.
+            if (!isLikelyChatOnly && cfg.vlmApiKey.isNotBlank() && (observation.isBlank() || observation.length < 80 || observation.contains("accessibility service not connected", ignoreCase = true))) {
                 // Prefer the continuous MediaProjection stream if available, else fall back to one-shot screenshot.
                 var png: ByteArray? = ScreenCaptureService.latestFrameBytes()
                 if (png == null || png.isEmpty()) png = scheduler.screenshot()
                 if (png != null && png.isNotEmpty()) {
-                    val vlmAnswer = runCatching {
+                    val vlmAnswer = runCatchingCancellable {
                         vlm.describe(png, "Describe the current screen. List interactive elements with their approximate tap coordinates (x, y). Be concise.")
                     }.getOrNull()
                     if (!vlmAnswer.isNullOrBlank()) {
@@ -405,6 +502,8 @@ class AgentLoop @Inject constructor(
                         Log.i(TAG, "Session $sessionId step $step: used vision fallback (${png.size} bytes)")
                     }
                 }
+            } else if (isLikelyChatOnly) {
+                Log.i(TAG, "Session $sessionId step $step: conversational prompt detected — skipping screenshot & VLM probe")
             }
             // ---- Hermes-style planning: create a plan on the first step ----
             if (step == 1 && tuning.enablePlanner && plan == null) {
@@ -432,7 +531,12 @@ class AgentLoop @Inject constructor(
                 // comes from a VALIDATED JSON object (no regex, no silent tap(0,0)), and
                 // usage uses the provider's REAL token counts.
                 if (tuning.useStructuredTools) {
-                    runCatching {
+                    // A-H4 FIX: use runCatchingCancellable so a session-level
+                    // CancellationException (timeout / user-stop / supersession)
+                    // propagates instead of being swallowed into Result.failure
+                    // — otherwise the session-timeout would never reach the outer
+                    // withTimeoutOrNull (see A-C2).
+                    runCatchingCancellable {
                         withTimeout(stepTimeoutMs) {
                             llm.complete(
                                 provider = cfg.provider,
@@ -470,7 +574,16 @@ class AgentLoop @Inject constructor(
                 // hung connection) from blocking the session for 10+ minutes.
                 // Cancellation propagates to the underlying OkHttp call via
                 // suspendCancellableCoroutine (see LlmClient.stream).
-                if (streamedThought == null) runCatching {
+                //
+                // CHAT-FLOW FIX (Bug 8): track the partial-stream text so that
+                // if streaming fails mid-generation, we can either keep the
+                // partial text (preferred — it's what the user was reading) or
+                // emit a clearing Thought before the non-streaming fallback
+                // produces different text. Without this, the streaming bubble
+                // would suddenly vanish and be replaced by entirely different
+                // text from the fallback call, disorienting the user.
+                var partialStreamText: String? = null
+                if (streamedThought == null) runCatchingCancellable {
                     withTimeout(stepTimeoutMs) {
                         val thoughtBuilder = StringBuilder()
                         var lastEmitMs = 0L
@@ -484,6 +597,7 @@ class AgentLoop @Inject constructor(
                             maxTokens = cfg.maxTokens,
                         ).collect { delta ->
                             thoughtBuilder.append(delta)
+                            partialStreamText = thoughtBuilder.toString()
                             val now = System.currentTimeMillis()
                             if (now - lastEmitMs >= 50L || thoughtBuilder.length < 15) {
                                 lastEmitMs = now
@@ -492,9 +606,26 @@ class AgentLoop @Inject constructor(
                         }
                         if (thoughtBuilder.isNotEmpty()) {
                             streamedThought = thoughtBuilder.toString()
-                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!))
+                            // CHAT-FLOW FIX: emit isFinal=true so the UI knows
+                            // streaming is done and TTS can fire ONCE on the
+                            // final text (not on every intermediate token).
+                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
                         }
                     }
+                }
+                // CHAT-FLOW FIX (Bug 8): if streaming failed but produced
+                // partial text, prefer the partial over the non-streaming
+                // fallback. The user was reading the partial; replacing it
+                // with entirely different text from a fresh LLM call is
+                // disorienting and discards the user's reading progress.
+                // Only fall back to non-streaming if we got NOTHING from stream.
+                if (streamedThought == null && partialStreamText != null && partialStreamText!!.length >= 20) {
+                    streamedThought = partialStreamText
+                    // Emit a final Thought so the streaming bubble commits
+                    // to the partial text (the uiMessages combine will stop
+                    // showing it as a streaming bubble once isFinal=true).
+                    _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                    Log.w(TAG, "Session $sessionId step $step: stream failed mid-generation, keeping partial text (${partialStreamText!!.length} chars)")
                 }
 
                 if (streamedThought != null) {
@@ -544,7 +675,25 @@ class AgentLoop @Inject constructor(
                     usage = result.usage
                 }
             } catch (e: CancellationException) {
-                if (e is kotlinx.coroutines.TimeoutCancellationException) {
+                // A-C2 FIX: distinguish a step-level timeout (from the inner
+                // `withTimeout(stepTimeoutMs)` — the current coroutine is still
+                // active, only the inner child was cancelled) from a session-
+                // level timeout (from the outer `withTimeoutOrNull(sessionTimeoutMs)`
+                // — the current coroutine is also cancelled, so isActive is false).
+                //
+                // Both throw TimeoutCancellationException because the outer
+                // withTimeoutOrNull propagates its TimeoutCancellationException
+                // down to children via parentCancelled → cancel(parent.exception).
+                // Without this distinction, the session-level timeout was caught
+                // here, treated as a step-level timeout, and `return`-ed — which
+                // made runLoopInner return normally to withTimeoutOrNull, so
+                // `completedNormally` became `true` and the timed-out session was
+                // mis-classified as successful. Re-throwing propagates the
+                // session-level timeout up to withTimeoutOrNull, which converts
+                // it to `null` → `completedNormally = false` → FAILED branch.
+                if (e is kotlinx.coroutines.TimeoutCancellationException &&
+                    currentCoroutineContext().isActive
+                ) {
                     val errMsg = "Request timed out after ${stepTimeoutMs / 1000}s. The AI provider did not respond in time."
                     logger.logError(
                         AgentLogger.ErrorLocation(
@@ -571,6 +720,10 @@ class AgentLoop @Inject constructor(
                     triggerReflection(sessionId, "FAILED")
                     return
                 } else {
+                    // Session-level cancellation (withTimeoutOrNull timeout, user
+                    // stop, or session supersession) — propagate to the outer
+                    // withTimeoutOrNull so it can convert to `null` and run the
+                    // FAILED / STOPPED branch.
                     throw e
                 }
             } catch (e: Exception) {
@@ -649,6 +802,21 @@ class AgentLoop @Inject constructor(
             // unlimited API credits on verbose models (Claude Opus, etc.).
             if (sessionTokens >= maxSessionTokens) {
                 val msg = "Token budget exceeded ($sessionTokens / $maxSessionTokens). Stopping to limit cost."
+                // CHAT-FLOW FIX (Bug 9): persist a SYSTEM note so the user can
+                // see WHY the session ended when they reopen it later. Previously
+                // only the ephemeral event stream carried the message — the
+                // persisted session had no record of the budget cap.
+                scope.launch {
+                    sessions.appendMessage(
+                        sessionId,
+                        ChatMessage(
+                            id = UUID.randomUUID().toString(),
+                            role = ChatMessage.Role.SYSTEM,
+                            content = msg,
+                            timestamp = System.currentTimeMillis(),
+                        )
+                    )
+                }
                 _events.tryEmit(Event.Completed(sessionId, msg))
                 sessions.setStatus(sessionId, SessionStatus.DONE)
                 triggerReflection(sessionId, "DONE")
@@ -695,14 +863,28 @@ class AgentLoop @Inject constructor(
             val parsedAction = parseActionLine(action)
             val skillResult = handleSkillAction(parsedAction, sessionId)
             val (ok, resultText) = if (skillResult != null) {
-                Pair(true, skillResult)
+                // A-H5 FIX: a refusal from handleSkillAction must NOT be reported
+                // as a successful dispatch — otherwise the LLM believes the
+                // skill executed and never tries an alternative approach.
+                // Detect the two refusal patterns ("disabled by the user" for
+                // toggled-off skills and "must be configured from the Settings
+                // screen" for privileged skill actions refused for security)
+                // and surface them as a tool-call error so the LLM retries
+                // with a different strategy.
+                val isRefusal = skillResult.contains("disabled by the user", ignoreCase = true) ||
+                    skillResult.contains("must be configured from the Settings screen", ignoreCase = true)
+                Pair(!isRefusal, skillResult)
             } else {
                 val deviceAction = parseDeviceAction(action)
                 if (deviceAction == null) {
                     // FAIL-CLOSED: a malformed tap/swipe must NOT fire a default gesture.
+                    // A-H3 FIX: parseDeviceAction now returns null for unknown actions
+                    // (was NoOp) — so an "ACTION: invalid" synthesized from a malformed
+                    // structured tool-call ALSO surfaces here as a clear tool-result
+                    // error to the LLM, rather than silently dispatching as success.
                     Pair(false, "error: could not parse valid coordinates from: $action")
                 } else {
-                    val dispatchOk = runCatching { scheduler.dispatch(deviceAction) }.getOrDefault(false)
+                    val dispatchOk = runCatchingCancellable { scheduler.dispatch(deviceAction) }.getOrDefault(false)
                     Pair(dispatchOk, if (dispatchOk) "ok" else "error")
                 }
             }
@@ -734,7 +916,11 @@ class AgentLoop @Inject constructor(
             val verifyResult = verifier.verifyLastDetailed(sessionId, call, preSnapshot = observation)
             val verifyOk = verifyResult.ok
             // Hermes-style plan tracking: a verified-successful action advances the plan.
-            if (verifyOk) plan?.nextStep?.let { it.markDone() }
+            // A-L3 FIX: route through Plan.markNextStepDone() — PlanStep.markDone()
+            // now returns a copy (the field is a val), so the previous
+            // `plan?.nextStep?.let { it.markDone() }` form discarded the copy
+            // and never actually advanced the plan.
+            if (verifyOk) plan?.markNextStepDone()
             // Record this step in the episode for self-learning reflection.
             episodeRecorder.recordStep(sessionId, step, observation, action, call, verifyOk)
             // Record a direct (fingerprint, action, outcome) lesson immediately —
@@ -746,7 +932,7 @@ class AgentLoop @Inject constructor(
             }
             // PERFORMANCE: defer lesson recording off the hot path
             val fFp = currentFingerprint; val fAs = sig
-            scope.launch { runCatching { learning.recordDirectLesson(sessionId, fFp, fAs, outcome, observation) } }
+            scope.launch { runCatchingCancellable { learning.recordDirectLesson(sessionId, fFp, fAs, outcome, observation) } }
             if (!verifyOk) {
                 // GROUNDED self-correction: feed the model WHY the action failed
                 // (diagnostic reason + whether the screen changed) instead of a
@@ -810,7 +996,7 @@ class AgentLoop @Inject constructor(
     private fun triggerReflection(sessionId: String, finalStatus: String) {
         episodeRecorder.finish(sessionId, finalStatus)
         scope.launch {
-            runCatching { learning.runPostSessionPipeline(sessionId) }
+            runCatchingCancellable { learning.runPostSessionPipeline(sessionId) }
         }
     }
 
@@ -855,7 +1041,11 @@ class AgentLoop @Inject constructor(
             s.startsWith("back", ignoreCase = true) -> DeviceAction.Back
             s.startsWith("home", ignoreCase = true) -> DeviceAction.Home
             s.startsWith("screenshot", ignoreCase = true) -> DeviceAction.Screenshot
-            else -> DeviceAction.NoOp
+            // A-H3 FIX: unknown action strings return null (was NoOp). The
+            // caller treats null as a tool-call error returned to the LLM,
+            // so a malformed "ACTION: invalid" synthesized from a bad
+            // structured tool-call no longer silently dispatches as success.
+            else -> null
         }
     }
 
@@ -872,7 +1062,14 @@ class AgentLoop @Inject constructor(
      * the UI gets actual results instead of just "started..." placeholders.
      */
     private suspend fun handleSkillAction(action: String, sessionIdForSkill: String): String? {
-        val m = Regex("(?i)skill:([a-z\\-]+)\\s*\\(\\s*(.*?)\\s*\\)").find(action) ?: return null
+        // A-L5 + A-L6 FIX: skill IDs may contain digits (e.g. custom-1, app-search-2)
+        // and args may contain nested parens (e.g. scheduled-automation(weekly:Wed:10:00|prompt)).
+        // The old regex `([a-z\-]+)\s*\(\s*(.*?)\s*\)` was non-greedy on the arg and
+        // excluded digits, so `skill:custom-1(bar(baz))` captured `custom` (without the
+        // `-1`) and `bar(baz` (truncated at the first `)`). The new regex is greedy on
+        // the arg and anchored to end-of-string, so nested parens are preserved and
+        // digit-containing IDs match.
+        val m = Regex("(?i)skill:([a-z0-9\\-]+)\\s*\\((.*)\\)$").find(action) ?: return null
         val skillId = m.groupValues[1].lowercase()
         val arg = m.groupValues[2].trim().trim('"')
         // Refuse disabled skills with a clear message back to the LLM so it
@@ -887,17 +1084,17 @@ class AgentLoop @Inject constructor(
                 val n = arg.toIntOrNull() ?: 20
                 // Run synchronously (with fallback) instead of fire-and-forget,
                 // so the tool-call result reflects actual completion.
-                val count = runCatching { gallery.syncMemory(n) }.getOrDefault(0)
+                val count = runCatchingCancellable { gallery.syncMemory(n) }.getOrDefault(0)
                 logger.logInfo(sessionIdForSkill, 0, "gallery-sync: $count photos")
                 "Gallery memory sync completed (scanned $count photos)."
             }
             "gallery-search" -> {
-                val photos = runCatching { gallery.search(arg) }.getOrDefault(emptyList())
+                val photos = runCatchingCancellable { gallery.search(arg) }.getOrDefault(emptyList())
                 logger.logInfo(sessionIdForSkill, 0, "gallery-search '$arg': ${photos.size} hits")
                 "Gallery search found ${photos.size} results for '$arg'."
             }
             "capcut-theme-video" -> {
-                val uris = runCatching { gallery.stageForTheme(arg) }.getOrDefault(emptyList())
+                val uris = runCatchingCancellable { gallery.stageForTheme(arg) }.getOrDefault(emptyList())
                 logger.logInfo(sessionIdForSkill, 0, "capcut-stage '$arg': ${uris.size} photos")
                 "Staged ${uris.size} photos for CapCut theme '$arg'."
             }
@@ -914,7 +1111,7 @@ class AgentLoop @Inject constructor(
             "behavior-replay" -> {
                 // Run replay synchronously with bounded timeout so the agent loop
                 // doesn't hang forever on a broken behavior skill.
-                val ok = runCatching {
+                val ok = runCatchingCancellable {
                     withTimeout(30_000L) { behaviorRecorder.replay(arg) }
                 }.getOrDefault(false)
                 logger.logInfo(sessionIdForSkill, 0, "behavior-replay($arg): ${if (ok) "ok" else "failed"}")
@@ -930,7 +1127,7 @@ class AgentLoop @Inject constructor(
                     else -> arg.substringBefore(':').ifBlank { "com.android.chrome" }
                 }
                 val query = if (skillId == "app-search" && arg.contains(':')) arg.substringAfter(':').trim() else arg
-                val launched = runCatching { scheduler.dispatch(DeviceAction.Launch(pkg)) }.getOrDefault(false)
+                val launched = runCatchingCancellable { scheduler.dispatch(DeviceAction.Launch(pkg)) }.getOrDefault(false)
                 if (launched) {
                     "Launched $pkg. Next step: tap the search bar and type '$query'."
                 } else {
@@ -960,7 +1157,7 @@ class AgentLoop @Inject constructor(
             "skill-creator" -> {
                 // Use the LLM to draft a SKILL.md from the user's description,
                 // then persist it under filesDir/skills/<id>/SKILL.md (runtime cache).
-                val result = runCatching {
+                val result = runCatchingCancellable {
                     val cfg2 = settings.modelConfig.first()
                     val draftResult = llm.complete(
                         provider = cfg2.provider,
@@ -998,32 +1195,44 @@ class AgentLoop @Inject constructor(
                 if (parts.size < 2) return "Usage: skill:scheduled-automation(60|prompt text)"
                 val scheduleSpec = parts[0].trim()
                 val promptText = parts[1].trim()
-                val created = runCatching {
-                    if (scheduleSpec.startsWith("weekly:")) {
-                        // Parse "weekly:Wed:10:00" -> day=Wed, time=10:00.
-                        // Take everything after "weekly:" as `rest`, then
-                        // split on the FIRST colon: day = rest.substringBefore(':'),
-                        // time = rest.substringAfter(':'). The previous
-                        // substringAfterLast(':') returned "00" (just the
-                        // minutes), silently scheduling tasks for midnight.
-                        val rest = scheduleSpec.substringAfter("weekly:")
-                        val dayName = rest.substringBefore(':')
-                        val time = rest.substringAfter(':')
-                        val dayMap = mapOf("Sun" to 1, "Mon" to 2, "Tue" to 3, "Wed" to 4, "Thu" to 5, "Fri" to 6, "Sat" to 7)
-                        val day = dayMap[dayName] ?: 4
+                val created = if (scheduleSpec.startsWith("weekly:")) {
+                    // Parse "weekly:Wed:10:00" -> day=Wed, time=10:00.
+                    // Take everything after "weekly:" as `rest`, then
+                    // split on the FIRST colon: day = rest.substringBefore(':'),
+                    // time = rest.substringAfter(':'). The previous
+                    // substringAfterLast(':') returned "00" (just the
+                    // minutes), silently scheduling tasks for midnight.
+                    val rest = scheduleSpec.substringAfter("weekly:")
+                    val dayName = rest.substringBefore(':')
+                    val time = rest.substringAfter(':')
+                    val dayMap = mapOf("Sun" to 1, "Mon" to 2, "Tue" to 3, "Wed" to 4, "Thu" to 5, "Fri" to 6, "Sat" to 7)
+                    // A-L7 FIX: unknown day name returns an error message to
+                    // the LLM instead of silently defaulting to Wednesday (4).
+                    // The previous behavior meant a typo like "weekly:Wde:10:00"
+                    // would schedule the task for Wednesday without any feedback.
+                    val day = dayMap[dayName]
+                        ?: return "Unknown day '$dayName'. Use Sun/Mon/Tue/Wed/Thu/Fri/Sat."
+                    runCatchingCancellable {
                         com.omniclaw.app.cron.ScheduledTaskWorker.scheduleWeekly(
-                            ctx, java.util.UUID.randomUUID().toString().take(8),
+                            // A-M7 FIX: use the full UUID (was .take(8)) — truncated
+                            // UUIDs collided across rapid invocations, overwriting one
+                            // another's WorkManager unique-work entry.
+                            ctx, java.util.UUID.randomUUID().toString(),
                             "Agent-created weekly", promptText, setOf(day), time,
                         )
-                    } else {
-                        val minutes = scheduleSpec.toLongOrNull() ?: 60L
+                        true
+                    }.getOrDefault(false)
+                } else {
+                    val minutes = scheduleSpec.toLongOrNull() ?: 60L
+                    runCatchingCancellable {
                         com.omniclaw.app.cron.ScheduledTaskWorker.scheduleInterval(
-                            ctx, java.util.UUID.randomUUID().toString().take(8),
+                            // A-M7 FIX: full UUID (was .take(8)).
+                            ctx, java.util.UUID.randomUUID().toString(),
                             "Agent-created interval", promptText, minutes,
                         )
-                    }
-                    true
-                }.getOrDefault(false)
+                        true
+                    }.getOrDefault(false)
+                }
                 if (created) {
                     "Scheduled automation created: $scheduleSpec → '$promptText'"
                 } else {
@@ -1087,6 +1296,12 @@ class AgentLoop @Inject constructor(
             "amazon-search" to "- skill:app-search(com.amazon.mShop.android:query) — launch Amazon + search",
             "skill-creator" to "- skill:skill-creator(description) — LLM-draft a new SKILL.md",
             "scheduled-automation" to "- skill:scheduled-automation(60|prompt) — schedule interval task",
+            // A-L4 NOTE: the duplicate `scheduled-automation` key is INTENTIONAL —
+            // this is a listOf (not mapOf), so both entries survive. They show
+            // TWO usage EXAMPLES (interval vs weekly) for the same skill ID;
+            // both are filtered together by isSkillEnabled, so the duplicate
+            // has no functional impact. Keeping both lets the LLM see both
+            // argument shapes in the prompt.
             "scheduled-automation" to "- skill:scheduled-automation(weekly:Wed:10:00|prompt) — schedule weekly task",
         )
         skillLines.filter { isSkillEnabled(it.first) }.forEach { appendLine(it.second) }
@@ -1107,13 +1322,18 @@ class AgentLoop @Inject constructor(
         // the current screen fingerprint. If any are found, they're appended
         // here so the LLM can avoid known-bad actions and repeat known-good ones.
         val fingerprint = episodeRecorder.fingerprint(observation)
-        val lessons = runCatching { learning.lessonsForPrompt(fingerprint, sessionId = sessionId) }.getOrNull()
+        val lessons = runCatchingCancellable { learning.lessonsForPrompt(fingerprint, sessionId = sessionId) }.getOrNull()
         if (lessons != null) {
             appendLine(lessons)
             // Emit a LessonsApplied event so the chat UI can show a transparency
             // hint ("applied N lessons from past sessions"). Count is derived
             // from the number of [AVOID]/[USE]/[LOOP] tags in the injected text.
-            val lessonCount = Regex("\\[(AVOID|USE|LOOP|NOTE)\\]").findAll(lessons).count()
+            // A-H1 FIX: the previous regex `\\[(AVOID|USE|LOOP|NOTE)\\]` required
+            // the closing `]` immediately after the tag, but lessonsForPrompt
+            // emits lines like `[AVOID conf=2] <text>` — `[AVOID ` has a space
+            // (not `]`) after the tag. Using `\\b` (word boundary) instead of
+            // `\\]` matches both `[AVOID]` and `[AVOID conf=2]`.
+            val lessonCount = Regex("\\[(AVOID|USE|LOOP|NOTE)\\b").findAll(lessons).count()
             if (lessonCount > 0) {
                 _events.tryEmit(Event.LessonsApplied(sessionId, step, lessonCount))
             }
@@ -1161,11 +1381,39 @@ class AgentLoop @Inject constructor(
     private suspend fun buildHistory(sessionId: String): List<LlmClient.Message> {
         val cached = historyCache.getOrPut(sessionId) { mutableListOf() }
         val session = sessions.getById(sessionId) ?: return cached.toList()
+        // A-M1 FIX: if the session's message list shrank (e.g. the user
+        // cleared history, or the session was reset), the cache holds a
+        // STALE larger list — the `cached.size == session.messages.size`
+        // check below would never be true and we'd return the stale cache
+        // forever. Detect the shrink and invalidate the cache so the next
+        // call rebuilds from the fresh (smaller) session.messages list.
+        if (cached.size > session.messages.size) {
+            historyCache.remove(sessionId)
+            return buildHistory(sessionId)
+        }
         if (cached.size == session.messages.size) return cached.toList()
         val startIdx = cached.size
         for (i in startIdx until session.messages.size) {
             val msg = session.messages[i]
-            cached.add(LlmClient.Message(role = msg.role.name.lowercase(), content = msg.content))
+            // CHAT-FLOW FIX: map the full message shape, including toolCalls
+            // and toolCallId. Previously only role+content were mapped, which:
+            //   - Reduced ASSISTANT messages with structured tool invocations
+            //     to plain text (the LLM couldn't see which tool it called).
+            //   - Sent TOOL messages with role="tool" but no tool_call_id,
+            //     which most OpenAI-compat endpoints reject with HTTP 400:
+            //     "tool messages must have tool_call_id".
+            // Mapping both fields lets the structured-tools path maintain a
+            // correct conversation history across multi-step device tasks.
+            val toolCalls = msg.toolCalls.takeIf { it.isNotEmpty() }
+                ?.map { com.omniclaw.app.data.model.LlmToolCall(id = it.id, name = it.name, arguments = it.args) }
+            cached.add(
+                LlmClient.Message(
+                    role = msg.role.name.lowercase(),
+                    content = msg.content,
+                    toolCalls = toolCalls,
+                    toolCallId = msg.toolCallId,
+                )
+            )
         }
         return cached.toList()
     }
@@ -1183,47 +1431,81 @@ class AgentLoop @Inject constructor(
     }
 
     /**
-     * Cheap polling fingerprint used ONLY by the post-action stabilization
-     * while-loop. Returns a string derived from the accessibility root's
-     * packageName + childCount — sufficient to detect "did the screen
-     * change?" without re-snapshotting the whole tree + SHA-256 hashing it.
+     * # STRATEGY CHANGE: No screenshots during pure chat
      *
-     * This is intentionally NOT the same fingerprint as
-     * [EpisodeRecorder.fingerprint] — that one is a stable cross-session
-     * screen signature; this one is a transient "is the screen still moving?"
-     * probe. They serve different purposes and should not be mixed.
+     * Cheap prompt-side heuristic that classifies whether the user's prompt is
+     * a pure conversational turn (question, explanation, summary, drafting,
+     * translation, etc.) — NOT a request to automate something on the device.
      *
-     * Returns an empty string if the accessibility service is disconnected
-     * or the root is null — the stabilization loop will treat empty == empty
-     * as "stable" and exit, which is the correct behavior when there's no
-     * tree to observe (no point polling).
+     * When this returns `true` on step 1, [runLoopInner] SKIPS:
+     *   - `scheduler.snapshot()` (accessibility tree read)
+     *   - `ScreenCaptureService.latestFrameBytes()` (MediaProjection frame pull)
+     *   - `scheduler.screenshot()` (one-shot a11y screenshot fallback)
+     *   - `vlm.describe(...)` (cloud VLM call)
+     *
+     * This eliminates the privacy-invasive screenshot-then-VLM-describe cycle
+     * that previously fired on EVERY chat message whenever the accessibility
+     * service wasn't connected (the common case during chat — the agent app is
+     * in the foreground, not the target app).
+     *
+     * The heuristic is intentionally high-precision (prefer false-negatives
+     * over false-positives): if we wrongly classify a device-action prompt as
+     * chat, we skip the vision probe for one step but the LLM still sees the
+     * accessibility snapshot on step ≥ 2 (when the LLM emits a non-`done`
+     * ACTION and we're now in automation mode). If we wrongly classify a chat
+     * prompt as device-action, we waste one screenshot — annoying but not
+     * broken.
+     *
+     * The classifier checks for:
+     *   1. Question words (what/why/how/who/when/where/can you/could you/would you)
+     *   2. Conversational verbs (explain/tell me/describe/define/compare/list/summarize/translate/write/draft)
+     *   3. Generic chat openers (hi/hello/hey/thanks/ok/yes/no)
+     * And excludes (returns false) when the prompt contains device-action verbs
+     * followed by an app/package reference: tap/open/launch/swipe/type/scroll/click
+     * on/for/in + app name or "screen".
      */
-    /**
-     * O(1) stabilization fingerprint — reads root.packageName:childCount
-     * WITHOUT building the full tree. Previous impl built the entire tree
-     * (~10-50KB string) then took first 80 chars — wasted 12+ tree traversals/step.
-     */
-    private fun cheapStabilizationFingerprint(): String {
-        return scheduler.stabilizationFingerprint()
-    }
+    private fun promptLooksConversational(prompt: String): Boolean {
+        val p = prompt.trim().lowercase()
+        if (p.isEmpty()) return true  // empty prompt → no device action possible
+        if (p.length > 1000) return false  // very long prompts are usually automation instructions
 
-    @Volatile
-    private var avgStabilizationTimeMs = 150L
+        // Device-action verbs that indicate automation intent, NOT chat.
+        // Match common forms: "tap X", "open Reddit", "launch com.foo", "scroll down",
+        // "swipe up", "type hello", "click the button", "search for X on Y",
+        // "take a screenshot", "play X on Y", "go to settings".
+        val automationPatterns = listOf(
+            Regex("\\b(tap|click|press|double[- ]?tap|long[- ]?press)\\s+(on\\s+)?(the\\s+)?[a-z0-9]"),
+            Regex("\\b(open|launch|start|go\\s+to|switch\\s+to)\\s+(com\\.|[a-z]+\\s*(app|on|in|for))"),
+            Regex("\\bswipe\\s+(up|down|left|right|to)\\b"),
+            Regex("\\bscroll\\s+(up|down|left|right|to|until)\\b"),
+            Regex("\\btype\\s+[\"']?[a-z0-9]"),
+            Regex("\\b(take\\s+a\\s+)?screenshot\\b"),
+            Regex("\\b(play|pause|skip|next|previous)\\s+(music|song|video|track|on)\\b"),
+            Regex("\\b(search|find|look\\s+up)\\s+.+\\s+(on|in|for)\\s+(reddit|youtube|google|amazon|taobao|twitter|instagram|tiktok|spotify|netflix|maps|play store|app store|settings)\\b"),
+            Regex("\\b(call|message|text|email|send)\\s+[a-z0-9]"),
+            Regex("\\b(set|turn|enable|disable|toggle)\\s+(alarm|timer|wifi|bluetooth|brightness|volume|on|off)\\b"),
+            Regex("\\bnavigate\\s+(to|back|home|up|down)\\b"),
+            Regex("\\bhome\\s+button\\b|\\bback\\s+button\\b|\\brecents\\s+button\\b"),
+            Regex("\\b(scheduled?|automate|every)\\s+"),
+        )
+        if (automationPatterns.any { it.containsMatchIn(p) }) return false
 
-    private fun getAdaptiveInitialDelay(): Long {
-        return (avgStabilizationTimeMs * 0.5).toLong().coerceIn(30L, 200L)
-    }
-
-    private fun getAdaptiveCap(): Long {
-        return 400L  // reduced from 600ms
-    }
-
-    private fun getAdaptivePollInterval(): Long {
-        return 80L  // increased from 50ms (fewer CPU wake-ups)
-    }
-
-    private fun updateStabilizationMetrics(elapsedMs: Long) {
-        avgStabilizationTimeMs = ((avgStabilizationTimeMs * 0.7) + (elapsedMs * 0.3)).toLong()
+        // Strong conversational signals — if any of these appear, classify as chat.
+        val conversationalPatterns = listOf(
+            // Question words at start of sentence
+            Regex("^(what|why|how|who|when|where|which|whose|whom)\\b"),
+            Regex("\\b(can|could|would|will|do|did|does|is|are|am|should|may|might)\\s+you\\b"),
+            // Conversational verbs
+            Regex("\\b(explain|tell me about|describe|define|compare|contrast|list|summarize|translate|draft|write|compose|rewrite|rephrase|elaborate|teach|help me understand|give me|show me how)\\b"),
+            // Generic chat openers / closers
+            Regex("^(hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|sure|yes|no|yep|nope|cool|nice|great)\\s*[!.?]*$"),
+            Regex("\\b(please\\s+)?(write|draft|compose|generate)\\s+(a\\s+)?(email|message|letter|poem|essay|story|script|code|function|class|summary|outline|list)\\b"),
+            // Meta-questions about the assistant itself
+            Regex("\\b(who are you|what can you do|what are you|are you|your name|help)\\b"),
+            // Knowledge / advice requests
+            Regex("\\b(what'?(s| is)|difference between|meaning of|definition of|synonym|antonym|example of|how (do|does)|why (do|does|is|are))\\b"),
+        )
+        return conversationalPatterns.any { it.containsMatchIn(p) }
     }
 
     companion object {

@@ -141,7 +141,7 @@ class MainActivity : ComponentActivity() {
     private fun handleDeepLink(intent: Intent?) {
         when (val result = deepLinkHandler.handleIntent(intent)) {
             is DeepLinkResult.SESSION_OPEN ->
-                Log.d("MainActivity", "Deep link -> open session ${'$'}{result.sessionId}")
+                Log.d("MainActivity", "Deep link -> open session ${result.sessionId}")
             DeepLinkResult.INVALID ->
                 Log.w("MainActivity", "Deep link -> invalid / unparseable")
             DeepLinkResult.NONE -> Unit

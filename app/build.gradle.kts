@@ -2,6 +2,12 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
+    // Note: AGP 9.x auto-applies the Kotlin Android plugin via kotlin.compose
+    // below (the Compose compiler plugin transitively applies the Kotlin
+    // plugin). Adding `alias(libs.plugins.kotlin.android)` here would
+    // register a second `kotlin` Project extension and fail with
+    // "Cannot add extension with name 'kotlin', as there is an extension
+    // already registered with that name." So we rely on kotlin.compose.
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt)

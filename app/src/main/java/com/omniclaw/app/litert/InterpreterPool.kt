@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import org.tensorflow.lite.Interpreter
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
@@ -48,6 +49,12 @@ class InterpreterPool @Inject constructor() {
     private val reservedSlots = ConcurrentHashMap<PoolKey, AtomicInteger>()
     private val warmupCount = AtomicLong(0)
 
+    // V-M15: closed flag prevents a concurrent acquire() from repopulating the
+    // pool after closeAll() has torn it down. Volatile so the read outside the
+    // lock sees the write performed inside closeAll().
+    @Volatile
+    private var closed = false
+
     /**
      * Acquire an interpreter for (modelPath, useGpu, useNnapi).
      *
@@ -66,15 +73,24 @@ class InterpreterPool @Inject constructor() {
         maxPoolSize: Int = 2,
         factory: () -> PooledInterpreter,
     ): LeasedInterpreter {
+        // V-M15: refuse new acquisitions once closeAll() has run.
+        if (closed) throw IllegalStateException("InterpreterPool is closed")
         val key = PoolKey(modelPath, useGpu, useNnapi)
         val poolLock = poolLocks.computeIfAbsent(key) { Mutex() }
         val reserved = reservedSlots.computeIfAbsent(key) { AtomicInteger(0) }
+        // V-C2: track consecutive factory() failures per acquire() call so a
+        // permanently-broken factory doesn't loop forever. V-H7: track
+        // consecutive lease timeouts so a stuck interpreter wedges the caller
+        // for at most 3 × 30 s instead of indefinitely.
+        var factoryFailures = 0
+        var consecutiveTimeouts = 0
         // Loop until we acquire (or create) an interpreter. The loop is
         // required because two coroutines may both see "no free slot" and
         // both wait on the same mutex; when one releases, only one waiter
         // wakes up. The other waits again, then re-checks for free slots
         // before deciding to wait further.
         while (true) {
+            if (closed) throw IllegalStateException("InterpreterPool is closed")
             // Carry the decision out of the lock via LOCAL vars — never a shared
             // instance field: concurrent acquire() calls for DIFFERENT models would
             // otherwise overwrite each other's chosen interpreter and lease the
@@ -83,6 +99,7 @@ class InterpreterPool @Inject constructor() {
             var waitFor: PooledInterpreter? = null
             var shouldCreate = false
             poolLock.withLock {
+                if (closed) throw IllegalStateException("InterpreterPool is closed")
                 val pool = pools.computeIfAbsent(key) { mutableListOf() }
                 // Find a free interpreter (one whose mutex is unlocked).
                 for (pi in pool) {
@@ -101,7 +118,11 @@ class InterpreterPool @Inject constructor() {
                 }
                 // Pool at capacity — remember which interpreter to wait on, then
                 // release poolLock so other acquirers can progress.
-                waitFor = pool.first()
+                // V-C1: use firstOrNull() — pool may be transiently empty when all
+                // maxPoolSize slots are reserved (factory() running concurrently)
+                // but not yet materialized. pool.first() would throw
+                // NoSuchElementException in that case.
+                waitFor = pool.firstOrNull()
             }
             leased?.let { return it }
             if (shouldCreate) {
@@ -117,10 +138,21 @@ class InterpreterPool @Inject constructor() {
                         return LeasedInterpreter(created, key, this)
                     }
                 }
-                // factory() failed — loop to retry or wait on an existing slot.
-                continue
+                // V-C2: factory() failed — bail out after 3 consecutive failures
+                // so a permanently broken factory (corrupt model, OOM, bad delegate)
+                // surfaces as an actionable exception instead of looping forever.
+                if (created == null) {
+                    if (++factoryFailures >= 3) {
+                        throw RuntimeException(
+                            "InterpreterPool.factory() failed $factoryFailures times for key=$key"
+                        )
+                    }
+                    continue
+                }
             }
-            val chosen = waitFor ?: continue  // null only on a race with closeAll → retry
+            // If null, pool is empty (all slots reserved but not yet materialized) —
+            // retry the loop to re-check for free slots.
+            val chosen = waitFor ?: continue
             // Acquire exclusively with lock() (NOT withLock): the lease must KEEP
             // the mutex held until release(). withLock's finally block would unlock
             // on return, handing out an unheld interpreter → concurrent run() corruption.
@@ -128,7 +160,18 @@ class InterpreterPool @Inject constructor() {
             // caller forever. On timeout, retry the loop to re-evaluate free slots
             // or create a new interpreter.
             val locked = withTimeoutOrNull(30_000) { chosen.mutex.lock() }
-            if (locked == null) continue
+            if (locked == null) {
+                // V-H7: a stuck/leaked lease must not wedge this caller forever.
+                // After 3 consecutive 30 s timeouts (90 s+) give up and throw so
+                // the caller can surface the error instead of hanging indefinitely.
+                if (++consecutiveTimeouts >= 3) {
+                    throw RuntimeException(
+                        "InterpreterPool lease stuck for ${consecutiveTimeouts * 30}s+ on key=$key"
+                    )
+                }
+                continue
+            }
+            consecutiveTimeouts = 0
             return LeasedInterpreter(chosen, key, this)
         }
     }
@@ -140,6 +183,10 @@ class InterpreterPool @Inject constructor() {
 
     /** Close all interpreters + delegates in all pools. */
     suspend fun closeAll() {
+        // V-M15: set closed BEFORE draining so a concurrent acquire() sees the
+        // flag and throws IllegalStateException instead of repopulating the pool
+        // with a brand-new interpreter that we then leak (never closed).
+        closed = true
         for ((key, pool) in pools.toMap()) {
             val poolLock = poolLocks[key] ?: continue
             poolLock.withLock {
@@ -184,10 +231,13 @@ class InterpreterPool @Inject constructor() {
         // try-finally { lease.close() } and an explicit release; only the first
         // call should unlock the mutex, otherwise the second throws
         // IllegalStateException: Mutex is not locked.
-        private var released = false
+        // V-H6: AtomicBoolean (not plain `var`) so the read-modify-write is
+        // atomic across threads — a plain boolean could be double-flipped by
+        // two concurrent close() calls on different threads, double-unlocking
+        // the mutex.
+        private val released = AtomicBoolean(false)
         override fun close() {
-            if (!released) {
-                released = true
+            if (released.compareAndSet(false, true)) {
                 pool.release(this)
             }
         }

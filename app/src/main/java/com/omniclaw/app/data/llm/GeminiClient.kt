@@ -175,16 +175,24 @@ class GeminiClient(
                     val retryAfter = resp.header("Retry-After")?.toIntOrNull()
                     // Honor the server Retry-After header before the retry helper backs
                     // off again, so a long quota window is not hammered at 1-8s (audit M-25).
-                    if (retryAfter != null) delay(retryAfter * 1000L)
+                    // D-M9: cap at 60s — a misconfigured / hostile server could otherwise
+                    // pin the client with Retry-After: 86400 and stall the agent loop
+                    // for a full day. 60s is long enough to honor a typical quota reset
+                    // while still surfacing the rate-limit upstream for user visibility.
+                    if (retryAfter != null) delay(minOf(retryAfter, 60) * 1000L)
                     throw RateLimitException(
                         retryAfterSeconds = retryAfter,
-                        body = b,
+                        body = "HTTP 429",
                     )
                 }
+                // D-H5: do NOT include the response body in the exception or the
+                // log line — Gemini error responses can echo parts of the request
+                // (system instruction, prompts, x-goog-api-key in headers) and
+                // leaking that via Logcat / crash reports is a security regression.
                 if (Log.isLoggable(TAG, Log.ERROR)) {
-                    Log.e(TAG, "Gemini complete error ${resp.code}: ${b.take(300)}")
+                    Log.e(TAG, "Gemini complete error HTTP ${resp.code}")
                 }
-                throw LlmException("Gemini HTTP ${resp.code}: ${b.take(500)}")
+                throw LlmException("Gemini HTTP ${resp.code}")
             }
             b
         }
@@ -295,17 +303,20 @@ class GeminiClient(
             override fun onResponse(c: Call, r: Response) {
                 r.use { resp ->
                     if (!resp.isSuccessful) {
-                        val errBody = resp.body?.string().orEmpty()
+                        // D-H5: drain the error body so the connection can be
+                        // reused, but do NOT include it in the exception or log —
+                        // Gemini error responses can echo parts of the request.
+                        runCatching { resp.body?.string() }
                         if (resp.code == 429) {
                             channel.close(RateLimitException(
-                                resp.header("Retry-After")?.toIntOrNull(), errBody
+                                resp.header("Retry-After")?.toIntOrNull(), "HTTP 429"
                             ))
                             return
                         }
                         if (Log.isLoggable(TAG, Log.ERROR)) {
-                            Log.e(TAG, "Gemini stream error ${resp.code}: $errBody")
+                            Log.e(TAG, "Gemini stream error HTTP ${resp.code}")
                         }
-                        channel.close(LlmException("Gemini HTTP ${resp.code}: ${errBody.take(500)}"))
+                        channel.close(LlmException("Gemini HTTP ${resp.code}"))
                         return
                     }
                     val src = resp.body?.source()
@@ -317,6 +328,12 @@ class GeminiClient(
                     // array, but a single JSON object can span multiple lines
                     // (newlines inside string values). Track brace depth so we
                     // only parse when we have a complete top-level object.
+                    //
+                    // D-M2: cap buf at MAX_BUFFER (1 MiB) so a malformed stream
+                    // (missing closing brace, runaway string with no quote) can't
+                    // grow buf without bound and OOM the process. Beyond the cap
+                    // we close the channel with an explicit error rather than
+                    // silently truncating.
                     val buf = StringBuilder()
                     try {
                         while (!src.exhausted()) {
@@ -324,11 +341,21 @@ class GeminiClient(
                             val line = src.readUtf8Line() ?: break
                             if (line.isBlank()) continue
                             buf.append(line)
+                            if (buf.length > MAX_BUFFER) {
+                                channel.close(LlmException("Gemini stream: object exceeded max buffer size ($MAX_BUFFER bytes)"))
+                                return
+                            }
                             // Try to parse every complete top-level object in buf.
                             while (true) {
                                 val obj = extractNextObject(buf) ?: break
                                 emitDelta(obj)?.let { delta ->
-                                    if (delta.isNotEmpty() && !channel.trySend(delta).isSuccess) return
+                                    // D-H11: on trySend failure (downstream can't keep up),
+                                    // close the channel explicitly so the collector sees a
+                                    // clean error rather than a silently-truncated stream.
+                                    if (delta.isNotEmpty() && !channel.trySend(delta).isSuccess) {
+                                        channel.close(IllegalStateException("Gemini stream back-pressure"))
+                                        return
+                                    }
                                 }
                             }
                         }
@@ -336,7 +363,11 @@ class GeminiClient(
                         if (buf.isNotBlank()) {
                             extractNextObject(buf)?.let { obj ->
                                 emitDelta(obj)?.let { delta ->
-                                    if (delta.isNotEmpty()) channel.trySend(delta)
+                                    // D-H11: same back-pressure handling on the flush path.
+                                    if (delta.isNotEmpty() && !channel.trySend(delta).isSuccess) {
+                                        channel.close(IllegalStateException("Gemini stream back-pressure"))
+                                        return
+                                    }
                                 }
                             }
                         }
@@ -398,6 +429,13 @@ class GeminiClient(
     // ------------------------------------------------------------------
     // Internal
     // ------------------------------------------------------------------
+
+    /**
+     * D-M2: hard cap on the SSE buffer. A malformed Gemini stream that never
+     * closes its top-level object would otherwise grow `buf` without bound;
+     * 1 MiB is well above any legitimate single-chunk response.
+     */
+    private val MAX_BUFFER = 1 * 1024 * 1024
 
     /**
      * Convert OpenAI-style messages to Gemini's `contents` array.

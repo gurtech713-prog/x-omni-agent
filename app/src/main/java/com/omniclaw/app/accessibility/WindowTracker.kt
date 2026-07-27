@@ -89,25 +89,33 @@ class WindowTracker @Inject constructor() {
             event.text?.forEach { t -> if (t.isNotBlank()) titles.add(t.toString()) }
         }
 
-        val newState = WindowState(
-            foregroundPackage = pkg ?: current.foregroundPackage,
-            foregroundActivity = className,
-            isDialogVisible = isDialog || current.isDialogVisible,
-            isKeyboardVisible = isKeyboard,
-            isNotificationShadeVisible = isShade,
-            isPictureInPictureVisible = isPip,
-            activeWindowTitles = titles,
-            lastEventTime = now,
-            lastEventType = type,
-        )
-        stateRef.set(newState)
-
-        // Dialog / keyboard states are sticky — we set them true on detection
-        // but they should clear when a subsequent event indicates the window
-        // closed. The heuristic below clears them when we see a new
-        // TYPE_WINDOW_STATE_CHANGED to a non-dialog, non-shade class.
-        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && !isDialog && !isShade) {
-            stateRef.updateAndGet { it.copy(isDialogVisible = false, isNotificationShadeVisible = false) }
+        // S-H2: do the entire read-modify-write inside a single atomic
+        // updateAndGet so concurrent events can't interleave (e.g. the sticky
+        // dialog/keyboard flags would otherwise race with the post-update
+        // clearing pass below). Reads `prev` inside the lambda — never the
+        // externally-visible `current`.
+        stateRef.updateAndGet { prev ->
+            val sticky = WindowState(
+                foregroundPackage = pkg ?: prev.foregroundPackage,
+                foregroundActivity = className,
+                isDialogVisible = isDialog || prev.isDialogVisible,
+                isKeyboardVisible = isKeyboard,
+                isNotificationShadeVisible = isShade,
+                isPictureInPictureVisible = isPip,
+                activeWindowTitles = titles,
+                lastEventTime = now,
+                lastEventType = type,
+            )
+            // Dialog / keyboard states are sticky — we set them true on
+            // detection but they should clear when a subsequent event
+            // indicates the window closed. The heuristic below clears them
+            // when we see a new TYPE_WINDOW_STATE_CHANGED to a non-dialog,
+            // non-shade class.
+            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && !isDialog && !isShade) {
+                sticky.copy(isDialogVisible = false, isNotificationShadeVisible = false)
+            } else {
+                sticky
+            }
         }
     }
 

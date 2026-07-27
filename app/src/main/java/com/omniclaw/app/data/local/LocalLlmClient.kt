@@ -67,12 +67,17 @@ class LocalLlmClient @Inject constructor(
      * @param modelPath Same path format as [LiteRtEngine.runIntSingle].
      * @param family    Tokenizer family (e.g. "gemma"). Must be registered
      *                  via [registerTokenizer] first.
+     *
+     * D-L5: `temperature` was previously accepted but silently ignored (the
+     * greedy-decode loop below never consults it). The parameter has been
+     * removed from the signature so callers don't expect sampling behavior
+     * the implementation doesn't provide. Sampling support will be added
+     * alongside top-p / top-k in a future iteration.
      */
     suspend fun complete(
         modelPath: String,
         family: String,
         messages: List<LlmClient.Message>,
-        temperature: Float = 0.2f,
         maxTokens: Int = 512,
     ): LlmClient.CompletionResult = withContext(Dispatchers.IO) {
         if (!engine.isAvailable) {
@@ -108,8 +113,9 @@ class LocalLlmClient @Inject constructor(
             promptTokens
         }
 
-        // Greedy decode with temperature-sampled top-k=1 (deterministic) for
-        // stability during agent execution. Real sampling would use top-p here.
+        // Greedy decode (deterministic) for stability during agent execution.
+        // Real sampling would consult a `temperature` parameter here with
+        // top-p / top-k — see the D-L5 note on [complete].
         val generated = StringBuilder()
         val inputTokens = truncated.toMutableList()
         val eos = tokenizer.eosTokenId
@@ -121,6 +127,17 @@ class LocalLlmClient @Inject constructor(
         val outputShape = runCatching { engine.outputShape(modelPath) }.getOrNull()
         val vocabSize = outputShape?.lastOrNull()?.coerceAtLeast(1)
             ?: throw LiteRtException("Cannot determine vocab size for '$modelPath' — output shape query failed")
+        // D-C4: most Q4-quantized TFLite causal-LM models (Gemma 2B, TinyLlama
+        // 1.1B, etc.) emit only the LAST-TOKEN logits [1, vocab] per decode step,
+        // not the full [1, seq, vocab] sequence. Allocating `seqLen * vocabSize`
+        // floats per step on a 256k-vocab model with seqLen=128 would consume
+        // ~128 MiB per step and OOM within a handful of steps. Probe the output
+        // shape once and pick the smallest allocation that satisfies the model.
+        //
+        //   2-D output [1, vocab]     → single-token output, alloc = vocabSize
+        //   3-D output [1, seq, vocab]→ full-sequence output, alloc = seqLen*vocab
+        //                                 (we only argmax the last slice)
+        val isSingleTokenOutput = outputShape != null && outputShape.size == 2
         try {
             for (step in 0 until effectiveMaxTokens) {
                 // Pad/truncate input to the model's expected seq length.
@@ -138,9 +155,31 @@ class LocalLlmClient @Inject constructor(
                 // We only use seqLen elements (the rest of inputSlice is
                 // already exactly seqLen long).
                 val inputForInference = if (inputSlice.size == seqLen) inputSlice else inputSlice.copyOf(seqLen)
-                val logits = engine.runIntSingle(modelPath, inputForInference, outputSize = seqLen * vocabSize)
+                val outputSize = if (isSingleTokenOutput) vocabSize else seqLen * vocabSize
+                val logits = try {
+                    engine.runIntSingle(modelPath, inputForInference, outputSize = outputSize)
+                } catch (e: Throwable) {
+                    // D-C4 fallback: if the model actually wanted the full-sequence
+                    // output buffer but we probed a single-token shape (or vice
+                    // versa), retry once with the larger allocation before
+                    // surfacing the error. This guards against models whose
+                    // output tensor has a dynamic seq dim that reported as 2-D
+                    // at probe time.
+                    if (isSingleTokenOutput) {
+                        Log.w(TAG, "Single-token output probe failed at step $stepsGenerated; retrying with full-seq allocation: ${e.message}")
+                        engine.runIntSingle(modelPath, inputForInference, outputSize = seqLen * vocabSize)
+                    } else {
+                        throw e
+                    }
+                }
                 // The model returns logits for the next position; argmax for greedy.
-                val lastSlice = logits.copyOfRange((seqLen - 1) * vocabSize, seqLen * vocabSize)
+                // For [1, vocab] outputs the slice is the whole array.
+                // For [1, seq, vocab] outputs we want the logits for the LAST token.
+                val lastSlice = if (isSingleTokenOutput && logits.size == vocabSize) {
+                    logits
+                } else {
+                    logits.copyOfRange((seqLen - 1) * vocabSize, seqLen * vocabSize)
+                }
                 val nextToken = argmax(lastSlice)
                 if (nextToken == eos) {
                     stopReason = "stop"

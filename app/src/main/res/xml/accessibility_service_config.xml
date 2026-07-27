@@ -13,9 +13,20 @@
                                     the keyboard before tapping — the agent's
                                     tap would land on a keyboard key instead of
                                     the field behind it.
+      - typeViewClicked           : tap confirmation — used by SuccessMonitor to
+                                    detect when a scheduled tap actually fired.
+      - typeViewFocused           : focus changes — lets the agent track the
+                                    active input field across IME show/hide.
+      - typeViewScrolled          : scroll events — used to confirm a swipe
+                                    gesture completed and to detect lazy-loaded
+                                    content (e.g. a feed paginating in more rows).
+      - typeViewTextChanged       : text input events — used by BehaviorRecorder
+                                    to capture form-field values during recording
+                                    (V-M16: previously missing, so the agent
+                                    couldn't observe text it had typed).
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeWindowsChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeWindowsChanged|typeViewClicked|typeViewFocused|typeViewScrolled|typeViewTextChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
     android:canPerformGestures="true"

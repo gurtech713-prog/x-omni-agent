@@ -1,13 +1,15 @@
 package com.omniclaw.app.ui.chat
 
+import android.content.Intent
+import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -23,9 +25,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.asPaddingValues
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -53,8 +52,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.sample
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -67,7 +66,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.omniclaw.app.core.theme.Motion
 import com.omniclaw.app.core.theme.OmniMono
 import com.omniclaw.app.data.model.ChatMessage
 import com.omniclaw.app.data.model.SessionStatus
@@ -100,49 +98,86 @@ fun ChatScreen(sessionId: String? = null) {
 
     LaunchedEffect(sessionId) {
         Log.d(TAG, "ChatScreen composed/launched with sessionId: $sessionId")
-        if (sessionId != null) {
+        // U-C5 FIX: only (re)open the session if it's not already active.
+        // Previously, re-entering the screen (e.g. bottom-nav tap on the
+        // already-displayed Chat tab, or any recomposition that re-keyed
+        // this effect) re-issued vm.open(sessionId), which calls clearEvents()
+        // and wipes the live agent event stream mid-run. Now we skip the
+        // re-open when sessionId is already the active one.
+        if (sessionId != null && vm.activeId.value != sessionId) {
             vm.open(sessionId)
         }
     }
 
+    // CHAT-FLOW FIX (Bug 5): hoist filteredMessages ABOVE the scroll
+    // LaunchedEffects so they can use filteredMessages.size as the scroll
+    // target. Previously the scroll logic used `messages.size` (the
+    // uiMessages StateFlow, which includes ALL messages regardless of
+    // showToolCalls), but the LazyColumn renders `filteredMessages` (which
+    // excludes TOOL messages when showToolCalls=false). The mismatch caused:
+    //   - targetIndex pointed PAST the last visible item
+    //   - isNearBottom comparison was always false (lastVisible maxed out
+    //     at filteredMessages.size-1, but we compared to messages.size-2)
+    //   - auto-scroll silently broke whenever showToolCalls=false
+    val filteredMessages = remember(messages, ui.showToolCalls) {
+        messages.filter { m ->
+            when (m.role) {
+                ChatMessage.Role.TOOL -> ui.showToolCalls
+                else -> true
+            }
+        }
+    }
+    // U-M3: suppress the TypingIndicator when the last message is a
+    // streaming-thought bubble — otherwise both the live thought text AND
+    // the typing dots render simultaneously, which is visually noisy and
+    // redundant (the streaming bubble already conveys "agent is working").
+    val hasStreamingThought =
+        messages.lastOrNull()?.id?.startsWith("streaming-thought-") == true
+
     // Scroll when new messages are added or status changes
-    // CHAT-4 FIX: the scroll target must be computed from the FILTERED
-    // message list (the LazyColumn renders `messages`, not `session.messages`),
-    // and the typing-indicator offset must only be added when the indicator
-    // is actually present. Previously the code used `session.messages.size`,
-    // which over-counted when `showToolCalls=false` filtered tool messages
-    // out of the visible list — the scroll target landed PAST the last item,
-    // causing the LazyColumn to scroll to an empty region (or no-op on some
-    // Compose versions). The fix derives the target from `messages.size`
-    // (the already-filtered StateFlow) and only adds +1 for the typing
-    // indicator when the session is RUNNING and has at least one message
-    // (matching the `else if` condition that renders TypingIndicator below).
-    LaunchedEffect(messages.size, session?.status) {
-        val n = messages.size
+    // CHAT-4 + Bug 5 FIX: use `filteredMessages.size` (the actually-rendered
+    // list) for the scroll target, NOT `messages.size` (the unfiltered
+    // StateFlow). The typing-indicator offset must only be added when the
+    // indicator is actually rendered (RUNNING && !hasStreamingThought).
+    LaunchedEffect(filteredMessages.size, session?.status, hasStreamingThought) {
+        val n = filteredMessages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING
-            val hasMessages = session?.messages?.isNotEmpty() == true
-            val showTypingIndicator = isRunning && hasMessages
+            val showTypingIndicator = isRunning && !hasStreamingThought
             val targetIndex = n - 1 + (if (showTypingIndicator) 1 else 0)
-            listState.animateScrollToItem(targetIndex)
+            // U-M1: only force-scroll when the user is already near the
+            // bottom — otherwise we yank the viewport away from someone
+            // reading older messages.
+            val layoutInfo = listState.layoutInfo
+            val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val isNearBottom = lastVisible >= n - 2
+            if (isNearBottom) listState.animateScrollToItem(targetIndex)
         }
         // H-37: live-scroll while the last message streams in. Keying this
         // effect on the content length of the last message restarted the whole
         // effect (cancelling the in-flight scroll animation) on every token.
-        // Instead, observe it via snapshotFlow + distinctUntilChanged + debounce
+        // Instead, observe it via snapshotFlow + distinctUntilChanged + sample
         // so streaming growth scrolls smoothly without restart churn; the effect
-        // key now relies on messages.size only.
-        snapshotFlow { messages.lastOrNull()?.content?.length }
+        // key now relies on filteredMessages.size only.
+        // U-M2: `debounce(100)` never fired because tokens arrive faster than
+        // 100ms — `sample(100)` emits the latest value on a fixed 100ms cadence
+        // regardless of activity, so the live-scroll keeps up with streaming.
+        snapshotFlow { filteredMessages.lastOrNull()?.content?.length }
             .distinctUntilChanged()
-            .debounce(100)
+            .sample(100)
             .collect {
-                val count = messages.size
+                val count = filteredMessages.size
                 if (count > 0) {
                     val running = session?.status == SessionStatus.RUNNING
-                    val hasMsgs = session?.messages?.isNotEmpty() == true
-                    val typing = running && hasMsgs
+                    val typing = running && !hasStreamingThought
                     val target = count - 1 + (if (typing) 1 else 0)
-                    listState.animateScrollToItem(target)
+                    // U-M1: only live-scroll when near the bottom — otherwise
+                    // we steal the viewport from someone reading older
+                    // messages.
+                    val layoutInfo = listState.layoutInfo
+                    val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    val isNearBottom = lastVisible >= count - 2
+                    if (isNearBottom) listState.animateScrollToItem(target)
                 }
             }
     }
@@ -151,11 +186,10 @@ fun ChatScreen(sessionId: String? = null) {
     // without running an ongoing scroll animation that causes text field focus loss.
     val listHeight = listState.layoutInfo.viewportSize.height
     LaunchedEffect(listHeight) {
-        val n = messages.size
+        val n = filteredMessages.size
         if (n > 0) {
             val isRunning = session?.status == SessionStatus.RUNNING
-            val hasMessages = session?.messages?.isNotEmpty() == true
-            val showTypingIndicator = isRunning && hasMessages
+            val showTypingIndicator = isRunning && !hasStreamingThought
             val targetIndex = n - 1 + (if (showTypingIndicator) 1 else 0)
             listState.scrollToItem(targetIndex)
         }
@@ -219,30 +253,25 @@ fun ChatScreen(sessionId: String? = null) {
         }
 
         // Messages list
+        // (filteredMessages and hasStreamingThought are hoisted above the
+        // LaunchedEffects so the scroll logic can use them — see Bug 5 fix.)
         LazyColumn(
             modifier = Modifier.weight(1f).fillMaxWidth(),
             state = listState,
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            val filteredMessages = messages.filter { m ->
-                when (m.role) {
-                    ChatMessage.Role.TOOL -> ui.showToolCalls
-                    else -> true
-                }
-            }
             items(filteredMessages, key = { it.id }) { m ->
-                AnimatedVisibility(
-                    visible = true,
-                    enter = fadeIn(tween(Motion.DurationMedium)),
-                ) {
-                    MessageRow(m, ui)
-                }
+                // U-L2: removed the `AnimatedVisibility(visible = true)`
+                // wrapper — it was always visible so the enter animation
+                // fired once per item on every recomposition with no visual
+                // benefit. Render MessageRow directly.
+                MessageRow(m, ui)
             }
             if (filteredMessages.isEmpty() && s?.status != SessionStatus.RUNNING) {
                 item { EmptyChatPlaceholder() }
             }
-            if (s?.status == SessionStatus.RUNNING) {
+            if (s?.status == SessionStatus.RUNNING && !hasStreamingThought) {
                 item { TypingIndicator() }
             }
         }
@@ -643,6 +672,22 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
             verticalAlignment = Alignment.Bottom,
         ) {
             IconButton(onClick = {
+                // U-M4: refuse to start the overlay service if the user hasn't
+                // granted SYSTEM_ALERT_WINDOW — without it, OverlayService.start()
+                // silently fails and the mic toggle drifts out of sync. Send
+                // the user straight to the Manage Overlay Permission settings
+                // screen instead so they can grant it in one tap.
+                if (!android.provider.Settings.canDrawOverlays(ctx)) {
+                    Log.w(TAG, "Mic toggle blocked: overlay permission not granted")
+                    Toast.makeText(ctx, "Overlay permission required", Toast.LENGTH_SHORT).show()
+                    val intent = Intent(
+                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${ctx.packageName}")
+                    )
+                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    ctx.startActivity(intent)
+                    return@IconButton
+                }
                 // Toggle the floating push-to-talk bubble. Press-and-hold the bubble
                 // to record; release to transcribe and dispatch to the agent loop.
                 val newState = !overlayOn
@@ -692,6 +737,7 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                 BasicTextField(
                     value = text,
                     onValueChange = { text = it },
+                    enabled = !running,
                     textStyle = TextStyle(
                         fontFamily = OmniMono,
                         fontSize = 14.sp,

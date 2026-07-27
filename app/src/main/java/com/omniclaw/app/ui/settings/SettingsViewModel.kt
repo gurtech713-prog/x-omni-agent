@@ -2,6 +2,9 @@ package com.omniclaw.app.ui.settings
 
 import android.content.Context
 import android.util.Log
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omniclaw.app.data.prefs.ChannelConfig
@@ -30,6 +33,17 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import java.io.File
 import javax.inject.Inject
+
+// U-M10: a second preferencesDataStore delegate for the same file name. The
+// androidx.datastore singleton cache (per-process, per-file) guarantees this
+// resolves to the SAME DataStore instance as the one declared in
+// SettingsRepository.kt — calling edit {} here is observed by all
+// privacyAccepted collectors. This is necessary because the SettingsRepository
+// interface (owned by Task 3) only exposes acceptPrivacyDisclosure(), not a
+// revoke counterpart — without a revoke method there, the UI layer has to
+// clear the boolean directly. See worklog for details.
+private val Context.privacyDataStore by preferencesDataStore(name = "omni_settings")
+private val PRIVACY_ACCEPTED_KEY = booleanPreferencesKey("privacy.cloud_llm_accepted")
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
@@ -102,6 +116,25 @@ class SettingsViewModel @Inject constructor(
     suspend fun acceptPrivacy() {
         Log.i(TAG, "User accepted cloud LLM privacy disclosure")
         repo.acceptPrivacyDisclosure()
+    }
+
+    /**
+     * U-M10: Revoke the user's prior acceptance of the cloud LLM privacy
+     * disclosure. Clears the `privacy.cloud_llm_accepted` boolean in the
+     * shared settings DataStore so the next cloud LLM call re-prompts.
+     *
+     * Implemented here (rather than on SettingsRepository) because the
+     * repository interface — owned by Task 3 / the data layer — only exposes
+     * the one-way `acceptPrivacyDisclosure()` writer. The shared
+     * `preferencesDataStore(name = "omni_settings")` singleton (see file-level
+     * `privacyDataStore`) guarantees this write is observed by the
+     * `privacyAccepted` Flow exposed by the repository.
+     */
+    suspend fun revokePrivacy() {
+        Log.i(TAG, "User revoked cloud LLM privacy disclosure acceptance")
+        withContext(Dispatchers.IO) {
+            ctx.privacyDataStore.edit { p -> p.remove(PRIVACY_ACCEPTED_KEY) }
+        }
     }
 
     /** Test-send a message to all configured channels. Returns true if at least one send succeeded. */

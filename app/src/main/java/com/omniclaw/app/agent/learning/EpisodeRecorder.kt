@@ -88,7 +88,6 @@ class EpisodeRecorder @Inject constructor() {
             !verifyOk -> Lesson.LessonOutcome.FAILURE
             else -> Lesson.LessonOutcome.SUCCESS
         }
-        val ep = synchronized(episodes) { episodes[sessionId] } ?: return
         val step = EpisodeStep(
             stepIndex = stepIndex,
             observation = observation.take(500),  // truncate for storage
@@ -99,10 +98,24 @@ class EpisodeRecorder @Inject constructor() {
             toolCallId = call.id,
             timestamp = System.currentTimeMillis(),
         )
-        // Synchronized on the episode itself — the map access is safe via
-        // synchronized(episodes), but the internal MutableList is not.
-        synchronized(ep.steps) {
-            ep.steps.add(step)
+        // A-M6 FIX: combine the episode-map lookup and the step-list mutation
+        // under a SINGLE lock on `episodes`. The previous two-block form
+        // (`synchronized(episodes) { episodes[sessionId] }` to read, then
+        // `synchronized(ep.steps) { ep.steps.add(step) }` to mutate) had a
+        // window between the two locks where another thread could call
+        // `clear(sessionId)` — removing the episode from the map while the
+        // step list was still reachable via the captured `ep` reference.
+        // The step would then be added to a stale episode that the rest of
+        // the system believed was cleared, silently resurrecting recorded
+        // steps for a session that was supposed to be reset. Holding the
+        // `episodes` lock across the add (in addition to the inner
+        // `ep.steps` lock, which guards against concurrent readers like
+        // getEpisode) closes the window.
+        synchronized(episodes) {
+            val ep = episodes[sessionId] ?: return
+            synchronized(ep.steps) {
+                ep.steps.add(step)
+            }
         }
     }
 
@@ -186,7 +199,25 @@ class EpisodeRecorder @Inject constructor() {
      *   "tap(500, 800)"     -> "tap(500,800)"
      *   "launch(com.app)"   -> "launch(com.app)"
      *   "skill:gallery-qa"  -> "skill:gallery-qa"
+     *
+     * A-C3 FIX: whitespace is stripped ONLY outside quoted regions. The
+     * previous implementation `replace(Regex("\\s+"), "")` collapsed
+     * whitespace inside quoted strings too, so `type("hello world")` was
+     * normalized to `type("helloworld")` — silently changing the action's
+     * semantic content. The state machine below preserves the bytes
+     * between unescaped `"` characters verbatim.
      */
-    fun normalizeAction(action: String): String =
-        action.trim().lowercase().replace(Regex("\\s+"), "")
+    fun normalizeAction(action: String): String {
+        val s = action.trim().lowercase()
+        val sb = StringBuilder(s.length)
+        var inQuotes = false
+        for (c in s) {
+            when {
+                c == '"' -> { inQuotes = !inQuotes; sb.append(c) }
+                c.isWhitespace() && !inQuotes -> { /* skip whitespace outside quotes */ }
+                else -> sb.append(c)
+            }
+        }
+        return sb.toString()
+    }
 }

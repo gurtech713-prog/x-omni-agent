@@ -110,11 +110,16 @@ class SecureStorage @Inject constructor(
     fun getSecret(key: String): String {
         if (_state == StorageState.FAILED) return ""
         return runCatching { prefs.getString(key, "").orEmpty() }.getOrElse {
-            // Keystore key invalidated (biometric reset, factory reset restore, etc.)
-            // Reset the corrupted store so subsequent reads do not keep throwing.
+            // Keystore key invalidated (biometric reset, factory reset restore, etc.).
+            // Only remove the offending key — DO NOT clear the whole store. A full
+            // `prefs.edit().clear().commit()` here would nuke EVERY stored secret
+            // (every API key, every webhook, every app credential) just because
+            // ONE key became unreadable. Full-wipe is reserved for explicit user
+            // action (e.g. a "reset secure storage" button in Settings) so a
+            // transient Keystore blip doesn't silently log the user out of every
+            // configured provider at once (D-C2).
             runCatching { removeSecret(key) }
-            runCatching { prefs.edit().clear().commit() }
-            android.util.Log.w(TAG, "SecureStorage read failed for key; store reset. Error: ${it.message}")
+            android.util.Log.w(TAG, "SecureStorage read failed for key '$key'; dropped only this key. Error: ${it.message}")
             ""
         }
     }
@@ -141,12 +146,19 @@ class SecureStorage @Inject constructor(
 
     /**
      * Check whether a secret needs rotation based on its last rotation timestamp.
-     * Returns false if the key has never been rotated (metadata missing).
+     *
+     * D-M7: returns TRUE when rotation metadata is missing. Previously this
+     * returned false, which meant a key whose metadata was lost (e.g. by an
+     * app reinstall that preserved the secret but not the metadata sidecar)
+     * would NEVER be flagged for rotation — its age was treated as "unknown but
+     * fine". Treating missing metadata as "age unknown, rotate" is the safer
+     * default: an unnecessary rotation is cheap, but a permanently-unrotated
+     * key is a silent security regression.
      */
     fun needsRotation(key: String, maxDays: Long = DEFAULT_ROTATION_DAYS): Boolean {
         if (_state == StorageState.FAILED) return false
-        val rotatedAtStr = prefs.getString(metadataKey(key, ROTATED_AT_SUFFIX), null) ?: return false
-        val rotatedAt = rotatedAtStr.toLongOrNull() ?: return false
+        val rotatedAtStr = prefs.getString(metadataKey(key, ROTATED_AT_SUFFIX), null) ?: return true
+        val rotatedAt = rotatedAtStr.toLongOrNull() ?: return true
         val milliseconds = TimeUnit.DAYS.toMillis(maxDays)
         return (System.currentTimeMillis() - rotatedAt) > milliseconds
     }

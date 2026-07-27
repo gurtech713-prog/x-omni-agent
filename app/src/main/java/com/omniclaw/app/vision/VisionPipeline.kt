@@ -131,12 +131,14 @@ class VisionPipeline @Inject constructor(
     }
 
     /**
-     * Streaming variant — emits text deltas as the VLM generates them.
-     * Currently delegates to the non-streaming path and emits the full
-     * result at once; a true SSE streaming implementation would parse
-     * the `stream: true` response line-by-line.
+     * V-L1: SIMULATED streaming — emits the full VLM response in ~32-char
+     * chunks for UI compatibility. This is NOT true token streaming; the
+     * underlying [describe] call completes before chunks are emitted, so the
+     * first chunk arrives only after the full VLM response is available.
+     * Renamed from `stream` to make the simulation explicit. The legacy
+     * `stream` alias is kept below for source-compat with out-of-scope callers.
      */
-    fun stream(imageBytes: ByteArray, question: String): Flow<String> = flow {
+    fun streamSimulated(imageBytes: ByteArray, question: String): Flow<String> = flow {
         val full = describe(imageBytes, question) ?: return@flow
         // Emit in ~32-char chunks to simulate streaming.
         var i = 0
@@ -147,11 +149,26 @@ class VisionPipeline @Inject constructor(
         }
     }.flowOn(Dispatchers.IO)
 
+    /** Source-compat alias for [streamSimulated] (V-L1). */
+    fun stream(imageBytes: ByteArray, question: String): Flow<String> =
+        streamSimulated(imageBytes, question)
+
     /** Clear the vision cache (e.g. on memory pressure). */
     fun clearCache() = cache.clear()
 
     /** Number of cached vision responses. */
     val cacheSize: Int get() = cache.size
+
+    /**
+     * V-M1: tear down the vision cache's scheduled sweep executor. Call from
+     * the app's lifecycle teardown (e.g. OmniApplication.onTerminate or a
+     * ProcessLifecycle ON_STOP observer). onTerminate is unreliable on real
+     * devices, so this method is intentionally idempotent and safe to skip —
+     * the sweep thread is a daemon and won't block JVM exit.
+     */
+    fun shutdown() {
+        cache.close()
+    }
 
     /**
      * Sniff the image MIME type from the magic byte signature.
