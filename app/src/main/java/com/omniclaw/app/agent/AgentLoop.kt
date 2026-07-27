@@ -548,27 +548,58 @@ class AgentLoop @Inject constructor(
                 // downstream parsing/dispatch/verify runs unchanged - but the action now
                 // comes from a VALIDATED JSON object (no regex, no silent tap(0,0)), and
                 // usage uses the provider's REAL token counts.
-                if (tuning.useStructuredTools) {
-                    // PERF-FIX (slow agent response): emit an immediate
-                    // placeholder Thought so the UI shows feedback the instant
-                    // the LLM call starts, instead of waiting for the full
-                    // non-streaming complete() to return. The structured-tools
-                    // path uses llm.complete() (non-streaming) because most
-                    // OpenAI-compat providers don't reliably stream tool_call
-                    // deltas — but that means the user sees nothing for the
-                    // full LLM latency (1-8s on typical providers). This
-                    // placeholder is overwritten by the real Thought event
-                    // emitted below once complete() returns. isFinal=false so
-                    // the UI treats it as a streaming bubble.
+                if (tuning.useStructuredTools && toolsDisabledSessions[sessionId] != true) {
+                    // FIX (live thinking + openai-compat agent failed):
+                    //
+                    // PREVIOUSLY: this path called llm.complete() (NON-streaming)
+                    // and emitted ONE Thought event AFTER the full response
+                    // returned. The user stared at a blank chat bubble for the
+                    // full LLM latency (1-8s on typical providers). That's why
+                    // "live thinking is not showing" — there was no streaming
+                    // on this path at all.
+                    //
+                    // NOW: we use llm.streamWithTools() — a real SSE stream
+                    // that emits both `delta.content` (the visible thinking
+                    // text, token-by-token) AND `delta.tool_calls[i]` chunks
+                    // (the structured tool call, arguments arriving in
+                    // fragments that we concatenate by index). The user sees
+                    // live thinking text the moment the first token arrives,
+                    // and the tool_call is assembled as the stream progresses.
+                    //
+                    // If the provider returns HTTP 400 / 422 (typically "I
+                    // don't support the `tools` parameter"), we mark the
+                    // session as tools-disabled and fall through to the plain
+                    // streaming path below, which sends no `tools` array. This
+                    // is the fix for "openai-compat agent failed" — many
+                    // self-hosted / older OpenAI-compat endpoints (Ollama,
+                    // llama.cpp, some China providers) reject `tools` and the
+                    // old code would burn through the structured-tools call,
+                    // the streaming call, AND the non-streaming fallback
+                    // before surfacing the error.
                     _events.tryEmit(Event.Thought(sessionId, step, "Thinking…", isFinal = false))
-                    // A-H4 FIX: use runCatchingCancellable so a session-level
-                    // CancellationException (timeout / user-stop / supersession)
-                    // propagates instead of being swallowed into Result.failure
-                    // — otherwise the session-timeout would never reach the outer
-                    // withTimeoutOrNull (see A-C2).
-                    runCatchingCancellable {
+
+                    val thoughtBuilder = StringBuilder()
+                    // tool_call arguments arrive in fragments — accumulate per index.
+                    val toolCallArgs = mutableMapOf<Int, StringBuilder>()
+                    // tool_call id+name arrive only in the FIRST delta for each
+                    // index; subsequent deltas for the same index have nulls.
+                    val toolCallMeta = mutableMapOf<Int, Pair<String?, String?>>()
+                    var streamHadToolCall = false
+                    var streamHadText = false
+                    var lastEmitMs = 0L
+
+                    try {
+                        // Use plain withTimeout + collect (NOT runCatchingCancellable)
+                        // because we want to INSPECT the exception below to decide
+                        // whether to disable tools for the session. runCatchingCancellable
+                        // would swallow the exception into Result.failure and we'd
+                        // lose the HTTP status code.
+                        //
+                        // CancellationException is re-thrown by the explicit catch
+                        // below — same contract as runCatchingCancellable, but with
+                        // access to the non-cancellation exception for inspection.
                         withTimeout(stepTimeoutMs) {
-                            llm.complete(
+                            llm.streamWithTools(
                                 provider = cfg.provider,
                                 baseUrl = cfg.baseUrl,
                                 apiKey = cfg.apiKey,
@@ -578,27 +609,109 @@ class AgentLoop @Inject constructor(
                                 maxTokens = cfg.maxTokens,
                                 tools = listOf(DeviceToolSchema.SPEC),
                                 toolChoice = "auto",
-                            )
+                            ).collect { chunk ->
+                                when (chunk) {
+                                    is LlmClient.StreamChunk.TextDelta -> {
+                                        thoughtBuilder.append(chunk.text)
+                                        streamHadText = true
+                                        // Throttle UI emissions to ~20/sec so we
+                                        // don't drown the main thread with dozens
+                                        // of recompositions per second. Always
+                                        // emit the first few chars so the user
+                                        // sees feedback instantly.
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastEmitMs >= 50L || thoughtBuilder.length < 15) {
+                                            lastEmitMs = now
+                                            _events.tryEmit(Event.Thought(sessionId, step, thoughtBuilder.toString()))
+                                        }
+                                    }
+                                    is LlmClient.StreamChunk.ToolCallDelta -> {
+                                        streamHadToolCall = true
+                                        toolCallArgs.getOrPut(chunk.index) { StringBuilder() }
+                                            .append(chunk.argumentsChunk)
+                                        // Merge id+name — they arrive in the first
+                                        // delta for each index, null in subsequent.
+                                        val existing = toolCallMeta[chunk.index]
+                                        toolCallMeta[chunk.index] = Pair(
+                                            chunk.id ?: existing?.first,
+                                            chunk.name ?: existing?.second,
+                                        )
+                                    }
+                                    is LlmClient.StreamChunk.Done -> {
+                                        // finishReason available if needed for
+                                        // length-based budget logic; not used here.
+                                    }
+                                }
+                            }
                         }
-                    }.getOrNull()?.let { res ->
-                        val tc = res.toolCalls.firstOrNull()
-                        if (tc != null) {
-                            val parsed = DeviceToolSchema.parse(tc.arguments)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // Timeout / user-stop / supersession — propagate to the
+                        // outer handler so the session is marked FAILED or
+                        // exits silently. Same contract as runCatchingCancellable.
+                        throw e
+                    } catch (e: com.omniclaw.app.data.llm.LlmException) {
+                        // HTTP 400 / 422 typically means the provider doesn't
+                        // support the `tools` parameter. Mark the session so
+                        // subsequent steps skip the structured-tools path and
+                        // go straight to plain streaming (which sends no tools).
+                        // This is the key fix for "openai-compat agent failed"
+                        // — we don't keep retrying with tools that the provider
+                        // rejects.
+                        val msg = e.message.orEmpty()
+                        if (msg.contains("HTTP 400") || msg.contains("HTTP 422")) {
+                            toolsDisabledSessions[sessionId] = true
+                            Log.w(TAG, "Session $sessionId: provider rejected tools ($msg) — disabling structured tools for this session, falling back to plain streaming")
+                        }
+                        // For other HTTP errors (5xx, 429) or parse errors,
+                        // don't disable tools permanently — just fall through
+                        // to the streaming path below for this one step.
+                    } catch (e: Exception) {
+                        // Any other exception (IOException, parse error, etc.)
+                        // — don't disable tools, just fall through to the
+                        // streaming path below for this one step.
+                        Log.w(TAG, "Session $sessionId step $step: streamWithTools failed (${e::class.simpleName}: ${e.message}) — falling back to plain streaming")
+                    }
+
+                    // If we got a tool_call, assemble the canonical
+                    // THOUGHT/ACTION text from the accumulated arguments.
+                    if (streamHadToolCall) {
+                        val firstCallIdx = toolCallArgs.keys.minOrNull() ?: 0
+                        val args = toolCallArgs[firstCallIdx]?.toString() ?: "{}"
+                        val parsed = runCatching { DeviceToolSchema.parse(args) }.getOrNull()
+                        if (parsed != null) {
                             val canonical = DeviceToolSchema.toActionLine(parsed.action)
                             streamedThought = buildString {
                                 append("THOUGHT: ")
-                                appendLine(parsed.thought.ifBlank { "Acting on the plan." })
+                                // Prefer the structured `thought` field; fall
+                                // back to the streamed text (some providers
+                                // emit reasoning in `content` before the
+                                // tool_call, not inside the tool args).
+                                appendLine(parsed.thought.ifBlank {
+                                    thoughtBuilder.toString().ifBlank { "Acting on the plan." }
+                                })
                                 when {
                                     parsed.done -> appendLine("ACTION: done")
                                     canonical != null -> appendLine("ACTION: $canonical")
                                     else -> appendLine("ACTION: invalid")
                                 }
                             }.trimEnd()
-                            structuredUsage = res.usage
-                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!))
-                            // Preview ToolCall emit removed (M-08): the canonical event is emitted after dispatch.
+                            // structuredUsage stays null — token counts aren't
+                            // reliably provided in streaming SSE. The estimate
+                            // computed below will be used instead.
+                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
                         }
+                    } else if (streamHadText) {
+                        // No tool_call — the model returned plain text (a
+                        // conversational reply). Use the accumulated text as
+                        // the thought. The downstream action parser looks for
+                        // "ACTION:" lines; if none, it treats it as a "done"
+                        // reply, which is exactly what we want for chat.
+                        streamedThought = thoughtBuilder.toString()
+                        _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
                     }
+                    // If neither text nor tool_call arrived (empty response),
+                    // streamedThought stays null and we fall through to the
+                    // plain streaming path below as a last-resort retry.
                 }
                 // Per-step timeout — prevents a single slow LLM call (or a
                 // hung connection) from blocking the session for 10+ minutes.
@@ -1440,6 +1553,22 @@ class AgentLoop @Inject constructor(
      */
     private val lastLessonCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String?>>()
 
+    /**
+     * FIX (openai-compat agent failed): per-session flag marking the active
+     * provider as NOT supporting the OpenAI `tools` parameter. Set when the
+     * structured-tools streaming call returns HTTP 400 or 422 (the standard
+     * "I don't understand this field" codes) — once set, subsequent steps in
+     * the same session skip the structured-tools path entirely and use the
+     * plain streaming path (which sends no `tools` array).
+     *
+     * This is per-session (not global) because the user may switch providers
+     * between sessions — a session started against Ollama (no tools support)
+     * shouldn't disable tools for a later session against GLM (tools supported).
+     *
+     * Cleared in [clearHistoryCache] when the session ends.
+     */
+    private val toolsDisabledSessions = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     private suspend fun buildHistory(sessionId: String): List<LlmClient.Message> {
         val cached = historyCache.getOrPut(sessionId) { mutableListOf() }
         // PERF-FIX (slow agent response): use the in-memory snapshot instead
@@ -1494,6 +1623,10 @@ class AgentLoop @Inject constructor(
         // future run on the same session doesn't see stale lessons from a
         // different observation.
         lastLessonCache.remove(sessionId)
+        // FIX (openai-compat agent failed): also clear the tools-disabled flag
+        // so a future run on the same session (potentially with a different
+        // provider after the user changed Settings) re-tries structured tools.
+        toolsDisabledSessions.remove(sessionId)
     }
 
     private suspend fun isStopRequested(sessionId: String): Boolean {

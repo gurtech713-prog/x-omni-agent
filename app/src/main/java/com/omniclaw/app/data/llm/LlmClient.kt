@@ -101,6 +101,43 @@ class LlmClient @Inject constructor(
         val toolCalls: List<LlmToolCall> = emptyList(),
     )
 
+    /**
+     * Streaming chunk emitted by [streamWithTools]. The collector assembles
+     * these into a final [CompletionResult]-equivalent state:
+     *   - [TextDelta]      — append to the assistant's visible text (live thinking)
+     *   - [ToolCallDelta]  — append to `tool_calls[index].function.arguments`;
+     *                        `id` and `name` arrive in the FIRST delta for that
+     *                        index and are null in subsequent deltas.
+     *   - [Done]           — the stream is complete; `finishReason` may be
+     *                        "stop", "tool_calls", "length", etc.
+     *
+     * OpenAI SSE shape for tool-call streaming (what this parses):
+     * ```
+     * data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"device_action","arguments":""}}]}}]}
+     * data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\""}}]}}]}
+     * data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"thought"}}]}}]}
+     * ...
+     * data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}
+     * data: {"choices":[{"finish_reason":"tool_calls"}]}
+     * data: [DONE]
+     * ```
+     *
+     * The `arguments` string is split across many deltas — the collector MUST
+     * concatenate them in order before parsing the final JSON. The `id` and
+     * `name` are sent only once (in the first delta for that index) and are
+     * null in all subsequent deltas for the same index.
+     */
+    sealed class StreamChunk {
+        data class TextDelta(val text: String) : StreamChunk()
+        data class ToolCallDelta(
+            val index: Int,
+            val id: String?,
+            val name: String?,
+            val argumentsChunk: String,
+        ) : StreamChunk()
+        data class Done(val finishReason: String?) : StreamChunk()
+    }
+
     /** Non-streaming completion. Cancellable. Supports Hermes-style structured tool-calling. */
     suspend fun complete(
         baseUrl: String,
@@ -168,12 +205,23 @@ class LlmClient @Inject constructor(
             put("max_tokens", maxTokens)
             put("stream", true)
             putJsonArray("messages") {
-                messages.forEach { m ->
-                    add(buildJsonObject {
-                        put("role", m.role)
-                        put("content", m.content)
-                    })
-                }
+                // FIX (openai-compat agent failed): use the same messageToJson
+                // helper that complete() uses, so tool_calls on assistant
+                // messages and tool_call_id on tool messages are preserved.
+                //
+                // Previously this inlined a simplified {role, content} object
+                // that STRIPPED tool_calls and tool_call_id. After the first
+                // device_action tool call, the conversation history contains a
+                // `{"role":"tool","content":"..."}` message — OpenAI-compat
+                // endpoints that strictly validate (OpenAI itself, many
+                // compatible providers) return HTTP 400 because tool messages
+                // MUST carry tool_call_id. The streaming path would fail
+                // silently, the non-streaming fallback would also fail (same
+                // malformed history), and the user saw "agent failed".
+                //
+                // messageToJson already handles tool_calls + tool_call_id
+                // correctly, so reusing it here is the one-line fix.
+                messages.forEach { m -> add(messageToJson(m)) }
             }
         }
         val call = streamingHttp.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
@@ -247,6 +295,161 @@ class LlmClient @Inject constructor(
                                     channel.close(IllegalStateException("back-pressure"))
                                     return
                                 }
+                            }
+                        }
+                        channel.close()
+                    } catch (e: IOException) {
+                        channel.close(e)
+                    }
+                }
+            }
+        })
+    }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.SUSPEND).flowOn(Dispatchers.IO)
+
+    /**
+     * Streaming completion WITH tools support — emits [StreamChunk] events
+     * (text deltas + tool_call deltas + done) so the caller can show live
+     * "thinking" text while ALSO accumulating a structured tool_call.
+     *
+     * This is the streaming equivalent of [complete] with `tools` set. It's
+     * what the agent loop's structured-tools path SHOULD use so the user
+     * sees token-by-token thinking instead of a blank screen for the full
+     * LLM latency.
+     *
+     * OpenAI's chat-completions API supports `stream: true` + `tools` + 
+     * `tool_choice` natively. The SSE deltas include `delta.tool_calls[i]`
+     * chunks that must be accumulated by `index` — the `arguments` field
+     * arrives in many small string fragments that must be concatenated in
+     * order before the final JSON can be parsed.
+     *
+     * Cancellable: coroutine cancellation cancels the underlying OkHttp call.
+     *
+     * Back-pressure: same as [stream] — if the downstream collector can't
+     * keep up, the channel closes cleanly so the caller can fall back.
+     */
+    fun streamWithTools(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        messages: List<Message>,
+        temperature: Float = 0.2f,
+        maxTokens: Int = 2048,
+        tools: List<ToolSpec>? = null,
+        toolChoice: String? = null,
+    ): Flow<StreamChunk> = callbackFlow {
+        val payload = buildJsonObject {
+            put("model", model)
+            put("temperature", temperature.toDouble())
+            put("max_tokens", maxTokens)
+            put("stream", true)
+            putJsonArray("messages") {
+                messages.forEach { m -> add(messageToJson(m)) }
+            }
+            if (tools != null) {
+                putJsonArray("tools") {
+                    tools.forEach { t ->
+                        add(buildJsonObject {
+                            put("type", "function")
+                            putJsonObject("function") {
+                                put("name", t.name)
+                                put("description", t.description)
+                                put("parameters", json.parseToJsonElement(t.parametersSchema).jsonObject)
+                            }
+                        })
+                    }
+                }
+                put("tool_choice", toolChoice ?: "auto")
+            }
+        }
+        val call = streamingHttp.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
+
+        // Coroutine cancellation → cancel the OkHttp call.
+        awaitClose { runCatching { call.cancel() } }
+
+        call.enqueue(object : Callback {
+            override fun onFailure(c: Call, e: IOException) {
+                if (channel.isClosedForSend) return
+                channel.close(
+                    if (e is IOException && c.isCanceled()) CancellationException("Stream cancelled")
+                    else e
+                )
+            }
+
+            override fun onResponse(c: Call, r: Response) {
+                r.use { resp ->
+                    if (!resp.isSuccessful) {
+                        // D-H5: drain the error body so the connection can be
+                        // reused, but do NOT include it in the exception — it
+                        // may contain the echoed request (prompt, Bearer token).
+                        runCatching { resp.body?.string() }
+                        if (resp.code == 429) {
+                            val retryAfter = resp.header("Retry-After")?.toIntOrNull()
+                            channel.close(RateLimitException(retryAfter, "HTTP 429"))
+                            return
+                        }
+                        channel.close(LlmException("HTTP ${resp.code}"))
+                        return
+                    }
+                    val src = resp.body?.source()
+                    if (src == null) {
+                        channel.close(LlmException("Empty response body"))
+                        return
+                    }
+                    try {
+                        while (!src.exhausted()) {
+                            if (channel.isClosedForSend) return
+                            val line = src.readUtf8Line() ?: break
+                            if (!line.startsWith("data:")) continue
+                            val data = line.removePrefix("data:").trim()
+                            if (data == "[DONE]") {
+                                channel.trySend(StreamChunk.Done(null))
+                                break
+                            }
+                            val obj = runCatching {
+                                json.parseToJsonElement(data).jsonObject
+                            }.getOrNull() ?: continue
+                            val choiceObj = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
+                                ?: continue
+                            val deltaObj = choiceObj["delta"]?.jsonObject
+
+                            // ---- Text content delta (the "live thinking" text) ----
+                            val deltaContent = (deltaObj?.get("content") as? JsonPrimitive)?.content.orEmpty()
+                            val deltaReasoning = (deltaObj?.get("reasoning_content") as? JsonPrimitive)?.content.orEmpty()
+                            val deltaReasoningAlt = (deltaObj?.get("reasoning") as? JsonPrimitive)?.content.orEmpty()
+                            val text = deltaContent.ifEmpty { deltaReasoning.ifEmpty { deltaReasoningAlt } }
+                            if (text.isNotEmpty()) {
+                                if (!channel.trySend(StreamChunk.TextDelta(text)).isSuccess) {
+                                    Log.w(TAG, "streamWithTools back-pressure: closing")
+                                    channel.close(IllegalStateException("back-pressure"))
+                                    return
+                                }
+                            }
+
+                            // ---- Tool call deltas (accumulated by index) ----
+                            val toolCallsArray = deltaObj?.get("tool_calls")?.jsonArray
+                            if (toolCallsArray != null) {
+                                for (tcEl in toolCallsArray) {
+                                    val tcObj = runCatching { tcEl.jsonObject }.getOrNull() ?: continue
+                                    val idx = (tcObj["index"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
+                                    val id = (tcObj["id"] as? JsonPrimitive)?.content
+                                    val fnObj = tcObj["function"]?.jsonObject
+                                    val name = (fnObj?.get("name") as? JsonPrimitive)?.content
+                                    val argsChunk = (fnObj?.get("arguments") as? JsonPrimitive)?.content.orEmpty()
+                                    if (!channel.trySend(
+                                            StreamChunk.ToolCallDelta(idx, id, name, argsChunk)
+                                        ).isSuccess
+                                    ) {
+                                        Log.w(TAG, "streamWithTools back-pressure: closing")
+                                        channel.close(IllegalStateException("back-pressure"))
+                                        return
+                                    }
+                                }
+                            }
+
+                            // ---- Finish reason (sent in the final delta, not [DONE]) ----
+                            val finishReason = (choiceObj["finish_reason"] as? JsonPrimitive)?.content
+                            if (finishReason != null) {
+                                channel.trySend(StreamChunk.Done(finishReason))
                             }
                         }
                         channel.close()

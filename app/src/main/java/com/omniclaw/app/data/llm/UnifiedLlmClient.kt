@@ -121,6 +121,80 @@ class UnifiedLlmClient @Inject constructor(
         }
     }
 
+    /**
+     * Streaming variant WITH tools support — emits [LlmClient.StreamChunk]
+     * events (text deltas + tool_call deltas + done) so the caller can show
+     * live "thinking" text while ALSO accumulating a structured tool_call.
+     *
+     * This is the streaming equivalent of [complete] with `tools` set, and
+     * is what the agent loop's structured-tools path uses to give the user
+     * token-by-token feedback instead of a blank screen for the full LLM
+     * latency.
+     *
+     * Provider behavior:
+     *   - OPENAI_COMPAT: native SSE streaming with `tools` + `tool_choice`.
+     *     Parses `delta.tool_calls[i]` chunks (arguments come in fragments
+     *     that must be concatenated by index) and `delta.content` for the
+     *     visible "thinking" text.
+     *   - GEMINI: streaming-with-tools not yet implemented in [GeminiClient]
+     *     (Gemini's SSE format is a chunked JSON array, not OpenAI-style
+     *     `data:` lines, and `functionCall` parts arrive in a single
+     *     non-streamed chunk). We fall back to a non-streaming [gemini.complete]
+     *     call and emit the result as a single TextDelta + ToolCallDelta +
+     *     Done sequence. The user sees one burst of text instead of true
+     *     token-by-token streaming, but the tool_call still arrives.
+     *   - LITERT: same pattern — local inference is non-streaming at the
+     *     UnifiedLlmClient layer (LocalLlmClient decodes greedily); we emit
+     *     the full text as a single TextDelta.
+     */
+    fun streamWithTools(
+        provider: LlmProvider,
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        messages: List<LlmClient.Message>,
+        temperature: Float = 0.2f,
+        maxTokens: Int = 2048,
+        tools: List<ToolSpec>? = null,
+        toolChoice: String? = null,
+    ): kotlinx.coroutines.flow.Flow<LlmClient.StreamChunk> = when (provider) {
+        LlmProvider.OPENAI_COMPAT -> openAi.streamWithTools(
+            baseUrl, apiKey, model, messages, temperature, maxTokens, tools, toolChoice,
+        )
+        LlmProvider.GEMINI -> {
+            // Gemini streaming-with-tools not yet implemented — fall back to
+            // non-streaming complete() and emit the result as a synthetic
+            // chunk sequence. This preserves the StreamChunk contract so the
+            // agent loop's collector doesn't need provider-specific branches.
+            val url = baseUrl.ifBlank { gemini.defaultBaseUrl }
+            kotlinx.coroutines.flow.flow {
+                val result = gemini.complete(
+                    url, apiKey, model, messages, temperature, maxTokens, tools, toolChoice,
+                )
+                if (result.text.isNotEmpty()) {
+                    emit(LlmClient.StreamChunk.TextDelta(result.text))
+                }
+                result.toolCalls.forEachIndexed { idx, tc ->
+                    // Emit the full arguments as a single chunk — the collector
+                    // concatenates by index, so a single chunk yields the final
+                    // arguments string directly.
+                    emit(LlmClient.StreamChunk.ToolCallDelta(idx, tc.id, tc.name, tc.arguments))
+                }
+                emit(LlmClient.StreamChunk.Done(result.finishReason.ifBlank { null }))
+            }
+        }
+        LlmProvider.LITERT -> {
+            kotlinx.coroutines.flow.flow {
+                val (family, path) = parseLocalModelSpec(model)
+                val result = local.complete(path, family, messages, maxTokens)
+                if (result.text.isNotEmpty()) {
+                    emit(LlmClient.StreamChunk.TextDelta(result.text))
+                }
+                emit(LlmClient.StreamChunk.Done(result.finishReason.ifBlank { null }))
+            }
+        }
+    }
+
     /** Split "local-gemma:models/gemma-2b.tflite" -> ("gemma", "models/gemma-2b.tflite"). */
     private fun parseLocalModelSpec(model: String): Pair<String, String> {
         val s = model.removePrefix("local-")
