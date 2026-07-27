@@ -296,9 +296,15 @@ class GeminiClient(
         }
         val call = http.newCall(buildRequest(url, apiKey, payload.toString()))
 
-        // Coroutine cancellation → cancel the OkHttp call.
-        awaitClose { runCatching { call.cancel() } }
-
+        // CRITICAL FIX (agent not working / did not respond in time):
+        // call.enqueue MUST come BEFORE awaitClose. awaitClose suspends the
+        // producer coroutine until the channel closes; if it's called first,
+        // call.enqueue is UNREACHABLE CODE — no HTTP request is ever made,
+        // the collector waits forever, and the agent loop's withTimeout(45s)
+        // fires → "The AI provider did not respond in time."
+        //
+        // See LlmClient.stream() for the full explanation. Same fix applied
+        // here for the Gemini streaming path.
         call.enqueue(object : Callback {
             override fun onFailure(c: Call, e: IOException) {
                 if (channel.isClosedForSend) return
@@ -432,6 +438,12 @@ class GeminiClient(
                 return delta
             }
         })
+
+        // CRITICAL FIX: awaitClose MUST be the LAST statement — see the long
+        // comment above the call.enqueue block. Suspends until the collector
+        // cancels (or the channel closes from inside the callback), then
+        // cancels the OkHttp call so the socket closes promptly.
+        awaitClose { runCatching { call.cancel() } }
     }.buffer(Channel.UNLIMITED).flowOn(Dispatchers.IO)
 
     // ------------------------------------------------------------------

@@ -119,13 +119,23 @@ object DeviceToolSchema {
      * downstream logging / replay still expects. Returns null for a null
      * action or [DeviceAction.NoOp] (nothing to dispatch), which callers
      * surface as an invalid action rather than a bogus gesture. (C-02)
+     *
+     * CRITICAL FIX (agentic tasks not working): `type(...)` now WRAPS the
+     * text in double quotes. Previously it emitted `type(hello, world)`
+     * (unquoted), but `parseDeviceAction`'s primary regex requires quotes:
+     * `type\s*\(\s*"(.*?)"\s*\)`. The unquoted form fell through to the
+     * non-greedy fallback regex which mis-extracted text containing commas
+     * or closing parens — `type(a,b)` became `a`, `type(a)b)` became `a`.
+     * This corrupted text input whenever the text contained `,` or `)`,
+     * silently dispatching the wrong text. Quoting round-trips correctly
+     * through both the primary regex and the structured tool_call path.
      */
     fun toActionLine(action: DeviceAction?): String? = when (action) {
         null -> null
         DeviceAction.NoOp -> null
         is DeviceAction.Tap -> "tap(${action.x},${action.y})"
         is DeviceAction.Swipe -> "swipe(${action.x1},${action.y1},${action.x2},${action.y2})"
-        is DeviceAction.Type -> "type(${action.text})"
+        is DeviceAction.Type -> "type(\"${action.text}\")"
         is DeviceAction.Launch -> "launch(${action.packageName})"
         DeviceAction.Back -> "back"
         DeviceAction.Home -> "home"

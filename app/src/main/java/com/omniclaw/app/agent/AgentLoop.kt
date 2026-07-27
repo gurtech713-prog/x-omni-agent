@@ -534,6 +534,27 @@ class AgentLoop @Inject constructor(
 
             val thought: String
             val usage: LlmUsage
+            // CRITICAL FIX (agentic tasks not working): capture the LLM's
+            // tool_call id so we can set it on BOTH the assistant message
+            // (as tool_calls) AND the tool message (as tool_call_id).
+            //
+            // PREVIOUSLY: the assistant message was appended with only
+            // `content = thought` (no toolCalls), and the tool message was
+            // appended with `toolCalls = listOf(call)` (wrong — tool messages
+            // must NOT carry tool_calls) and NO toolCallId. On step 2, the
+            // OpenAI-compat endpoint saw an assistant message without
+            // tool_calls followed by a tool message without tool_call_id →
+            // HTTP 400 → "agent failed". This broke EVERY multi-step agentic
+            // task: step 1 dispatched the action, but the session died before
+            // step 2 could run.
+            //
+            // Now: structuredToolCallId holds the LLM's tool_call id (from
+            // the SSE stream's first ToolCallDelta), and structuredToolCallArgs
+            // holds the raw arguments JSON. These are used below to build
+            // well-formed assistant + tool messages that pass OpenAI's
+            // conversation-history validation on step 2+.
+            var structuredToolCallId: String? = null
+            var structuredToolCallArgs: String? = null
             try {
                 // ---- Streaming: collect the thought token-by-token so the UI
                 // can show live progress. The stream() flow emits deltas; we
@@ -586,6 +607,15 @@ class AgentLoop @Inject constructor(
                     val toolCallMeta = mutableMapOf<Int, Pair<String?, String?>>()
                     var streamHadToolCall = false
                     var streamHadText = false
+                    // CRITICAL FIX (did not respond in time): track whether the
+                    // stream COMPLETED NORMALLY (no exception). If it did AND
+                    // produced neither text nor tool_call, that's a legitimate
+                    // empty response — we should NOT fall through to the plain
+                    // streaming path (which would send the entire prompt again,
+                    // doubling cost and latency). Only fall through when the
+                    // stream actually FAILED (exception), in which case the
+                    // plain streaming path is a legitimate retry.
+                    var streamCompletedNormally = false
                     var lastEmitMs = 0L
 
                     try {
@@ -644,6 +674,12 @@ class AgentLoop @Inject constructor(
                                 }
                             }
                         }
+                        // If we reach here, the stream completed without throwing
+                        // (no timeout, no HTTP error, no IOException). Mark it so
+                        // the assembly logic below knows this was a NORMAL completion
+                        // and an empty result is a legitimate empty response (not a
+                        // reason to fall through to the plain streaming retry).
+                        streamCompletedNormally = true
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         // Timeout / user-stop / supersession — propagate to the
                         // outer handler so the session is marked FAILED or
@@ -666,10 +702,46 @@ class AgentLoop @Inject constructor(
                         // don't disable tools permanently — just fall through
                         // to the streaming path below for this one step.
                     } catch (e: Exception) {
-                        // Any other exception (IOException, parse error, etc.)
-                        // — don't disable tools, just fall through to the
-                        // streaming path below for this one step.
-                        Log.w(TAG, "Session $sessionId step $step: streamWithTools failed (${e::class.simpleName}: ${e.message}) — falling back to plain streaming")
+                        // CRITICAL FIX (did not respond in time): distinguish
+                        // FATAL errors (don't retry — surface immediately) from
+                        // RETRYABLE errors (fall through to plain streaming).
+                        //
+                        // The previous code caught EVERY exception here and
+                        // fell through to the plain streaming path — which
+                        // meant a single transient error caused a 3× timeout
+                        // cascade (structured-tools 45s + plain stream 45s +
+                        // non-streaming fallback 45s = 135s) before the user
+                        // saw any error. Fatal errors (auth, bad URL, etc.)
+                        // would fail the SAME way on all 3 paths, so retrying
+                        // was pure waste.
+                        //
+                        // Fatal errors (surface immediately by re-throwing so
+                        // the outer catch at ~line 880 handles them):
+                        //   - IllegalArgumentException: bad base URL (e.g.
+                        //     "Refusing cleartext http:// LLM endpoint")
+                        //   - SecurityException: network security config
+                        //   - LlmException with HTTP 401/403: bad API key
+                        //     (note: these are LlmException, caught above —
+                        //      but defensive: if a subclass escapes, re-throw)
+                        //
+                        // Retryable errors (fall through to plain streaming):
+                        //   - IOException: network transient (DNS, connection
+                        //     reset, mobile handoff)
+                        //   - IllegalStateException: back-pressure (rare)
+                        //   - Other RuntimeException: parse errors, etc.
+                        val isFatal = when (e) {
+                            is IllegalArgumentException -> true
+                            is SecurityException -> true
+                            else -> {
+                                val msg = e.message.orEmpty()
+                                msg.contains("HTTP 401") || msg.contains("HTTP 403")
+                            }
+                        }
+                        if (isFatal) {
+                            Log.w(TAG, "Session $sessionId step $step: streamWithTools fatal error (${e::class.simpleName}: ${e.message}) — surfacing immediately, no retry")
+                            throw e
+                        }
+                        Log.w(TAG, "Session $sessionId step $step: streamWithTools retryable error (${e::class.simpleName}: ${e.message}) — falling back to plain streaming")
                     }
 
                     // If we got a tool_call, assemble the canonical
@@ -677,8 +749,47 @@ class AgentLoop @Inject constructor(
                     if (streamHadToolCall) {
                         val firstCallIdx = toolCallArgs.keys.minOrNull() ?: 0
                         val args = toolCallArgs[firstCallIdx]?.toString() ?: "{}"
+                        // CRITICAL FIX (agentic tasks not working): capture the
+                        // LLM's tool_call id + raw arguments so the assistant
+                        // and tool messages appended below carry the correct
+                        // tool_calls / tool_call_id fields. Without these, step
+                        // 2's LLM call sees malformed history and returns
+                        // HTTP 400 ("tool messages must have tool_call_id").
+                        structuredToolCallArgs = args
+                        structuredToolCallId = toolCallMeta[firstCallIdx]?.first
+                            ?: java.util.UUID.randomUUID().toString()
                         val parsed = runCatching { DeviceToolSchema.parse(args) }.getOrNull()
-                        if (parsed != null) {
+                        // CRITICAL FIX (skills not working): when the LLM emits
+                        // a `device_action` tool_call with action="done" AND
+                        // the streamed text contains "ACTION: skill:", prefer
+                        // the TEXT over the tool_call. The `device_action` tool
+                        // schema's enum doesn't include "skill" — so the LLM
+                        // can't emit a structured skill tool_call. Instead it
+                        // emits the skill action as plain text alongside a
+                        // "done" tool_call (because "done" is the closest
+                        // semantic match). Without this fix, the tool_call
+                        // branch would synthesize "ACTION: done" and the skill
+                        // action in the text would be DISCARDED — the skill
+                        // would never be invoked. With this fix, we detect the
+                        // skill action in the text and use it instead.
+                        val textContent = thoughtBuilder.toString()
+                        val hasSkillActionInText = textContent.contains("ACTION: skill:", ignoreCase = true)
+                        if (parsed != null && parsed.done && hasSkillActionInText) {
+                            // The LLM wanted to invoke a skill but couldn't
+                            // express it as a structured tool_call. Use the
+                            // text content as the thought so the downstream
+                            // ACTION regex + skill dispatcher can handle it.
+                            streamedThought = textContent
+                            // Clear the tool_call metadata — this turn is now
+                            // a plain-text skill invocation, not a structured
+                            // tool_call. The assistant message should NOT
+                            // carry tool_calls (there's no matching tool
+                            // message to follow), and the tool message below
+                            // will use a fresh UUID for toolCallId.
+                            structuredToolCallId = null
+                            structuredToolCallArgs = null
+                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                        } else if (parsed != null) {
                             val canonical = DeviceToolSchema.toActionLine(parsed.action)
                             streamedThought = buildString {
                                 append("THOUGHT: ")
@@ -709,9 +820,27 @@ class AgentLoop @Inject constructor(
                         streamedThought = thoughtBuilder.toString()
                         _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
                     }
-                    // If neither text nor tool_call arrived (empty response),
-                    // streamedThought stays null and we fall through to the
-                    // plain streaming path below as a last-resort retry.
+                    // CRITICAL FIX (did not respond in time): if the stream
+                    // COMPLETED NORMALLY (no exception) but produced NEITHER
+                    // text nor tool_call, treat that as an empty response
+                    // rather than falling through to the plain streaming path.
+                    // The previous fall-through would send the ENTIRE prompt
+                    // again via llm.stream() — doubling cost and latency. Some
+                    // providers (Anthropic via OpenAI-compat shim, certain GLM
+                    // models with safety filters) emit a finish_reason chunk
+                    // with NO content; that's a legitimate empty response, not
+                    // a reason to retry. Setting streamedThought = "" lets the
+                    // empty-thought guard at line ~908 handle it gracefully.
+                    // We do NOT fall through to the plain streaming path.
+                    //
+                    // NOTE: if streamCompletedNormally is FALSE, the stream
+                    // threw an exception (caught above) and we SHOULD fall
+                    // through to the plain streaming retry — leave
+                    // streamedThought null in that case.
+                    else if (streamCompletedNormally) {
+                        streamedThought = ""
+                        _events.tryEmit(Event.Thought(sessionId, step, "", isFinal = true))
+                    }
                 }
                 // Per-step timeout — prevents a single slow LLM call (or a
                 // hung connection) from blocking the session for 10+ minutes.
@@ -762,7 +891,17 @@ class AgentLoop @Inject constructor(
                 // with entirely different text from a fresh LLM call is
                 // disorienting and discards the user's reading progress.
                 // Only fall back to non-streaming if we got NOTHING from stream.
-                if (streamedThought == null && partialStreamText != null && partialStreamText!!.length >= 20) {
+                //
+                // CRITICAL FIX (did not respond in time): lowered the threshold
+                // from 20 chars to 1 char (isNotEmpty()). The previous 20-char
+                // threshold discarded useful partial output — if the stream
+                // emitted 15 chars of a real reply before a mobile network
+                // handoff dropped the connection, the partial was discarded and
+                // the non-streaming fallback fired, doubling latency and
+                // producing different text (the exact disorientation this code
+                // was trying to avoid). Any non-empty partial is better than
+                // throwing it away and starting over.
+                if (streamedThought == null && partialStreamText != null && partialStreamText!!.isNotEmpty()) {
                     streamedThought = partialStreamText
                     // Emit a final Thought so the streaming bubble commits
                     // to the partial text (the uiMessages combine will stop
@@ -932,6 +1071,28 @@ class AgentLoop @Inject constructor(
                     content = thought,
                     timestamp = System.currentTimeMillis(),
                     thoughts = parseThoughts(thought),
+                    // CRITICAL FIX (agentic tasks not working): when the
+                    // structured-tools path produced a tool_call, the assistant
+                    // message MUST carry tool_calls so the OpenAI-compat
+                    // endpoint can match the subsequent tool message to this
+                    // tool_call via tool_call_id. Without this, step 2 returns
+                    // HTTP 400 ("an assistant message with 'tool_calls' must
+                    // precede tool messages") and the session dies.
+                    //
+                    // We use the LLM's original tool_call id (structuredToolCallId)
+                    // so the round-trip matches. The ToolCall here is a lightweight
+                    // record — the full result/ok/duration are recorded on the
+                    // TOOL message below after dispatch.
+                    toolCalls = structuredToolCallId?.let { tcId ->
+                        listOf(ToolCall(
+                            id = tcId,
+                            name = "device_action",
+                            args = structuredToolCallArgs ?: "",
+                            result = "",
+                            ok = true,
+                            durationMs = 0L,
+                        ))
+                    } ?: emptyList(),
                 )
             )
             sessions.incSteps(sessionId)
@@ -1028,13 +1189,34 @@ class AgentLoop @Inject constructor(
                     Pair(false, "error: could not parse valid coordinates from: $action")
                 } else {
                     val dispatchOk = runCatchingCancellable { scheduler.dispatch(deviceAction) }.getOrDefault(false)
-                    Pair(dispatchOk, if (dispatchOk) "ok" else "error")
+                    // CRITICAL FIX (agentic tasks not working): give the LLM
+                    // a diagnostic error message when dispatch fails, so it
+                    // can tell the user to enable the accessibility service
+                    // instead of blindly retrying the same action. Previously
+                    // the result was just "error" — the LLM had no way to
+                    // know the accessibility service was off.
+                    val dispatchResult = if (dispatchOk) "ok" else {
+                        if (scheduler.boundService == null) {
+                            "error: accessibility service not connected. Tell the user to enable it in Settings → Accessibility → X-OmniClaw."
+                        } else {
+                            "error: dispatch failed (accessibility service is connected but the action was rejected)"
+                        }
+                    }
+                    Pair(dispatchOk, dispatchResult)
                 }
             }
             val call = ToolCall(
-                id = UUID.randomUUID().toString(),
+                // CRITICAL FIX (agentic tasks not working): use the LLM's
+                // original tool_call id (structuredToolCallId) when available
+                // so the tool message's tool_call_id matches the assistant
+                // message's tool_calls entry. This is REQUIRED by the
+                // OpenAI-compat spec — a tool message without a matching
+                // tool_call_id is rejected with HTTP 400. When the action
+                // came from the plain-text streaming path (not a structured
+                // tool_call), fall back to a fresh UUID.
+                id = structuredToolCallId ?: UUID.randomUUID().toString(),
                 name = action,
-                args = "",
+                args = structuredToolCallArgs ?: "",
                 result = resultText,
                 ok = ok,
                 durationMs = System.currentTimeMillis() - started,
@@ -1050,7 +1232,22 @@ class AgentLoop @Inject constructor(
                     role = ChatMessage.Role.TOOL,
                     content = "${call.name} -> ${call.result}",
                     timestamp = System.currentTimeMillis(),
-                    toolCalls = listOf(call),
+                    // CRITICAL FIX (agentic tasks not working): tool messages
+                    // MUST carry tool_call_id (referencing the assistant's
+                    // tool_call) and MUST NOT carry tool_calls (that field is
+                    // only for assistant messages). The previous code set
+                    // `toolCalls = listOf(call)` here, which:
+                    //   1. Violated the OpenAI spec (tool messages with
+                    //      tool_calls are rejected by strict providers).
+                    //   2. Left toolCallId null, so the tool message couldn't
+                    //      be matched to the preceding assistant tool_call.
+                    // Both issues caused HTTP 400 on step 2's LLM call.
+                    //
+                    // Now: set toolCallId to the LLM's tool_call id (same as
+                    // the assistant message's tool_calls[0].id), and leave
+                    // toolCalls empty (the default). The ChatMessage data
+                    // class has a toolCallId field for exactly this purpose.
+                    toolCallId = structuredToolCallId,
                 )
             )
 

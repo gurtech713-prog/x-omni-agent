@@ -185,9 +185,22 @@ class ScheduledTaskWorker @AssistedInject constructor(
         // STOPPED) — even FAILED — because retrying a session that failed
         // due to a bad prompt or a missing permission will just fail again.
         // The user can manually re-trigger from the Sessions screen.
+        //
+        // CRITICAL FIX (schedule not working): if the worker was cancelled
+        // (isStopped) but the agent session never reached a terminal state,
+        // explicitly STOP the agent loop. AgentLoop.start() launches on its
+        // OWN scope (CoroutineScope(SupervisorJob() + Dispatchers.Default)),
+        // NOT the worker's coroutine scope — so WorkManager cancellation
+        // doesn't propagate to the agent. Without this stop() call, the
+        // agent keeps running in the background after the worker is gone,
+        // with no foreground service to protect it → the system eventually
+        // kills the process, the session never reaches a terminal state,
+        // and recordRun is never called. From the user's perspective:
+        // "scheduled tasks don't fire" (or fire but produce no visible result).
         return if (finalStatus == null) {
             if (isStopped) {
-                Log.i("ScheduledTaskWorker", "Task $sessionId cancelled by WorkManager — returning success() to avoid resurrection")
+                Log.i("ScheduledTaskWorker", "Task $sessionId cancelled by WorkManager — stopping agent + returning success()")
+                runCatchingCancellable { agentLoop.stop(sessionId) }
                 Result.success()
             } else {
                 Log.w("ScheduledTaskWorker", "Task $sessionId did not reach a terminal state — returning retry() so WorkManager re-attempts")

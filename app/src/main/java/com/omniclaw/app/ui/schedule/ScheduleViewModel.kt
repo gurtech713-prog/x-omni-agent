@@ -119,14 +119,35 @@ class ScheduleViewModel @Inject constructor(
         when (t.scheduleKind) {
             ScheduleKind.INTERVAL -> {
                 val minutes = (t.intervalMinutes ?: 60).toLong().coerceAtLeast(15)
-                ScheduledTaskWorker.scheduleInterval(ctx, t.id, t.title, t.prompt, minutes)
+                // CRITICAL FIX (schedule not working): pass onlyWhenScreenOn +
+                // quiet hours to the worker. Previously these were silently
+                // dropped — the user configured "only when screen on" or
+                // quiet hours in the UI, but the worker always saw the
+                // defaults (false / "" / ""), so tasks fired at 3 AM with
+                // the screen off regardless of the user's settings.
+                ScheduledTaskWorker.scheduleInterval(
+                    ctx, t.id, t.title, t.prompt, minutes,
+                    onlyWhenScreenOn = t.onlyWhenScreenOn,
+                    quietStart = t.quietHoursStart,
+                    quietEnd = t.quietHoursEnd,
+                )
             }
             ScheduleKind.WEEKLY -> {
-                ScheduledTaskWorker.scheduleWeekly(ctx, t.id, t.title, t.prompt, t.weekdays, t.timeOfDay)
+                ScheduledTaskWorker.scheduleWeekly(
+                    ctx, t.id, t.title, t.prompt, t.weekdays, t.timeOfDay,
+                    onlyWhenScreenOn = t.onlyWhenScreenOn,
+                    quietStart = t.quietHoursStart,
+                    quietEnd = t.quietHoursEnd,
+                )
             }
             ScheduleKind.WEEKDAY -> {
                 // Mon-Fri (2..6) at the specified time
-                ScheduledTaskWorker.scheduleWeekly(ctx, t.id, t.title, t.prompt, setOf(2, 3, 4, 5, 6), t.timeOfDay)
+                ScheduledTaskWorker.scheduleWeekly(
+                    ctx, t.id, t.title, t.prompt, setOf(2, 3, 4, 5, 6), t.timeOfDay,
+                    onlyWhenScreenOn = t.onlyWhenScreenOn,
+                    quietStart = t.quietHoursStart,
+                    quietEnd = t.quietHoursEnd,
+                )
             }
         }
     }

@@ -64,7 +64,17 @@ class DeviceScheduler @Inject constructor(
     suspend fun screenshot(): ByteArray? = executor.screenshot()
 
     suspend fun dispatch(action: DeviceAction): Boolean {
-        val svc = boundService ?: return false
+        val svc = boundService
+        if (svc == null) {
+            // CRITICAL FIX (agentic tasks not working): log when the a11y
+            // service is not connected so the user/developer can see WHY
+            // every action returns false. Previously this was a silent
+            // return — the agent loop reported "error" to the LLM with no
+            // diagnostic, and the user had no idea the accessibility
+            // service needed to be enabled in system Settings.
+            android.util.Log.w("DeviceScheduler", "dispatch($action) FAILED: accessibility service not connected. Enable it in Settings → Accessibility → X-OmniClaw.")
+            return false
+        }
         return executor.dispatch(action)
     }
 

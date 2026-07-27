@@ -80,9 +80,25 @@ class LlmClient @Inject constructor(
      * connection then never sends a byte) held the user on a blank screen
      * for 2 full minutes before OkHttp fired. 45s matches stepTimeoutMs so
      * the two layers fail together instead of one waiting out the other.
+     *
+     * CRITICAL FIX (did not respond in time): raised 45s -> 90s. When the
+     * OkHttp readTimeout (45s) and the coroutine withTimeout(45s) are EQUAL,
+     * the winner is non-deterministic — if OkHttp fires first, it throws
+     * SocketTimeoutException (IOException), which gets caught by the
+     * structured-tools `catch (e: Exception)` block and falls through to the
+     * plain streaming path, which ALSO times out, which falls through to the
+     * non-streaming fallback, which ALSO times out. The user waits up to
+     * 135s (3 × 45s) instead of 45s. Setting readTimeout > stepTimeoutMs
+     * (90s > 45s) ensures the coroutine withTimeout ALWAYS fires first, so
+     * the error message is deterministic ("did not respond in time" after
+     * exactly 45s, not "agent failed" after 135s). The 90s readTimeout
+     * still bounds a truly stalled connection (coroutine cancellation
+     * propagates via awaitClose { call.cancel() } and closes the socket
+     * immediately, so the 90s is just a safety net for the rare case where
+     * cancellation doesn't propagate cleanly).
      */
     private val streamingHttp: OkHttpClient by lazy {
-        http.newBuilder().readTimeout(45, java.util.concurrent.TimeUnit.SECONDS).build()
+        http.newBuilder().readTimeout(90, java.util.concurrent.TimeUnit.SECONDS).build()
     }
 
     @Serializable
@@ -226,10 +242,18 @@ class LlmClient @Inject constructor(
         }
         val call = streamingHttp.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
 
-        // Coroutine cancellation → cancel the OkHttp call so the socket closes
-        // promptly and the server stops generating tokens.
-        awaitClose { runCatching { call.cancel() } }
-
+        // CRITICAL FIX (agent not working / did not respond in time):
+        // call.enqueue MUST come BEFORE awaitClose. awaitClose suspends the
+        // producer coroutine until the channel closes; if it's called first,
+        // call.enqueue is UNREACHABLE CODE — no HTTP request is ever made,
+        // the collector waits forever, and the agent loop's withTimeout(45s)
+        // fires → "The AI provider did not respond in time."
+        //
+        // The canonical callbackFlow idiom is:
+        //   1. enqueue the call (registers the async OkHttp callback)
+        //   2. awaitClose { call.cancel() } as the LAST statement — suspends
+        //      until the collector cancels, then cancels the OkHttp call so
+        //      the socket closes promptly.
         call.enqueue(object : Callback {
             override fun onFailure(c: Call, e: IOException) {
                 if (channel.isClosedForSend) return
@@ -304,6 +328,14 @@ class LlmClient @Inject constructor(
                 }
             }
         })
+
+        // CRITICAL FIX: awaitClose MUST be the LAST statement in the callbackFlow.
+        // It suspends the producer coroutine until the collector cancels the flow
+        // (or the channel closes from inside the callback). On cancellation it
+        // runs the cleanup block { call.cancel() } so the OkHttp call is aborted
+        // and the socket closes promptly. Without this, the call would keep
+        // running in the background after the collector cancels.
+        awaitClose { runCatching { call.cancel() } }
     }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.SUSPEND).flowOn(Dispatchers.IO)
 
     /**
@@ -363,9 +395,12 @@ class LlmClient @Inject constructor(
         }
         val call = streamingHttp.newCall(buildRequest(baseUrl, apiKey, payload.toString()))
 
-        // Coroutine cancellation → cancel the OkHttp call.
-        awaitClose { runCatching { call.cancel() } }
-
+        // CRITICAL FIX (agent not working / did not respond in time):
+        // call.enqueue MUST come BEFORE awaitClose. See the long comment in
+        // stream() above for the full explanation. The previous order
+        // (awaitClose first) made call.enqueue unreachable, so no HTTP request
+        // was ever dispatched and every streamWithTools call hung until the
+        // agent loop's withTimeout(45s) fired.
         call.enqueue(object : Callback {
             override fun onFailure(c: Call, e: IOException) {
                 if (channel.isClosedForSend) return
@@ -459,6 +494,12 @@ class LlmClient @Inject constructor(
                 }
             }
         })
+
+        // CRITICAL FIX: awaitClose MUST be the LAST statement — see the long
+        // comment in stream() above. Suspends until the collector cancels (or
+        // the channel closes from inside the callback), then cancels the OkHttp
+        // call so the socket closes promptly.
+        awaitClose { runCatching { call.cancel() } }
     }.buffer(capacity = 64, onBufferOverflow = BufferOverflow.SUSPEND).flowOn(Dispatchers.IO)
 
     private fun parseCompletion(body: String): CompletionResult {
