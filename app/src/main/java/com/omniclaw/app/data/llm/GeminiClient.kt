@@ -150,9 +150,15 @@ class GeminiClient(
         // setprop log.tag.GeminiClient VERBOSE`).
 
         val body = retry(
-            maxAttempts = 3,
+            // PERF-FIX (slow agent response): reduced 3 -> 2 attempts. On a 429
+            // with Retry-After, each attempt delayed the user by up to 60s (now
+            // 10s, see below) — 3 attempts meant a worst-case 180s wait (now 20s)
+            // before the agent loop's outer retry/error handling took over. For
+            // an interactive agent, surfacing the rate-limit after ONE retry is
+            // far better UX than holding the user for minutes.
+            maxAttempts = 2,
             baseDelayMs = 1000,
-            maxDelayMs = 8000,
+            maxDelayMs = 4000,
             retryable = { e ->
                 when (e) {
                     is LlmException -> {
@@ -175,11 +181,13 @@ class GeminiClient(
                     val retryAfter = resp.header("Retry-After")?.toIntOrNull()
                     // Honor the server Retry-After header before the retry helper backs
                     // off again, so a long quota window is not hammered at 1-8s (audit M-25).
-                    // D-M9: cap at 60s — a misconfigured / hostile server could otherwise
-                    // pin the client with Retry-After: 86400 and stall the agent loop
-                    // for a full day. 60s is long enough to honor a typical quota reset
-                    // while still surfacing the rate-limit upstream for user visibility.
-                    if (retryAfter != null) delay(minOf(retryAfter, 60) * 1000L)
+                    // PERF-FIX (slow agent response): cap at 10s (was 60s). A 60s cap meant
+                    // the user sat on a blank screen for a full minute per attempt —
+                    // unacceptable for interactive use. 10s is long enough to honor a
+                    // typical short quota reset (most providers return Retry-After: 1-5s),
+                    // while still surfacing persistent rate-limits upstream quickly so the
+                    // agent loop can inform the user instead of silently waiting.
+                    if (retryAfter != null) delay(minOf(retryAfter, 10) * 1000L)
                     throw RateLimitException(
                         retryAfterSeconds = retryAfter,
                         body = "HTTP 429",

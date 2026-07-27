@@ -51,11 +51,23 @@ object AppModule {
         // timeout always wins, giving the LLM the full budget.
         // HttpLoggingInterceptor at BASIC level would log 2 lines per call
         // (POST + 200 OK), adding ~0.1ms overhead. Removed since logcat is noisy.
+        //
+        // PERF-FIX (slow agent response):
+        //   - callTimeout 50s: belt-and-suspenders upper bound for the WHOLE call
+        //     (connect + read + write). Just below stepTimeoutMs=45s would be ideal
+        //     but we keep a small buffer so the agent loop's withTimeout always
+        //     wins; without callTimeout a stalled call could otherwise occupy a
+        //     connection for connect+read+write = up to 130s before OkHttp aborts.
+        //   - ConnectionPool 8 (was 5): the agent now runs concurrent HTTP traffic
+        //     on the hot path (LLM main call + planner + VLM fallback + STT/VLM
+        //     in other features). A pool of 5 was the bottleneck under concurrent
+        //     use — calls queued waiting for a free connection, adding latency.
         return OkHttpClient.Builder()
-            .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(50, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
     }

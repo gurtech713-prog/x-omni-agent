@@ -72,9 +72,17 @@ class LlmClient @Inject constructor(
      * without closing the socket is treated as a network failure rather than
      * an infinite wait. This matches the streaming-friendly behavior of most
      * production LLM SDKs.
+     *
+     * PERF-FIX (slow agent response): lowered 120s -> 45s. The agent loop's
+     * step timeout (stepTimeoutMs = 45s) is the real user-facing bound; a
+     * 120s read-timeout gave no useful behavior the step timeout didn't
+     * already cover, and meant a stalled SSE stream (server accepts the
+     * connection then never sends a byte) held the user on a blank screen
+     * for 2 full minutes before OkHttp fired. 45s matches stepTimeoutMs so
+     * the two layers fail together instead of one waiting out the other.
      */
     private val streamingHttp: OkHttpClient by lazy {
-        http.newBuilder().readTimeout(120, java.util.concurrent.TimeUnit.SECONDS).build()
+        http.newBuilder().readTimeout(45, java.util.concurrent.TimeUnit.SECONDS).build()
     }
 
     @Serializable

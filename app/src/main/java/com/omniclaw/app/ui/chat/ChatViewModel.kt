@@ -3,6 +3,7 @@ package com.omniclaw.app.ui.chat
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.omniclaw.app.BuildConfig
 import com.omniclaw.app.agent.AgentLoop
 import com.omniclaw.app.data.model.Session
 import com.omniclaw.app.data.model.SessionStatus
@@ -124,7 +125,19 @@ class ChatViewModel @Inject constructor(
         // session's steps, not a global mix.
         viewModelScope.launch {
             agent.events.collect { e ->
-                Log.d(TAG, "Received agent event for session ${e.sessionId}: $e")
+                // PERF-FIX (slow agent response): gate the per-event Log.d with
+                // BuildConfig.DEBUG. During streaming, dozens of Thought events
+                // fire per second — each previously triggered `e.toString()` on
+                // a data class containing the FULL accumulated thought text,
+                // effectively re-serializing the growing string every ~50ms.
+                // That's GC pressure + Logcat I/O on the collector (main)
+                // thread, competing with the UI for CPU. In release builds
+                // (where Log.d is a no-op anyway) the toString() allocation
+                // still happened before the call. BuildConfig.DEBUG short-
+                // circuits the whole expression in release.
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "Received agent event for session ${e.sessionId}: ${e::class.simpleName}")
+                }
                 val activeId = _activeId.value
                 if (activeId == null || e.sessionId == activeId) {
                     appendEvent(e)

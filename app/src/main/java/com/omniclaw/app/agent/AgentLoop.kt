@@ -37,6 +37,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -400,9 +402,17 @@ class AgentLoop @Inject constructor(
             return
         }
 
-        val cfg = settings.modelConfig.first()
-        // Hermes improvements: de-hardcoded loop constants + feature flags.
-        val tuning = settings.agentTuning.first()
+        // PERF-FIX (slow agent response): fetch modelConfig + agentTuning in
+        // PARALLEL instead of sequentially. Both are independent DataStore reads
+        // (and modelConfig also decrypts API keys via SecureStorage). On step 1
+        // they were sequential on the critical path, adding ~20-100ms of pure
+        // wait time before the LLM call could even start. coroutineScope + async
+        // lets them overlap; if either fails, the other is cancelled automatically.
+        val (cfg, tuning) = coroutineScope {
+            val cfgAsync = async { settings.modelConfig.first() }
+            val tuningAsync = async { settings.agentTuning.first() }
+            Pair(cfgAsync.await(), tuningAsync.await())
+        }
         // Plan-then-act state (created on step 1, replanned when stuck).
         var plan: Planner.Plan? = null
 
@@ -506,7 +516,15 @@ class AgentLoop @Inject constructor(
                 Log.i(TAG, "Session $sessionId step $step: conversational prompt detected — skipping screenshot & VLM probe")
             }
             // ---- Hermes-style planning: create a plan on the first step ----
-            if (step == 1 && tuning.enablePlanner && plan == null) {
+            // PERF-FIX (slow agent response): SKIP the planner entirely for
+            // conversational prompts. planner.makePlan() is a full extra LLM
+            // roundtrip that doubles first-token latency on step 1 — it's only
+            // useful for multi-step device automation, where the plan guides
+            // the loop's check-off-as-you-go behavior. For a chat-only turn
+            // ("What is the capital of France?") the plan would be discarded
+            // immediately when the LLM emits ACTION: done, so the roundtrip
+            // was pure latency with no benefit.
+            if (step == 1 && tuning.enablePlanner && plan == null && !isLikelyChatOnly) {
                 plan = planner.makePlan(cfg, prompt, observation)
             }
             val systemMsg = LlmClient.Message(
@@ -531,6 +549,18 @@ class AgentLoop @Inject constructor(
                 // comes from a VALIDATED JSON object (no regex, no silent tap(0,0)), and
                 // usage uses the provider's REAL token counts.
                 if (tuning.useStructuredTools) {
+                    // PERF-FIX (slow agent response): emit an immediate
+                    // placeholder Thought so the UI shows feedback the instant
+                    // the LLM call starts, instead of waiting for the full
+                    // non-streaming complete() to return. The structured-tools
+                    // path uses llm.complete() (non-streaming) because most
+                    // OpenAI-compat providers don't reliably stream tool_call
+                    // deltas — but that means the user sees nothing for the
+                    // full LLM latency (1-8s on typical providers). This
+                    // placeholder is overwritten by the real Thought event
+                    // emitted below once complete() returns. isFinal=false so
+                    // the UI treats it as a streaming bubble.
+                    _events.tryEmit(Event.Thought(sessionId, step, "Thinking…", isFinal = false))
                     // A-H4 FIX: use runCatchingCancellable so a session-level
                     // CancellationException (timeout / user-stop / supersession)
                     // propagates instead of being swallowed into Result.failure
@@ -1304,7 +1334,15 @@ class AgentLoop @Inject constructor(
             // argument shapes in the prompt.
             "scheduled-automation" to "- skill:scheduled-automation(weekly:Wed:10:00|prompt) — schedule weekly task",
         )
-        skillLines.filter { isSkillEnabled(it.first) }.forEach { appendLine(it.second) }
+        // PERF-FIX (slow agent response): build the enabled map ONCE per step
+        // instead of calling isSkillEnabled() (which does a linear scan of
+        // skillRepo.skills.value) for each of the 12 skill lines. 12 × O(n)
+        // scans per step on the critical path before the LLM call.
+        val skillEnabledMap = skillRepo.skills.value.associateBy { it.id }
+        skillLines.filter { (id, _) ->
+            // Skills not present in the repo default to enabled.
+            skillEnabledMap[id]?.enabled ?: true
+        }.forEach { appendLine(it.second) }
         appendLine()
         appendLine("Rules:")
         appendLine("- For questions, explanations, summaries, or advice: put the full answer in")
@@ -1321,8 +1359,23 @@ class AgentLoop @Inject constructor(
         // The LearningEngine queries the lesson store for lessons matching
         // the current screen fingerprint. If any are found, they're appended
         // here so the LLM can avoid known-bad actions and repeat known-good ones.
+        //
+        // PERF-FIX (slow agent response): cache the last (fingerprint, lessons)
+        // pair per session. During automation the fingerprint changes every
+        // step (different screen state), so this cache mostly helps the
+        // chat-only path where the observation (and thus fingerprint) is the
+        // same empty string across the single step. It also de-dupes redundant
+        // Room queries when buildSystemPrompt is called more than once per
+        // step (e.g. by the planner).
         val fingerprint = episodeRecorder.fingerprint(observation)
-        val lessons = runCatchingCancellable { learning.lessonsForPrompt(fingerprint, sessionId = sessionId) }.getOrNull()
+        val cached = lastLessonCache[sessionId]
+        val lessons = if (cached != null && cached.first == fingerprint) {
+            cached.second
+        } else {
+            val fresh = runCatchingCancellable { learning.lessonsForPrompt(fingerprint, sessionId = sessionId) }.getOrNull()
+            lastLessonCache[sessionId] = fingerprint to fresh
+            fresh
+        }
         if (lessons != null) {
             appendLine(lessons)
             // Emit a LessonsApplied event so the chat UI can show a transparency
@@ -1378,9 +1431,26 @@ class AgentLoop @Inject constructor(
      */
     private val historyCache = java.util.concurrent.ConcurrentHashMap<String, MutableList<LlmClient.Message>>()
 
+    /**
+     * PERF-FIX (slow agent response): per-session cache of the last
+     * (fingerprint, lessons) pair returned by [LearningEngine.lessonsForPrompt].
+     * Avoids re-querying Room when the fingerprint hasn't changed (common on
+     * chat-only turns where the observation is the empty string both times
+     * buildSystemPrompt is called, and on retries within the same step).
+     */
+    private val lastLessonCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String?>>()
+
     private suspend fun buildHistory(sessionId: String): List<LlmClient.Message> {
         val cached = historyCache.getOrPut(sessionId) { mutableListOf() }
-        val session = sessions.getById(sessionId) ?: return cached.toList()
+        // PERF-FIX (slow agent response): use the in-memory snapshot instead
+        // of the suspend getById(). During a running session the StateFlow is
+        // always current (the agent loop's own appendMessage calls update it
+        // synchronously), so the suspend call was just an unnecessary context
+        // switch + cached.messages.isNotEmpty() check on every step. getById()
+        // is still the right call for cold reads (e.g. opening a past session
+        // from disk) — but buildHistory is only ever called from inside a
+        // running loop, where the snapshot is authoritative.
+        val session = sessions.getByIdSnapshot(sessionId) ?: return cached.toList()
         // A-M1 FIX: if the session's message list shrank (e.g. the user
         // cleared history, or the session was reset), the cache holds a
         // STALE larger list — the `cached.size == session.messages.size`
@@ -1420,6 +1490,10 @@ class AgentLoop @Inject constructor(
 
     private fun clearHistoryCache(sessionId: String) {
         historyCache.remove(sessionId)
+        // PERF-FIX (slow agent response): also clear the lesson cache so a
+        // future run on the same session doesn't see stale lessons from a
+        // different observation.
+        lastLessonCache.remove(sessionId)
     }
 
     private suspend fun isStopRequested(sessionId: String): Boolean {
