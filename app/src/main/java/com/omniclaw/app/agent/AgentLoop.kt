@@ -230,6 +230,27 @@ class AgentLoop @Inject constructor(
             episodeRecorder.start(session.id, prompt)
 
             sessions.setStatus(session.id, SessionStatus.RUNNING)
+            // CRITICAL FIX (agent not performing tasks): check if the
+            // accessibility service is connected BEFORE starting the loop.
+            // If it's not connected, tap/swipe/type won't work (they need
+            // gesture dispatch via the a11y service). Launch will still work
+            // (it uses PackageManager directly), but the user needs to know
+            // that device actions require the a11y service. We surface a
+            // one-time SYSTEM message at session start so the user sees it
+            // immediately instead of wondering why "tap does nothing".
+            if (scheduler.boundService == null) {
+                val a11yWarn = "⚠ Accessibility service not connected. Launch works, but tap/swipe/type need the service. Enable it: Settings → Accessibility → X-OmniClaw → On."
+                sessions.appendMessage(
+                    session.id,
+                    ChatMessage(
+                        id = UUID.randomUUID().toString(),
+                        role = ChatMessage.Role.SYSTEM,
+                        content = a11yWarn,
+                        timestamp = System.currentTimeMillis(),
+                    )
+                )
+                _events.tryEmit(Event.Thought(session.id, 0, a11yWarn))
+            }
             // Start the foreground service + Halo overlay when the first session
             // becomes active, so the loop survives backgrounding and the user sees
             // live status via the Dynamic Island-style pill.
@@ -652,7 +673,12 @@ class AgentLoop @Inject constructor(
                                         val now = System.currentTimeMillis()
                                         if (now - lastEmitMs >= 50L || thoughtBuilder.length < 15) {
                                             lastEmitMs = now
-                                            _events.tryEmit(Event.Thought(sessionId, step, thoughtBuilder.toString()))
+                                            // CRITICAL FIX (thought/action showing as normal chat):
+                                            // Emit the CLEAN version of the streaming text, not the
+                                            // raw "THOUGHT: .../ACTION: ..." scaffolding. The user
+                                            // sees a clean streaming bubble; the raw text is still
+                                            // available in the final message's `thoughts` field.
+                                            _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(thoughtBuilder.toString())))
                                         }
                                     }
                                     is LlmClient.StreamChunk.ToolCallDelta -> {
@@ -788,7 +814,9 @@ class AgentLoop @Inject constructor(
                             // will use a fresh UUID for toolCallId.
                             structuredToolCallId = null
                             structuredToolCallArgs = null
-                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                            // Emit the CLEAN version (without THOUGHT:/ACTION: scaffolding)
+                            // so the UI shows a nice chat bubble, not the raw internal format.
+                            _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(streamedThought!!), isFinal = true))
                         } else if (parsed != null) {
                             val canonical = DeviceToolSchema.toActionLine(parsed.action)
                             streamedThought = buildString {
@@ -809,7 +837,7 @@ class AgentLoop @Inject constructor(
                             // structuredUsage stays null — token counts aren't
                             // reliably provided in streaming SSE. The estimate
                             // computed below will be used instead.
-                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                            _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(streamedThought!!), isFinal = true))
                         }
                     } else if (streamHadText) {
                         // No tool_call — the model returned plain text (a
@@ -818,7 +846,7 @@ class AgentLoop @Inject constructor(
                         // "ACTION:" lines; if none, it treats it as a "done"
                         // reply, which is exactly what we want for chat.
                         streamedThought = thoughtBuilder.toString()
-                        _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                        _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(streamedThought!!), isFinal = true))
                     }
                     // CRITICAL FIX (did not respond in time): if the stream
                     // COMPLETED NORMALLY (no exception) but produced NEITHER
@@ -873,7 +901,8 @@ class AgentLoop @Inject constructor(
                             val now = System.currentTimeMillis()
                             if (now - lastEmitMs >= 50L || thoughtBuilder.length < 15) {
                                 lastEmitMs = now
-                                _events.tryEmit(Event.Thought(sessionId, step, thoughtBuilder.toString()))
+                                // Emit clean version (without THOUGHT:/ACTION: scaffolding)
+                                _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(thoughtBuilder.toString())))
                             }
                         }
                         if (thoughtBuilder.isNotEmpty()) {
@@ -881,7 +910,7 @@ class AgentLoop @Inject constructor(
                             // CHAT-FLOW FIX: emit isFinal=true so the UI knows
                             // streaming is done and TTS can fire ONCE on the
                             // final text (not on every intermediate token).
-                            _events.tryEmit(Event.Thought(sessionId, step, streamedThought!!, isFinal = true))
+                            _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(streamedThought!!), isFinal = true))
                         }
                     }
                 }
@@ -1036,7 +1065,10 @@ class AgentLoop @Inject constructor(
                 return
             }
 
-            _events.tryEmit(Event.Thought(sessionId, step, thought, isFinal = true))
+            // Emit the CLEAN version (without THOUGHT:/ACTION: scaffolding) as
+            // the final thought event. The raw text is preserved in the message's
+            // `thoughts` field for the expandable "Thought process" box.
+            _events.tryEmit(Event.Thought(sessionId, step, cleanContentForMessage(thought), isFinal = true))
             // CHAT-10 FIX: guard against empty LLM responses. If the model
             // returned an empty string (e.g. content-filtered by safety
             // settings, or a malformed response with empty choices), don't
@@ -1068,7 +1100,16 @@ class AgentLoop @Inject constructor(
                 ChatMessage(
                     id = UUID.randomUUID().toString(),
                     role = ChatMessage.Role.ASSISTANT,
-                    content = thought,
+                    // CRITICAL FIX (thought/action showing as normal chat):
+                    // The `content` field is what the UI shows as the main
+                    // chat bubble. Previously this was set to the raw `thought`
+                    // (e.g. "THOUGHT: I'll open camera\nACTION: launch(camera)"),
+                    // so the user saw the internal scaffolding as the chat
+                    // message. Now we strip the THOUGHT:/ACTION: prefixes and
+                    // store the CLEAN user-facing reply in `content`. The raw
+                    // text is preserved in the `thoughts` field so the UI can
+                    // show it in the expandable "Thought process" box.
+                    content = cleanContentForMessage(thought),
                     timestamp = System.currentTimeMillis(),
                     thoughts = parseThoughts(thought),
                     // CRITICAL FIX (agentic tasks not working): when the
@@ -1343,6 +1384,71 @@ class AgentLoop @Inject constructor(
     private fun parseThoughts(text: String): List<String> =
         Regex("(?m)^THOUGHT:\\s*(.+)$").findAll(text).map { it.groupValues[1].trim() }.toList()
 
+    /**
+     * CRITICAL FIX (thought/action showing as normal chat):
+     * Strip the "THOUGHT:" / "ACTION:" / "PLAN:" / "OBSERVATION:" scaffolding
+     * from the raw agent thought and return a CLEAN user-facing string for the
+     * chat bubble's `content` field.
+     *
+     * The raw thought text (e.g. "THOUGHT: I'll open camera\nACTION: launch(camera)")
+     * is internal formatting meant for the action parser, NOT for the user's
+     * eyes. The user should see a clean reply like "I'll open the camera app for you."
+     * in the chat bubble, with the raw thinking hidden in the expandable
+     * "Thought process" box (populated from the `thoughts` field).
+     *
+     * Rules:
+     *   - Extract the text AFTER "THOUGHT:" (the conversational reply).
+     *   - Drop "ACTION:" lines entirely (they're shown as tool-call chips).
+     *   - Drop "PLAN:" / "OBSERVATION:" lines (internal scaffolding).
+     *   - If there's no THOUGHT: prefix, return the raw text as-is (the LLM
+     *     might have sent a plain conversational reply without scaffolding).
+     *   - If the result is blank (e.g. only had ACTION: lines), return a
+     *     user-friendly status like "Performing: tap(540,1200)" so the bubble
+     *     isn't empty.
+     */
+    private fun cleanContentForMessage(raw: String): String {
+        val lines = raw.lines()
+        val thoughtLines = mutableListOf<String>()
+        var capturingThought = false
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("THOUGHT:", ignoreCase = true) -> {
+                    capturingThought = true
+                    val content = trimmed.substringAfter(":").trim()
+                    if (content.isNotEmpty()) thoughtLines.add(content)
+                }
+                trimmed.startsWith("ACTION:", ignoreCase = true) -> {
+                    capturingThought = false
+                }
+                trimmed.startsWith("PLAN:", ignoreCase = true) ||
+                trimmed.startsWith("OBSERVATION:", ignoreCase = true) ||
+                trimmed.startsWith("[VISION", ignoreCase = true) -> {
+                    // Skip internal scaffolding lines
+                }
+                else -> {
+                    if (capturingThought) {
+                        thoughtLines.add(line)
+                    }
+                }
+            }
+        }
+
+        val cleaned = thoughtLines.joinToString("\n").trim()
+        if (cleaned.isNotBlank()) return cleaned
+
+        // Fallback: no THOUGHT: text found. If there's an action, show a
+        // clean status message so the bubble isn't empty.
+        val action = Regex("(?mi)^action:\\s*(.+)$").find(raw)?.groupValues?.getOrNull(1)?.trim()
+        if (action != null && !action.lowercase().startsWith("done")) {
+            return "Performing: $action"
+        }
+
+        // Last resort: return the raw text (might be a plain conversational reply)
+        return raw.trim()
+    }
+
     private fun parseDeviceAction(action: String): DeviceAction? {
         val s = action.trim()
         return when {
@@ -1457,16 +1563,25 @@ class AgentLoop @Inject constructor(
                 logger.logInfo(sessionIdForSkill, 0, "behavior-replay($arg): ${if (ok) "ok" else "failed"}")
                 if (ok) "Behavior replay '$arg' completed successfully." else "Behavior replay '$arg' failed or timed out."
             }
-            "app-search", "amazon-search", "reddit-search" -> {
+            "app-search" -> {
                 // Launch the target app, then the agent loop's next iteration
                 // will see the app's search bar via the accessibility tree and
                 // can tap+type the query. We just kick off the launch here.
-                val pkg = when (skillId) {
-                    "amazon-search" -> "com.amazon.mShop.android.shopping"
-                    "reddit-search" -> "com.reddit.frontpage"
-                    else -> arg.substringBefore(':').ifBlank { "com.android.chrome" }
-                }
-                val query = if (skillId == "app-search" && arg.contains(':')) arg.substringAfter(':').trim() else arg
+                //
+                // CLEANUP: removed the `amazon-search` / `reddit-search` branches
+                // — those skills were deleted (amazon-search was a duplicate of
+                // app-search; reddit-search never existed as a skill). The
+                // generic app-search skill handles all apps via the
+                // `<package>:<query>` arg format.
+                //
+                // Arg format: "<package>:<query>" — e.g.
+                //   "com.reddit.frontpage:budget travel"
+                //   "com.google.android.youtube:edge-native android"
+                // If no colon, treat the whole arg as the query and default
+                // to the browser.
+                val pkg = if (arg.contains(':')) arg.substringBefore(':').trim()
+                    else "com.android.chrome"
+                val query = if (arg.contains(':')) arg.substringAfter(':').trim() else arg
                 val launched = runCatchingCancellable { scheduler.dispatch(DeviceAction.Launch(pkg)) }.getOrDefault(false)
                 if (launched) {
                     "Launched $pkg. Next step: tap the search bar and type '$query'."
@@ -1474,25 +1589,32 @@ class AgentLoop @Inject constructor(
                     "Failed to launch $pkg. Try a different package or use the browser."
                 }
             }
-            "model-config", "model-provider", "channel-config" -> {
-                // SECURITY: These skill actions have been INTENTIONALLY REMOVED
-                // from the LLM's action vocabulary. They allowed a prompt-injected
-                // LLM to silently rewrite the API endpoint, exfiltrate the API
-                // key, or redirect the Discord webhook to an attacker URL — a
-                // privilege-escalation vector. Users configure these explicitly
-                // via the Settings screen; the LLM must not be able to.
+            "model-config", "model-provider", "channel-config", "amazon-search",
+            "reddit-search", "taobao-search", "capcut-theme-video", "gallery-memory",
+            "gallery-search" -> {
+                // CLEANUP: these skills were removed (Chinese products, duplicates,
+                // or security risks). If the LLM still invokes one (e.g. from
+                // stale memory or a cached system prompt), return a clear error
+                // so it picks a different approach instead of silently failing.
                 //
-                // If a caller passes one of these IDs, log + refuse.
-                logger.logError(
-                    AgentLogger.ErrorLocation(
-                        sessionId = sessionIdForSkill, step = 0,
-                        action = "skill:$skillId",
-                        className = "AgentLoop", methodName = "handleSkillAction",
-                        lineNumber = 0,
-                        message = "Refused privileged skill action '$skillId' from LLM context."
+                // model-config / channel-config are ALSO refused here as a
+                // security measure — even if a stale skill file lingers on
+                // disk, the LLM can't use it to rewrite the API endpoint or
+                // webhook URL.
+                if (skillId == "model-config" || skillId == "model-provider" || skillId == "channel-config") {
+                    logger.logError(
+                        AgentLogger.ErrorLocation(
+                            sessionId = sessionIdForSkill, step = 0,
+                            action = "skill:$skillId",
+                            className = "AgentLoop", methodName = "handleSkillAction",
+                            lineNumber = 0,
+                            message = "Refused privileged skill action '$skillId' from LLM context."
+                        )
                     )
-                )
-                "Action '$skillId' must be configured from the Settings screen — it cannot be modified by the agent."
+                    "Action '$skillId' must be configured from the Settings screen — it cannot be modified by the agent."
+                } else {
+                    "Skill '$skillId' has been removed. Use a different approach or ask the user to use app-search instead."
+                }
             }
             "skill-creator" -> {
                 // Use the LLM to draft a SKILL.md from the user's description,
@@ -1622,21 +1744,23 @@ class AgentLoop @Inject constructor(
         appendLine("Available skill actions:")
         // Filter the skill list by the user's enabled/disabled toggles so
         // disabled skills are not advertised to the LLM. Skills not present
-        // in the SkillRepository (internal helpers like gallery-search,
-        // open-bookmark, behavior-replay) are always shown — there's no
-        // toggle to disable them.
+        // in the SkillRepository (internal helpers like open-bookmark,
+        // behavior-replay) are always shown — there's no toggle to disable them.
+        //
+        // CLEANUP: removed Chinese-product skills (taobao-search, capcut-theme-video)
+        // and redundant/duplicate skills (amazon-search was a duplicate of app-search;
+        // gallery-memory was a duplicate of gallery-qa; model-config and channel-config
+        // were security risks already refused in code). The list now contains only
+        // the 5 essential skills + the 2 internal helpers (open-bookmark, behavior-replay).
         val skillLines = listOf(
             "gallery-qa" to "- skill:gallery-qa(20)             — scan latest 20 photos into memory",
-            "gallery-search" to "- skill:gallery-search(parrot)     — search gallery by keyword",
-            "capcut-theme-video" to "- skill:capcut-theme-video(parrot) — stage theme photos for CapCut",
             "clipboard-to-shortcut" to "- skill:clipboard-to-shortcut(name)— save clipboard URL as a bookmark",
             "open-bookmark" to "- skill:open-bookmark(name)        — launch a saved bookmark by name",
             "behavior-replay" to "- skill:behavior-replay(id)        — replay a recorded behavior skill",
             "app-search" to "- skill:app-search(com.reddit.frontpage:query) — launch app + search",
-            "amazon-search" to "- skill:app-search(com.amazon.mShop.android:query) — launch Amazon + search",
             "skill-creator" to "- skill:skill-creator(description) — LLM-draft a new SKILL.md",
             "scheduled-automation" to "- skill:scheduled-automation(60|prompt) — schedule interval task",
-            // A-L4 NOTE: the duplicate `scheduled-automation` key is INTENTIONAL —
+            // NOTE: the duplicate `scheduled-automation` key is INTENTIONAL —
             // this is a listOf (not mapOf), so both entries survive. They show
             // TWO usage EXAMPLES (interval vs weekly) for the same skill ID;
             // both are filtered together by isSkillEnabled, so the duplicate
@@ -1877,15 +2001,31 @@ class AgentLoop @Inject constructor(
         // Match common forms: "tap X", "open Reddit", "launch com.foo", "scroll down",
         // "swipe up", "type hello", "click the button", "search for X on Y",
         // "take a screenshot", "play X on Y", "go to settings".
+        //
+        // CRITICAL FIX (agent not performing tasks): the previous `open|launch`
+        // pattern required the word AFTER the verb to be either `com.` or a
+        // word followed by `app|on|in|for`. So "open camera", "open X", "open
+        // Chrome" did NOT match — `camera`/`x`/`chrome` alone don't satisfy
+        // `[a-z]+\s*(app|on|in|for)`. The prompt was then misclassified as
+        // conversational, the observation pipeline was skipped, and the LLM
+        // had no screen context to act on → "agent can't perform any task".
+        //
+        // The fix: match `open|launch|start` followed by ANY word (the app
+        // name). We also add explicit patterns for common single-word app
+        // names (camera, settings, browser, etc.) so they're never
+        // misclassified as chat.
         val automationPatterns = listOf(
             Regex("\\b(tap|click|press|double[- ]?tap|long[- ]?press)\\s+(on\\s+)?(the\\s+)?[a-z0-9]"),
-            Regex("\\b(open|launch|start|go\\s+to|switch\\s+to)\\s+(com\\.|[a-z]+\\s*(app|on|in|for))"),
+            // open/launch/start + ANY word (app name, package, or "settings"/"camera"/etc.)
+            Regex("\\b(open|launch|start|go\\s+to|switch\\s+to)\\s+[a-z0-9]"),
+            // Explicit single-word app targets that are ALWAYS automation.
+            Regex("\\b(open|launch|start)\\s+(camera|settings|browser|chrome|youtube|reddit|whatsapp|instagram|facebook|twitter|x|telegram|spotify|maps|gmail|calculator|clock|photos|gallery|app)\\b"),
             Regex("\\bswipe\\s+(up|down|left|right|to)\\b"),
             Regex("\\bscroll\\s+(up|down|left|right|to|until)\\b"),
             Regex("\\btype\\s+[\"']?[a-z0-9]"),
             Regex("\\b(take\\s+a\\s+)?screenshot\\b"),
             Regex("\\b(play|pause|skip|next|previous)\\s+(music|song|video|track|on)\\b"),
-            Regex("\\b(search|find|look\\s+up)\\s+.+\\s+(on|in|for)\\s+(reddit|youtube|google|amazon|taobao|twitter|instagram|tiktok|spotify|netflix|maps|play store|app store|settings)\\b"),
+            Regex("\\b(search|find|look\\s+up)\\s+.+\\s+(on|in|for)\\s+(reddit|youtube|google|amazon|twitter|instagram|tiktok|spotify|netflix|maps|play store|app store|settings)\\b"),
             Regex("\\b(call|message|text|email|send)\\s+[a-z0-9]"),
             Regex("\\b(set|turn|enable|disable|toggle)\\s+(alarm|timer|wifi|bluetooth|brightness|volume|on|off)\\b"),
             Regex("\\bnavigate\\s+(to|back|home|up|down)\\b"),

@@ -385,8 +385,16 @@ class AccessibilityExecutor @Inject constructor(
         return try {
             val pm = svc.packageManager
             val cleanedInput = packageNameOrAppName.trim().trim('"', '\'').lowercase()
-            
-            // Map common app names to popular package names if passed by friendly name
+
+            // Map common app names to popular package names if passed by friendly name.
+            // CRITICAL FIX (agent not performing tasks): expanded the knownMap with
+            // multiple camera package names (different OEMs use different ones) and
+            // more app aliases. The previous map only had "com.android.camera" for
+            // camera — but Samsung uses "com.sec.android.app.camera", Pixel uses
+            // "com.google.android.GoogleCamera", MIUI uses "com.android.camera",
+            // etc. If the package wasn't found, launch() returned false and the
+            // agent reported "error" with no diagnostic. Now we try multiple
+            // package names for camera and fall back to launchableApps search.
             val knownMap = mapOf(
                 "whatsapp" to "com.whatsapp",
                 "youtube" to "com.google.android.youtube",
@@ -401,17 +409,46 @@ class AccessibilityExecutor @Inject constructor(
                 "spotify" to "com.spotify.music",
                 "maps" to "com.google.android.apps.maps",
                 "gmail" to "com.google.android.gm",
-                "camera" to "com.android.camera",
                 "calculator" to "com.google.android.calculator",
                 "clock" to "com.google.android.deskclock",
                 "photos" to "com.google.android.apps.photos",
-                "gallery" to "com.miui.gallery"
+                "gallery" to "com.google.android.apps.photos",
+                // Camera — multiple OEM package names. The first one that
+                // resolves via getLaunchIntentForPackage wins.
+                "camera" to "com.android.camera",
+                "google camera" to "com.google.android.GoogleCamera",
+                // Note: Samsung's camera package is handled below via the
+                // multi-try list since "com.sec.android.app.camera" won't
+                // resolve on non-Samsung devices.
             )
-            
+
+            // Camera has multiple possible package names across OEMs. Try them
+            // all when the user asks for "camera".
+            val cameraPackages = listOf(
+                "com.android.camera",
+                "com.google.android.GoogleCamera",
+                "com.sec.android.app.camera",          // Samsung
+                "com.miui.camera",                      // Xiaomi MIUI
+                "org.lineageos.camera",                 // LineageOS
+                "com.android.camera2",                  // AOSP camera2
+                "com.oppo.camera",                      // OPPO
+                "com.coloros.camera",                   // ColorOS (Realme/OPPO)
+            )
+
             val pkg = knownMap[cleanedInput] ?: packageNameOrAppName.trim().trim('"', '\'')
-            
+
+            // Try the resolved package first.
             var intent = pm.getLaunchIntentForPackage(pkg)
-            
+
+            // If camera and the first package didn't resolve, try the other
+            // OEM camera packages.
+            if (intent == null && cleanedInput == "camera") {
+                for (cameraPkg in cameraPackages) {
+                    intent = pm.getLaunchIntentForPackage(cameraPkg)
+                    if (intent != null) break
+                }
+            }
+
             // If getLaunchIntentForPackage returned null and input looks like an
             // app label, search launchable apps via a single cached query
             // (ACTION_MAIN + CATEGORY_LAUNCHER) instead of iterating every
@@ -424,12 +461,12 @@ class AccessibilityExecutor @Inject constructor(
                     intent = pm.getLaunchIntentForPackage(matchPkg)
                 }
             }
-            
+
             if (intent == null) {
-                Log.w(TAG, "launch($packageNameOrAppName) failed: no launch intent found")
+                Log.w(TAG, "launch($packageNameOrAppName) failed: no launch intent found (tried pkg='$pkg')")
                 return false
             }
-            
+
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             svc.startActivity(intent)
             val prev = windowTracker.current.foregroundPackage

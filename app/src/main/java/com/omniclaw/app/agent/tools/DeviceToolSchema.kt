@@ -69,25 +69,38 @@ object DeviceToolSchema {
      * Fail-closed parse of an [com.omniclaw.app.data.model.LlmToolCall.arguments]
      * JSON object. Callers MUST treat `valid == false` as an error to report back
      * to the model, never as a reason to dispatch a default gesture.
+     *
+     * CRITICAL FIX (tap/launch not executing): the parser now accepts ALTERNATE
+     * field names for the `package` parameter. The JSON schema declares the
+     * field as `"package"`, but many LLMs (especially smaller models) send
+     * `"packageName"` instead (matching the Kotlin/Java convention). The
+     * previous parser only checked `obj["package"]` — if the LLM sent
+     * `{"action":"launch","packageName":"camera"}`, the parse returned null,
+     * the action became "ACTION: invalid", and launch was never dispatched.
+     * Now we check both field names.
+     *
+     * Same fix applied to coordinates: some LLMs send `"x"` as a float
+     * (e.g. `540.0`) instead of an integer. The `intOrNull` extension on
+     * `JsonPrimitive` returns null for `"540.0"` — so we now also try
+     * `contentOrNull?.toFloatOrNull()?.toInt()` as a fallback.
      */
     fun parse(argumentsJson: String): Parsed {
         val obj: JsonObject =
             runCatching { json.parseToJsonElement(argumentsJson).jsonObject }.getOrNull()
                 ?: return Parsed("", null, done = false, valid = false)
 
-        // A-H2 FIX: use `as? JsonPrimitive` (fail-closed) instead of
-        // `.jsonPrimitive` (which throws on non-primitive values). If the LLM
-        // returns `{"thought": {"nested": "object"}}` or `{"thought": [1,2,3]}`,
-        // the previous `.jsonPrimitive` threw IllegalStateException, which
-        // surfaced as a 500-style crash in the agent loop. `as? JsonPrimitive`
-        // returns null for non-primitive payloads, and `?.contentOrNull`
-        // yields an empty string — the caller then treats the action as
-        // invalid (valid == false) and reports a grounded error to the LLM.
         val thought = (obj["thought"] as? JsonPrimitive)?.contentOrNull.orEmpty()
         val action = (obj["action"] as? JsonPrimitive)?.contentOrNull?.lowercase()?.trim()
             ?: return Parsed(thought, null, done = false, valid = false)
 
-        fun int(key: String): Int? = (obj[key] as? JsonPrimitive)?.intOrNull
+        // Helper: read an integer, accepting both int and float JSON values.
+        // Many LLMs send coordinates as floats (e.g. 540.0) — intOrNull
+        // returns null for those, so we fall back to float->int conversion.
+        fun int(key: String): Int? {
+            val prim = obj[key] as? JsonPrimitive ?: return null
+            prim.intOrNull?.let { return it }
+            return prim.contentOrNull?.toFloatOrNull()?.toInt()
+        }
 
         if (action == "done") return Parsed(thought, null, done = true, valid = true)
 
@@ -102,7 +115,16 @@ object DeviceToolSchema {
                 else DeviceAction.Swipe(x, y, x2, y2)
             }
             "type" -> (obj["text"] as? JsonPrimitive)?.contentOrNull?.let { DeviceAction.Type(it) }
-            "launch" -> (obj["package"] as? JsonPrimitive)?.contentOrNull?.let { DeviceAction.Launch(it) }
+            // CRITICAL FIX: accept both "package" (schema field name) and
+            // "packageName" (Kotlin/Java convention) — many LLMs send the
+            // latter because it matches the field name they see in examples.
+            "launch" -> {
+                val pkg = (obj["package"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["packageName"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["app"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["appName"] as? JsonPrimitive)?.contentOrNull
+                pkg?.let { DeviceAction.Launch(it) }
+            }
             "back" -> DeviceAction.Back
             "home" -> DeviceAction.Home
             "screenshot" -> DeviceAction.Screenshot

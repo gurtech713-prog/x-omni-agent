@@ -13,6 +13,7 @@ import com.omniclaw.app.data.local.LocalLlmClient
 import com.omniclaw.app.data.llm.LlmClient
 import com.omniclaw.app.voice.TextToSpeechManager
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltAndroidApp
@@ -21,6 +22,13 @@ class OmniApplication : Application(), Configuration.Provider {
     @Inject lateinit var workerFactory: HiltWorkerFactory
     @Inject lateinit var localLlmClient: LocalLlmClient
     @Inject lateinit var ttsManager: TextToSpeechManager
+    // FIX (skills not loading): inject SkillRepository so we can reload skills
+    // at app startup. Previously skills were only loaded when the user opened
+    // the Memory screen (MemoryViewModel.init called skillRepo.reload()). If
+    // the user never opened Memory, the skill list stayed at the seedSkills()
+    // defaults and any runtime-created skills (from skill-creator) were
+    // invisible. Loading at startup ensures the skill list is always fresh.
+    @Inject lateinit var skillRepository: com.omniclaw.app.data.skill.SkillRepository
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
@@ -41,7 +49,25 @@ class OmniApplication : Application(), Configuration.Provider {
         super.onCreate()
         registerNotificationChannels()
         registerLocalTokenizers()
+        // FIX (skills not loading): reload skills at startup so the skill list
+        // includes both bundled assets AND any runtime-created skills from
+        // filesDir/skills/. Launched on a background coroutine because reload()
+        // does disk I/O (reading SKILL.md files) and onCreate must not block.
+        appScope.launch {
+            runCatching { skillRepository.reload() }
+                .onFailure { Log.w(TAG, "Skill reload at startup failed: ${it.message}") }
+        }
     }
+
+    /**
+     * Application-scoped coroutine scope for background init work that doesn't
+     * belong to a specific Activity/Service. Used here for the skill reload at
+     * startup. SupervisorJob so a failure in one child doesn't cancel siblings.
+     */
+    private val appScope: kotlinx.coroutines.CoroutineScope =
+        kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
 
     /**
      * Release native / system resources when the process is being torn down.

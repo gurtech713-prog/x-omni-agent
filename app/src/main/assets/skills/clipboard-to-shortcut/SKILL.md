@@ -1,16 +1,22 @@
 # clipboard-to-shortcut
 
-Turn the clipboard URL into a named skill.
+Save the clipboard URL as a named bookmark for quick launch later.
 
-- Turn the clipboard URL into a skill named Amazon quick link.
-- Convert the clipboard into a skill called "Daily news portal".
+- Turn the clipboard URL into a shortcut named Amazon quick link.
+- Convert the clipboard into a shortcut called Daily news portal.
+
+## Usage
+`skill:clipboard-to-shortcut(<name>)`
+
+The argument is the bookmark name. Pass the name only — no URL (the URL
+is read from the clipboard).
 
 ## Behavior
-1. READ_CLIPBOARD — get URL
-2. Open Settings → Skills → Create from URL
-3. Persist as: assets/skills/<name>/SKILL.md
-4. Future invocations: "Open <name>" -> launch(url)
+1. Read the clipboard contents
+2. Validate it's a URL (http:// or https://)
+3. Save as a bookmark with the given name
+4. Future invocations: "Open <name>" launches the bookmarked URL
 
-## Tools
-- READ_CLIPBOARD
-- launch — to verify the URL works
+## Notes
+- If the clipboard doesn't contain a URL, returns an error
+- The bookmark name is used as the launch phrase: "open <name>"
