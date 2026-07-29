@@ -36,6 +36,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowUpward
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Icon
@@ -70,6 +71,7 @@ import com.omniclaw.app.core.theme.OmniMono
 import com.omniclaw.app.data.model.ChatMessage
 import com.omniclaw.app.data.model.SessionStatus
 import com.omniclaw.app.ui.components.OmniBadge
+import com.omniclaw.app.ui.components.OmniButton
 import com.omniclaw.app.ui.components.OmniDivider
 import com.omniclaw.app.ui.components.OmniEmptyState
 import com.omniclaw.app.ui.components.OmniStat
@@ -94,6 +96,8 @@ fun ChatScreen(sessionId: String? = null) {
     val ui by vm.uiPrefs.collectAsStateWithLifecycle()
     val modelConfig by vm.modelConfig.collectAsStateWithLifecycle()
     val messages by vm.uiMessages.collectAsStateWithLifecycle()
+    val isRecording by vm.isRecording.collectAsStateWithLifecycle()
+    val transcribedText by vm.transcribedText.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
 
     LaunchedEffect(sessionId) {
@@ -236,8 +240,11 @@ fun ChatScreen(sessionId: String? = null) {
                     Spacer(Modifier.width(16.dp))
                     Box(Modifier.size(1.dp, 12.dp).background(MaterialTheme.colorScheme.outlineVariant))
                     Spacer(Modifier.width(16.dp))
+                    // Per-session live token counter (from agent events) + persisted total.
+                    val liveTokens by vm.sessionTokens.collectAsStateWithLifecycle()
+                    val displayTokens = if (liveTokens > 0) liveTokens else s.tokenUsage
                     Text(
-                        text = "TOKENS: ${s.tokenUsage}",
+                        text = "TOKENS: $displayTokens",
                         fontFamily = OmniMono,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -247,6 +254,14 @@ fun ChatScreen(sessionId: String? = null) {
                 Spacer(Modifier.weight(1f))
                 if (s.status == SessionStatus.RUNNING) {
                     OmniBadge("LIVE", filled = true, pulsing = true)
+                } else if (s.status == SessionStatus.FAILED) {
+                    // RETRY BUTTON: shown when the session failed. Re-sends the
+                    // last user message so the user doesn't have to retype it.
+                    OmniButton(
+                        text = "RETRY",
+                        onClick = { vm.retryLastMessage() },
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
                 }
             }
             OmniDivider()
@@ -281,6 +296,10 @@ fun ChatScreen(sessionId: String? = null) {
             running = session?.status == SessionStatus.RUNNING,
             onSend = { text -> vm.send(text) },
             onStop = { vm.stop() },
+            isRecording = isRecording,
+            onMicClick = { if (isRecording) vm.stopRecording() else vm.startRecording() },
+            transcribedText = transcribedText,
+            onTranscribedConsumed = { vm.clearTranscribedText() },
         )
     }
 }
@@ -634,12 +653,27 @@ private fun EmptyChatPlaceholder() {
 }
 
 @Composable
-private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> Unit) {
+private fun Composer(
+    running: Boolean,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    isRecording: Boolean = false,
+    onMicClick: () -> Unit = {},
+    transcribedText: String? = null,
+    onTranscribedConsumed: () -> Unit = {},
+) {
     // rememberSaveable so the typed-but-unsent text survives rotation and
     // process death. Previously `remember` was used, which lost the draft
     // on any configuration change.
     var text by rememberSaveable { mutableStateOf("") }
     val ctx = androidx.compose.ui.platform.LocalContext.current
+    // VOICE INPUT: when transcribed text arrives, insert it into the text field.
+    LaunchedEffect(transcribedText) {
+        if (!transcribedText.isNullOrEmpty()) {
+            text = if (text.isBlank()) transcribedText else "$text $transcribedText"
+            onTranscribedConsumed()
+        }
+    }
     // CHAT-8 FIX: sync the mic toggle state from the ACTUAL overlay service
     // state on every recomposition, instead of trusting a remembered bool
     // that drifts. Previously `overlayOn` was initialized once from
@@ -771,6 +805,18 @@ private fun Composer(running: Boolean, onSend: (String) -> Unit, onStop: () -> U
                         modifier = Modifier.size(28.dp))
                 }
             } else {
+                // MICROPHONE BUTTON: press-and-hold style — tap to start
+                // recording, tap again to stop and transcribe. Shows a red
+                // dot when recording.
+                IconButton(onClick = { onMicClick() }) {
+                    Icon(
+                        if (isRecording) Icons.Filled.Mic else Icons.Outlined.Mic,
+                        contentDescription = if (isRecording) "Stop recording" else "Voice input",
+                        tint = if (isRecording) androidx.compose.ui.graphics.Color.Red
+                               else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
                 IconButton(
                     onClick = {
                         if (text.isNotBlank()) {

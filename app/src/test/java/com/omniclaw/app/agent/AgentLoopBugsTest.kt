@@ -25,7 +25,10 @@ import java.util.concurrent.atomic.AtomicInteger
  *  1. Duplicate `sessions.appendMessage(...)` in the `action == null || done`
  *     branch — every conversational turn was double-written to the session.
  *  2. `LlmUsage(0L, ...)` on the streaming path hardcoded `promptTokens = 0`,
- *     breaking the `maxSessionTokens` budget guard (prompt tokens dominate cost).
+ *     breaking accurate token accounting (prompt tokens dominate cost). The
+ *     30k `maxSessionTokens` budget guard that depended on this has since been
+ *     removed per user request, but correct usage tracking is still important
+ *     for the session's displayed token count.
  *  3. The cancel+launch+register sequence in `start()` was split across two
  *     `startMutex.withLock {}` blocks, allowing two concurrent loops for one
  *     session when `start()` was called twice in rapid succession.

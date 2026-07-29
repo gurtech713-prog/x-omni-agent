@@ -21,6 +21,12 @@ import javax.inject.Singleton
  * preprocessing, caching, retry, and response parsing. The http / json /
  * settings dependencies are retained for backward compatibility with
  * existing DI bindings and for the legacy [describeFile] entry point.
+ *
+ * SCREENSHOT ANNOTATION: [describeWithAnnotation] overlays bounding boxes and
+ * labels from the accessibility tree onto the screenshot before sending it to
+ * the VLM. This dramatically improves coordinate accuracy because the VLM can
+ * see exactly where each interactive element is, rather than guessing from
+ * raw pixels.
  */
 @Singleton
 class VlmClient @Inject constructor(
@@ -47,6 +53,94 @@ class VlmClient @Inject constructor(
             java.io.File(path).readBytes()
         }.getOrNull() ?: return null
         return describe(bytes, question)
+    }
+
+    /**
+     * Ask the VLM about a screenshot WITH accessibility-tree annotations
+     * overlaid. Each [Annotation] draws a colored bounding box + label on
+     * the image before it's sent to the vision model.
+     *
+     * This improves VLM accuracy because the model can see:
+     *   - Where each interactive element is (exact bounds)
+     *   - What text/label each element has
+     *   - The TAP coordinate for each element
+     *
+     * The annotated image is sent with the question, and the VLM's response
+     * can reference the annotated coordinates directly.
+     */
+    suspend fun describeWithAnnotation(
+        pngBytes: ByteArray,
+        question: String,
+        annotations: List<Annotation>,
+    ): String? {
+        if (annotations.isEmpty()) return describe(pngBytes, question)
+        val annotatedBytes = runCatching { annotateImage(pngBytes, annotations) }.getOrNull()
+            ?: return describe(pngBytes, question)
+        // Include annotation context in the prompt so the VLM knows what the
+        // boxes mean.
+        val contextPrompt = buildString {
+            append(question)
+            append("\n\nAnnotated elements on the screenshot:")
+            annotations.forEachIndexed { i, a ->
+                append("\n[${i + 1}] ${a.label} at (${a.x},${a.y}) bounds=[${a.left},${a.top},${a.right},${a.bottom}]")
+            }
+        }
+        return pipeline.describe(annotatedBytes, contextPrompt)
+    }
+
+    /**
+     * One annotation to draw on a screenshot. [left/top/right/bottom] are in
+     * pixel coordinates matching the screenshot bitmap. [x]/[y] are the TAP
+     * target (center). [label] is the text to draw next to the box.
+     */
+    data class Annotation(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val x: Int,
+        val y: Int,
+        val label: String,
+    )
+
+    /**
+     * Draw bounding boxes + labels on the image. Returns PNG bytes.
+     */
+    private fun annotateImage(pngBytes: ByteArray, annotations: List<Annotation>): ByteArray {
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
+            ?: return pngBytes
+        val mutable = bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+        val canvas = android.graphics.Canvas(mutable)
+        val boxPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.RED
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 4f
+            isAntiAlias = true
+        }
+        val textPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.RED
+            textSize = 28f
+            isAntiAlias = true
+            setShadowLayer(2f, 1f, 1f, android.graphics.Color.BLACK)
+        }
+        val dotPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.RED
+            style = android.graphics.Paint.Style.FILL
+            isAntiAlias = true
+        }
+        annotations.forEach { a ->
+            // Draw bounding box
+            canvas.drawRect(a.left.toFloat(), a.top.toFloat(), a.right.toFloat(), a.bottom.toFloat(), boxPaint)
+            // Draw TAP dot at center
+            canvas.drawCircle(a.x.toFloat(), a.y.toFloat(), 6f, dotPaint)
+            // Draw label
+            canvas.drawText(a.label.take(30), a.left.toFloat(), (a.top - 5).coerceAtLeast(20).toFloat(), textPaint)
+        }
+        val out = java.io.ByteArrayOutputStream()
+        mutable.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, out)
+        mutable.recycle()
+        if (mutable !== bitmap) bitmap.recycle()
+        return out.toByteArray()
     }
 
     /** Clear the underlying vision cache (e.g. on memory pressure). */

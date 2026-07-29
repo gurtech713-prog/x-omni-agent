@@ -591,16 +591,43 @@ class LlmClient @Inject constructor(
     /** Serialize a [Message] honoring the OpenAI tool protocol (tool_calls / tool role). */
     private fun messageToJson(m: Message): JsonObject = buildJsonObject {
         put("role", m.role)
-        put("content", m.content)
+        // CRITICAL FIX (agentic tasks failing at step 2):
+        //
+        // The OpenAI API spec requires `content` to be `null` (NOT an empty
+        // string "") on assistant messages that carry `tool_calls`. Many
+        // providers (OpenAI, GLM, ZhipuAI, Anthropic) return HTTP 400 with
+        // "content must be a string, null, or undefined" or similar when an
+        // assistant message has `"content": ""` alongside `tool_calls`.
+        //
+        // When the LLM returns ONLY a tool_call (no visible text), `content`
+        // is empty. Previously this was serialized as `"content": ""`, which
+        // killed every multi-step agentic task at step 2 — the LLM API
+        // rejected the malformed history and the session failed with HTTP 400.
+        //
+        // Now: for assistant messages with tool_calls AND blank content, we
+        // set content to JsonNull (which serializes as `"content": null`).
+        // For all other messages (user, tool, assistant-without-tool_calls),
+        // content is always a non-null string.
+        val hasToolCalls = !m.toolCalls.isNullOrEmpty()
+        val contentIsBlank = m.content.isBlank()
+        if (hasToolCalls && contentIsBlank) {
+            put("content", kotlinx.serialization.json.JsonNull)
+        } else {
+            put("content", m.content)
+        }
         m.toolCallId?.let { put("tool_call_id", it) }
-        if (!m.toolCalls.isNullOrEmpty()) {
+        if (hasToolCalls) {
             putJsonArray("tool_calls") {
-                m.toolCalls.forEach { tc ->
+                m.toolCalls!!.forEach { tc ->
                     add(buildJsonObject {
                         put("id", tc.id)
                         put("type", "function")
                         putJsonObject("function") {
                             put("name", tc.name)
+                            // CRITICAL: arguments must be a STRING (JSON-encoded),
+                            // not a JSON object. The OpenAI spec requires:
+                            // "arguments": "{\"action\":\"tap\",\"x\":100,\"y\":200}"
+                            // If we pass a raw JsonObject, the API rejects it.
                             put("arguments", tc.arguments)
                         }
                     })

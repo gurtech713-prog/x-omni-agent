@@ -61,54 +61,128 @@ class ChatAuditFixesTest {
         assertEquals("same session+step must produce the same ID", id1, id2)
     }
 
-    // ─── CHAT-2: send() creates fresh session after terminal status ────────
+    // ─── CHAT-CONTINUATION: send() reuses DONE sessions, only FAILED/STOPPED are terminal ──
 
     /**
      * Local stand-in for SessionStatus (the real enum requires the data-model
-     * classpath). Mirrors the four terminal + two non-terminal statuses.
+     * classpath). Mirrors the statuses used by the agent loop.
      */
     private enum class TestStatus { RUNNING, IDLE, DONE, FAILED, STOPPED }
 
     /**
-     * Mirror of the fixed send() terminal-status check. If the active session
-     * is DONE / FAILED / STOPPED, send() creates a NEW session instead of
-     * appending to the old one.
+     * Mirror of the CORRECTED send() terminal-status check.
+     *
+     * PREVIOUSLY (CHAT-2): DONE was treated as terminal, so every follow-up
+     * message created a NEW session — the user could never continue a chat
+     * because AgentLoop sets status=DONE after every completed turn.
+     *
+     * NOW (CHAT-CONTINUATION): only FAILED and STOPPED are terminal. A DONE
+     * session is a normal "agent finished its turn" state and the user can
+     * keep chatting in the same thread. IDLE/RUNNING/DONE all reuse the
+     * existing session.
      */
     private fun shouldCreateNewSession(existingStatus: TestStatus?): Boolean {
         if (existingStatus == null) return true
-        return existingStatus == TestStatus.DONE ||
-            existingStatus == TestStatus.FAILED ||
+        return existingStatus == TestStatus.FAILED ||
             existingStatus == TestStatus.STOPPED
     }
 
+    /**
+     * Mirror of the LAST-CHANCE RECOVERY logic added to send().
+     *
+     * When _activeId is null (ViewModel recreation / process kill), send()
+     * now checks if there's a recent non-terminal session to revive BEFORE
+     * creating a new one. This prevents the "new chat on every message after
+     * app restart" bug. Returns true if a recoverable session was found.
+     */
+    private fun shouldRecoverRecentSession(
+        existingStatus: TestStatus?,
+        recentSessionStatus: TestStatus?,
+    ): Boolean {
+        // Only recover when there's no active session AND the existing one
+        // isn't terminal (FAILED/STOPPED are genuinely unrecoverable).
+        if (existingStatus != null && shouldCreateNewSession(existingStatus)) return false
+        if (recentSessionStatus == null) return false
+        return recentSessionStatus != TestStatus.FAILED &&
+            recentSessionStatus != TestStatus.STOPPED
+    }
+
     @Test
-    fun `CHAT-2 null session triggers new session creation`() {
+    fun `CHAT-CONTINUATION null session triggers new session creation`() {
         assertTrue("null session must create new", shouldCreateNewSession(null))
     }
 
     @Test
-    fun `CHAT-2 RUNNING session does NOT trigger new session creation`() {
+    fun `CHAT-CONTINUATION RUNNING session does NOT trigger new session creation`() {
         assertFalse("RUNNING session must NOT create new", shouldCreateNewSession(TestStatus.RUNNING))
     }
 
     @Test
-    fun `CHAT-2 IDLE session does NOT trigger new session creation`() {
+    fun `CHAT-CONTINUATION IDLE session does NOT trigger new session creation`() {
         assertFalse("IDLE session must NOT create new", shouldCreateNewSession(TestStatus.IDLE))
     }
 
     @Test
-    fun `CHAT-2 DONE session triggers new session creation`() {
-        assertTrue("DONE session must create new", shouldCreateNewSession(TestStatus.DONE))
+    fun `CHAT-CONTINUATION DONE session does NOT trigger new session creation`() {
+        // CRITICAL FIX: DONE means "agent finished its turn", NOT "session
+        // is archived". The user can continue the conversation in the same
+        // thread. Previously DONE was treated as terminal, which caused every
+        // follow-up message to create a new session.
+        assertFalse("DONE session must NOT create new — user can continue chat", shouldCreateNewSession(TestStatus.DONE))
     }
 
     @Test
-    fun `CHAT-2 FAILED session triggers new session creation`() {
+    fun `CHAT-CONTINUATION FAILED session triggers new session creation`() {
         assertTrue("FAILED session must create new", shouldCreateNewSession(TestStatus.FAILED))
     }
 
     @Test
-    fun `CHAT-2 STOPPED session triggers new session creation`() {
+    fun `CHAT-CONTINUATION STOPPED session triggers new session creation`() {
         assertTrue("STOPPED session must create new", shouldCreateNewSession(TestStatus.STOPPED))
+    }
+
+    // ─── SESSION RECOVERY: send() revives recent session when _activeId is null ──
+
+    @Test
+    fun `SESSION-RECOVERY revives recent DONE session when activeId is null`() {
+        // After ViewModel recreation, _activeId is null. A recent DONE session
+        // exists. send() should recover it instead of creating new.
+        assertTrue(
+            "Should recover recent DONE session",
+            shouldRecoverRecentSession(existingStatus = null, recentSessionStatus = TestStatus.DONE)
+        )
+    }
+
+    @Test
+    fun `SESSION-RECOVERY revives recent IDLE session when activeId is null`() {
+        assertTrue(
+            "Should recover recent IDLE session",
+            shouldRecoverRecentSession(existingStatus = null, recentSessionStatus = TestStatus.IDLE)
+        )
+    }
+
+    @Test
+    fun `SESSION-RECOVERY does NOT recover recent FAILED session`() {
+        assertFalse(
+            "Should NOT recover a FAILED session",
+            shouldRecoverRecentSession(existingStatus = null, recentSessionStatus = TestStatus.FAILED)
+        )
+    }
+
+    @Test
+    fun `SESSION-RECOVERY does NOT recover recent STOPPED session`() {
+        assertFalse(
+            "Should NOT recover a STOPPED session",
+            shouldRecoverRecentSession(existingStatus = null, recentSessionStatus = TestStatus.STOPPED)
+        )
+    }
+
+    @Test
+    fun `SESSION-RECOVERY creates new session when no recent session exists`() {
+        assertFalse(
+            "Should NOT recover when no recent session exists",
+            shouldRecoverRecentSession(existingStatus = null, recentSessionStatus = null)
+        )
     }
 
     // ─── CHAT-4: scroll target derived from filtered messages ──────────────

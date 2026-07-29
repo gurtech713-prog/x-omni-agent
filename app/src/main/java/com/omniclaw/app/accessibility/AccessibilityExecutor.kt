@@ -76,11 +76,284 @@ class AccessibilityExecutor @Inject constructor(
     }
 
     /**
+     * Check if a UI element matching [query] exists on the current screen.
+     * Does NOT click it — just returns true if found. Uses the same 5-pass
+     * matching strategy as [tapElementByText].
+     */
+    suspend fun elementExists(query: String): Boolean {
+        val svc = svc() as? AccessibilityService ?: return false
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        try {
+            return findNodeByText(root, query) != null
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Find ALL UI elements matching [query] and return their metadata as a
+     * list of [ElementInfo]. Used by the find_elements tool so the LLM can
+     * see all matching elements and choose which one to tap.
+     *
+     * Each [ElementInfo] includes: text, content-description, view ID,
+     * bounds, center coordinates (TAP target), and whether it's clickable.
+     */
+    suspend fun findAllElements(query: String): List<ElementInfo> {
+        val svc = svc() as? AccessibilityService ?: return emptyList()
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return emptyList()
+        try {
+            val q = query.trim().lowercase()
+            if (q.isBlank()) return emptyList()
+            val results = mutableListOf<ElementInfo>()
+            val allNodes = searchEngine.findAll(root) { node ->
+                runCatching {
+                    val text = node.text?.toString().orEmpty()
+                    val desc = node.contentDescription?.toString().orEmpty()
+                    val id = node.viewIdResourceName.orEmpty()
+                    text.lowercase().contains(q) ||
+                        desc.lowercase().contains(q) ||
+                        id.lowercase().contains(q)
+                }.getOrDefault(false)
+            }
+            for (node in allNodes) {
+                val rect = android.graphics.Rect()
+                runCatching { node.getBoundsInScreen(rect) }
+                val info = ElementInfo(
+                    text = runCatching { node.text?.toString().orEmpty() }.getOrDefault(""),
+                    contentDescription = runCatching { node.contentDescription?.toString().orEmpty() }.getOrDefault(""),
+                    viewId = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault(""),
+                    bounds = intArrayOf(rect.left, rect.top, rect.right, rect.bottom),
+                    centerX = (rect.left + rect.right) / 2,
+                    centerY = (rect.top + rect.bottom) / 2,
+                    isClickable = runCatching { node.isClickable }.getOrDefault(false),
+                    isEditable = runCatching { node.isEditable }.getOrDefault(false),
+                    isScrollable = runCatching { node.isScrollable }.getOrDefault(false),
+                )
+                results.add(info)
+                runCatching { node.recycle() }
+            }
+            return results
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /** Metadata about a UI element, returned by [findAllElements]. */
+    data class ElementInfo(
+        val text: String,
+        val contentDescription: String,
+        val viewId: String,
+        val bounds: IntArray,
+        val centerX: Int,
+        val centerY: Int,
+        val isClickable: Boolean,
+        val isEditable: Boolean,
+        val isScrollable: Boolean,
+    )
+
+    /**
+     * Get the current foreground package name. Used by app-specific skill
+     * profiles to look up known view IDs for the active app.
+     */
+    fun foregroundPackage(): String? {
+        val svc = svc() as? AccessibilityService ?: return null
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return null
+        try {
+            return root.packageName?.toString()
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Select text in the focused editable field. Uses ACTION_SET_SELECTION
+     * with the given character range.
+     */
+    suspend fun selectText(start: Int, end: Int): Boolean {
+        val svc = svc() as? AccessibilityService ?: return false
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        var target: AccessibilityNodeInfo? = null
+        try {
+            target = runCatching { root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }.getOrNull()
+            if (target == null) {
+                target = searchEngine.findFirst(root, searchEngine.editable)
+            }
+            if (target == null) return false
+            val args = Bundle().apply {
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, start)
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, end)
+            }
+            return runCatching {
+                target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+            }.getOrDefault(false)
+        } finally {
+            runCatching { target?.recycle() }
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Copy the current selection to the clipboard via ACTION_COPY on the
+     * focused field.
+     */
+    suspend fun copySelection(): Boolean {
+        val svc = svc() as? AccessibilityService ?: return false
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        var target: AccessibilityNodeInfo? = null
+        try {
+            target = runCatching { root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }.getOrNull()
+            if (target == null) {
+                target = searchEngine.findFirst(root, searchEngine.editable)
+            }
+            if (target == null) return false
+            // Select all first, then copy
+            val selectAllArgs = Bundle().apply {
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, Int.MAX_VALUE)
+            }
+            runCatching { target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectAllArgs) }
+            return runCatching {
+                target.performAction(AccessibilityNodeInfo.ACTION_COPY)
+            }.getOrDefault(false)
+        } finally {
+            runCatching { target?.recycle() }
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Find a node by text/content-description/view-ID match. 5-pass matching:
+     *   1. Exact text match (case-insensitive)
+     *   2. Exact content-description match
+     *   3. Text contains query
+     *   4. Content-description contains query
+     *   5. View ID resource name contains query (e.g. "shutter_btn" matches "shutter")
+     * Returns the node (caller owns it) or null.
+     */
+    private fun findNodeByText(root: AccessibilityNodeInfo, query: String): AccessibilityNodeInfo? {
+        val q = query.trim().lowercase()
+        if (q.isBlank()) return null
+        // Pass 1: exact text
+        searchEngine.findFirst(root) { node ->
+            runCatching { node.text?.toString()?.equals(query, ignoreCase = true) == true }.getOrDefault(false)
+        }?.let { return it }
+        // Pass 2: exact content-description
+        searchEngine.findFirst(root) { node ->
+            runCatching { node.contentDescription?.toString()?.equals(query, ignoreCase = true) == true }.getOrDefault(false)
+        }?.let { return it }
+        // Pass 3: text contains
+        searchEngine.findFirst(root) { node ->
+            runCatching { node.text?.toString()?.lowercase()?.contains(q) == true }.getOrDefault(false)
+        }?.let { return it }
+        // Pass 4: content-description contains
+        searchEngine.findFirst(root) { node ->
+            runCatching { node.contentDescription?.toString()?.lowercase()?.contains(q) == true }.getOrDefault(false)
+        }?.let { return it }
+        // Pass 5: view ID resource name contains (multi-language fallback)
+        searchEngine.findFirst(root) { node ->
+            runCatching {
+                node.viewIdResourceName?.lowercase()?.contains(q) == true
+            }.getOrDefault(false)
+        }?.let { return it }
+        return null
+    }
+
+    /**
+     * Tap a UI element by its text or content description — NO coordinates
+     * required. This is far more reliable than tap(x,y) because it searches
+     * the accessibility tree for a node matching the given text/description
+     * and dispatches ACTION_CLICK on it directly.
+     *
+     * Matching strategy (in priority order):
+     *   1. Exact text match (case-insensitive)
+     *   2. Exact content-description match (case-insensitive)
+     *   3. Text contains the query (case-insensitive)
+     *   4. Content-description contains the query (case-insensitive)
+     *
+     * If a non-clickable node matches, we walk UP to the nearest clickable
+     * ancestor and click that (common pattern: a TextView inside a clickable
+     * FrameLayout).
+     *
+     * Returns true if a matching node was found AND clicked.
+     */
+    suspend fun tapElementByText(query: String): Boolean {
+        val svc = svc() as? AccessibilityService ?: return false
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        try {
+            if (query.isBlank()) return false
+            // Use the unified 5-pass matcher (includes view ID resource name
+            // matching for multi-language support).
+            val match = findNodeByText(root, query) ?: run {
+                Log.i(TAG, "tapElementByText('$query'): no matching node found")
+                return false
+            }
+
+            // If the matched node isn't clickable, walk up to the nearest
+            // clickable ancestor (common pattern: TextView inside FrameLayout).
+            var target = match
+            var needsRecycle = false
+            if (!runCatching { target.isClickable }.getOrDefault(false)) {
+                var ancestor = runCatching { target.parent }.getOrNull()
+                var hops = 0
+                while (ancestor != null && hops < 5) {
+                    if (runCatching { ancestor.isClickable }.getOrDefault(false)) break
+                    val next = runCatching { ancestor.parent }.getOrNull()
+                    if (next != null) runCatching { ancestor.recycle() }
+                    ancestor = next
+                    hops++
+                }
+                if (ancestor != null && runCatching { ancestor.isClickable }.getOrDefault(false)) {
+                    runCatching { match.recycle() }
+                    target = ancestor
+                    needsRecycle = true
+                }
+            }
+
+            val ok = performClickWithFocus(target)
+            if (needsRecycle) runCatching { target.recycle() }
+            else runCatching { target.recycle() }
+            if (ok) {
+                Log.i(TAG, "tapElementByText('$query'): clicked successfully")
+                waitForStabilization()
+            }
+            return ok
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Check if the screen changed after the last action. Used by the agent
+     * loop's verification step to give the LLM feedback on whether its action
+     * had an effect.
+     *
+     * Returns a [VerifyResult] with the before/after fingerprints and whether
+     * the screen changed.
+     */
+    suspend fun verifyScreenChanged(beforeFingerprint: String): VerifyResult {
+        val after = quickFingerprint()
+        val changed = after != beforeFingerprint && after.isNotBlank()
+        return VerifyResult(changed = changed, beforeFingerprint = beforeFingerprint, afterFingerprint = after)
+    }
+
+    /** Result of a post-action verification check. */
+    data class VerifyResult(
+        val changed: Boolean,
+        val beforeFingerprint: String,
+        val afterFingerprint: String,
+    )
+
+    /**
      * Capture a flat text snapshot of the current accessibility tree.
      *
      * Recovers gracefully from null roots (waits up to 800ms with 3 retries,
      * re-querying `rootInActiveWindow` each time). Returns a sentinel string
      * if the service is disconnected or the root remains null after retries.
+     *
+     * SNAPSHOT FORMAT: each clickable/scrollable node includes an explicit
+     * "tap here: (x,y)" hint with its screen-center coordinates, so the LLM
+     * can read the exact tap target directly from the observation without
+     * guessing from a screenshot. This dramatically improves tap accuracy.
      */
     suspend fun snapshot(): String {
         val s = svc()
@@ -141,14 +414,49 @@ class AccessibilityExecutor @Inject constructor(
                 // stats reset to zero on every tap/swipe.
                 val gm = gestureManager(svc)
                 val ok = gm.tap(action.x, action.y)
-                metrics.recordTap(System.currentTimeMillis() - start, ok)
-                if (ok) waitForStabilization()
-                ok
+                // NODE-CLICK FALLBACK: if the gesture tap was cancelled on all
+                // retries (common during activity transitions, IME show/hide,
+                // or on OEMs with aggressive gesture interception), try to
+                // find the clickable node at (x,y) and dispatch ACTION_CLICK
+                // on it directly. This is the same mechanism a TalkBack user
+                // triggers when they "click" a focusable element — it bypasses
+                // the gesture pipeline entirely and works even when
+                // dispatchGesture is being cancelled. Without this fallback the
+                // agent would report "tap failed" and the LLM would have no
+                // recourse except retrying the exact same (doomed) gesture.
+                val finalOk = if (ok) true else tapNodeAt(svc, action.x, action.y)
+                metrics.recordTap(System.currentTimeMillis() - start, finalOk)
+                if (finalOk) waitForStabilization()
+                finalOk
             }
             is DeviceAction.Swipe -> {
                 val start = System.currentTimeMillis()
                 val gm = gestureManager(svc)
                 val ok = gm.swipe(action.x1, action.y1, action.x2, action.y2)
+                metrics.recordSwipe(System.currentTimeMillis() - start, ok)
+                if (ok) waitForStabilization()
+                ok
+            }
+            is DeviceAction.Drag -> {
+                val start = System.currentTimeMillis()
+                val gm = gestureManager(svc)
+                val ok = gm.drag(action.x1, action.y1, action.x2, action.y2)
+                metrics.recordSwipe(System.currentTimeMillis() - start, ok)
+                if (ok) waitForStabilization()
+                ok
+            }
+            // SCROLL: direction-based, screen-aware. Delegates to
+            // GestureManager.scroll() which reads the real viewport size and
+            // computes a swipe path that lands on scrollable content. This
+            // replaces the old approach where the LLM had to emit exact pixel
+            // coordinates for swipe() — which failed constantly because the
+            // model either guessed wrong coordinates or used hardcoded values
+            // that didn't match the actual screen size.
+            is DeviceAction.Scroll -> {
+                val start = System.currentTimeMillis()
+                val gm = gestureManager(svc)
+                val dir = parseScrollDirection(action.direction)
+                val ok = if (dir != null) gm.scroll(dir, action.amount) else false
                 metrics.recordSwipe(System.currentTimeMillis() - start, ok)
                 if (ok) waitForStabilization()
                 ok
@@ -188,6 +496,256 @@ class AccessibilityExecutor @Inject constructor(
         }
     }
 
+    /**
+     * Map a direction string ("up"/"down"/"left"/"right", case-insensitive)
+     * to a [GestureManager.ScrollDirection]. Returns null for unrecognized
+     * strings so the caller can surface a parse error instead of dispatching
+     * a bogus scroll.
+     */
+    private fun parseScrollDirection(s: String): GestureManager.ScrollDirection? =
+        when (s.lowercase().trim()) {
+            "up" -> GestureManager.ScrollDirection.UP
+            "down" -> GestureManager.ScrollDirection.DOWN
+            "left" -> GestureManager.ScrollDirection.LEFT
+            "right" -> GestureManager.ScrollDirection.RIGHT
+            else -> null
+        }
+
+    /**
+     * Fallback tap mechanism: find the clickable (or focusable) accessibility
+     * node whose screen bounds contain (x, y) and dispatch [ACTION_CLICK] on
+     * it directly, bypassing the gesture pipeline.
+     *
+     * This is used when [GestureManager.tap] fails (all retries cancelled) —
+     * a common situation on OEMs with aggressive gesture interception, during
+     * activity transitions, or when a system overlay briefly steals focus.
+     * The node-click path uses the same accessibility action that TalkBack
+     * uses for "activate" gestures, so it works even when dispatchGesture is
+     * being cancelled.
+     *
+     * Walks the tree from the active root, finds the deepest node whose
+     * bounds contain (x, y) and which is clickable (or, failing that, the
+     * nearest focusable ancestor). Clicks it, then recycles every node it
+     * touched. Returns true if a node was found AND the click action returned
+     * true; false otherwise.
+     *
+     * If no clickable node is at the exact point, we also try the nearest
+     * clickable node within a small tolerance radius (±40px) — handles cases
+     * where the LLM's coordinates are slightly off-center on a small button.
+     */
+    private suspend fun tapNodeAt(svc: AccessibilityService, x: Int, y: Int): Boolean {
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        try {
+            // First pass: find a clickable node whose bounds contain (x, y).
+            // Prefer the DEEPEST such node (closest to the leaf) so we click
+            // the actual button, not its container.
+            val exact = findDeepestNodeContaining(root, x, y, requireClickable = true)
+            if (exact != null) {
+                val clicked = performClickWithFocus(exact)
+                runCatching { exact.recycle() }
+                if (clicked) {
+                    Log.i(TAG, "tapNodeAt($x,$y) succeeded via ACTION_CLICK (gesture fallback)")
+                    return true
+                }
+            }
+            // Second pass: tolerate a small offset — find the nearest clickable
+            // node within ±40px of (x, y). The LLM's coordinates are often
+            // derived from a screenshot and can be a few pixels off-center on
+            // small targets (icons, checkboxes).
+            val near = findNearestClickableNear(root, x, y, tolerance = 40)
+            if (near != null) {
+                val clicked = performClickWithFocus(near)
+                runCatching { near.recycle() }
+                if (clicked) {
+                    Log.i(TAG, "tapNodeAt($x,$y) succeeded via nearest-clickable fallback")
+                    return true
+                }
+            }
+            return false
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * Perform a click on [node] with a focus-first strategy.
+     *
+     * Some views (EditText, CheckBox, custom views) require focus before
+     * ACTION_CLICK works. We try:
+     *   1. ACTION_FOCUS (best-effort — ignored if the node isn't focusable)
+     *   2. ACTION_CLICK
+     *   3. If ACTION_CLICK fails, try ACTION_LONG_CLICK (some views only
+     *      respond to long-click)
+     *   4. If all fail, try dispatching ACTION_CLICK on the node's parent
+     *      (some click handlers are on the parent, not the leaf)
+     *
+     * Returns true if any action succeeded.
+     */
+    private fun performClickWithFocus(node: AccessibilityNodeInfo): Boolean {
+        // Step 1: focus the node (best-effort).
+        runCatching { node.performAction(AccessibilityNodeInfo.ACTION_FOCUS) }
+        // Step 2: try ACTION_CLICK.
+        val clicked = runCatching {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        }.getOrDefault(false)
+        if (clicked) return true
+        // Step 3: try ACTION_LONG_CLICK (rare, but some views only respond to it).
+        val longClicked = runCatching {
+            node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+        }.getOrDefault(false)
+        if (longClicked) return true
+        // Step 4: try clicking the parent (some click handlers are on the
+        // parent container, not the leaf node).
+        val parent = runCatching { node.parent }.getOrNull()
+        if (parent != null) {
+            val parentClicked = runCatching {
+                parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }.getOrDefault(false)
+            runCatching { parent.recycle() }
+            if (parentClicked) return true
+        }
+        return false
+    }
+
+    /**
+     * Find the deepest node in [root]'s subtree whose screen bounds contain
+     * (x, y). When [requireClickable] is true, only returns nodes that report
+     * [AccessibilityNodeInfo.isClickable] — so we don't accidentally "click"
+     * a plain TextView (which has no click handler and the action is a no-op).
+     *
+     * Iterative DFS with explicit (node, depth) frames, depth-capped at 50,
+     * node-count-capped at 2000 to avoid pathological trees. Collects every
+     * node it opens so they can be recycled in a single pass at the end
+     * (except the returned match, which the caller owns, and the root, which
+     * the caller also owns).
+     */
+    private fun findDeepestNodeContaining(
+        root: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        requireClickable: Boolean,
+    ): AccessibilityNodeInfo? {
+        data class Frame(val node: AccessibilityNodeInfo, val depth: Int)
+        val stack = ArrayDeque<Frame>()
+        val visited = HashSet<Int>(256)
+        // Every node we obtain via getChild() is owned by this search and must
+        // be recycled. The root is caller-owned (NOT in this list).
+        val opened = ArrayList<AccessibilityNodeInfo>(128)
+        var best: AccessibilityNodeInfo? = null
+        var bestDepth = -1
+        var nodesVisited = 0
+        stack.addLast(Frame(root, 0))
+        visited.add(System.identityHashCode(root))
+        try {
+            while (stack.isNotEmpty()) {
+                if (nodesVisited >= 2000) break
+                val (node, depth) = stack.removeLast()
+                nodesVisited++
+                val alive = runCatching { node.className != null }.getOrDefault(false)
+                if (!alive) continue
+                val rect = android.graphics.Rect()
+                val hasBounds = runCatching { node.getBoundsInScreen(rect); true }.getOrDefault(false)
+                if (hasBounds && rect.contains(x, y)) {
+                    val clickable = runCatching { node.isClickable }.getOrDefault(false)
+                    if ((!requireClickable || clickable) && depth > bestDepth) {
+                        best = node
+                        bestDepth = depth
+                    }
+                }
+                // Expand children — deepest match wins, so always descend.
+                if (depth < 50) {
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (i in 0 until childCount) {
+                        val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
+                        val id = System.identityHashCode(child)
+                        if (id in visited) { runCatching { child.recycle() }; continue }
+                        visited.add(id)
+                        opened.add(child)
+                        stack.addLast(Frame(child, depth + 1))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "findDeepestNodeContaining failed: ${e.message}")
+        } finally {
+            // Recycle every opened node EXCEPT the one we're returning.
+            for (n in opened) {
+                if (n !== best) runCatching { n.recycle() }
+            }
+        }
+        return best
+    }
+
+    /**
+     * Find the nearest clickable node to (x, y) within [tolerance] pixels.
+     * Used as a second-pass fallback when no clickable node exactly contains
+     * the target point — common when the LLM's coordinates are a few pixels
+     * off-center on small targets.
+     *
+     * Returns the node (caller owns it; recycle when done) or null.
+     */
+    private fun findNearestClickableNear(
+        root: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        tolerance: Int,
+    ): AccessibilityNodeInfo? {
+        data class Frame(val node: AccessibilityNodeInfo, val depth: Int)
+        val stack = ArrayDeque<Frame>()
+        val visited = HashSet<Int>(256)
+        val opened = ArrayList<AccessibilityNodeInfo>(128)
+        var best: AccessibilityNodeInfo? = null
+        var bestDist = Int.MAX_VALUE
+        var nodesVisited = 0
+        val tolSq = tolerance * tolerance
+        stack.addLast(Frame(root, 0))
+        visited.add(System.identityHashCode(root))
+        try {
+            while (stack.isNotEmpty()) {
+                if (nodesVisited >= 2000) break
+                val (node, depth) = stack.removeLast()
+                nodesVisited++
+                val alive = runCatching { node.className != null }.getOrDefault(false)
+                if (!alive) continue
+                val clickable = runCatching { node.isClickable }.getOrDefault(false)
+                if (clickable) {
+                    val rect = android.graphics.Rect()
+                    val hasBounds = runCatching { node.getBoundsInScreen(rect); true }.getOrDefault(false)
+                    if (hasBounds) {
+                        // Squared distance from (x,y) to the nearest edge of
+                        // the rect (0 if inside). Cheaper than sqrt and fine
+                        // for comparison.
+                        val dx = maxOf(0, maxOf(rect.left - x, x - rect.right))
+                        val dy = maxOf(0, maxOf(rect.top - y, y - rect.bottom))
+                        val dist = dx * dx + dy * dy
+                        if (dist < bestDist && dist <= tolSq) {
+                            best = node
+                            bestDist = dist
+                        }
+                    }
+                }
+                if (depth < 50) {
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (i in 0 until childCount) {
+                        val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
+                        val id = System.identityHashCode(child)
+                        if (id in visited) { runCatching { child.recycle() }; continue }
+                        visited.add(id)
+                        opened.add(child)
+                        stack.addLast(Frame(child, depth + 1))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "findNearestClickableNear failed: ${e.message}")
+        } finally {
+            for (n in opened) {
+                if (n !== best) runCatching { n.recycle() }
+            }
+        }
+        return best
+    }
+
     /** Capture a screenshot as compressed bytes (WebP/PNG). */
     suspend fun screenshot(): ByteArray? {
         val svc = svc() as? OmniA11yLike ?: return null
@@ -210,6 +768,14 @@ class AccessibilityExecutor @Inject constructor(
      * We only press BACK when a dialog/keyboard is actually visible —
      * never speculatively — so we don't dismiss the user's legitimate
      * foreground activity.
+     *
+     * KEYBOARD-EDITABLE FIX: when a Tap targets an editable (EditText-like)
+     * node, we do NOT dismiss the keyboard. The agent is almost certainly
+     * trying to focus the field to type into it — dismissing the keyboard
+     * first would close the IME, then the tap re-opens it, causing a visible
+     * flicker AND a race where the tap lands during the IME's hide animation
+     * and gets cancelled. By keeping the keyboard visible when the target is
+     * editable, the tap cleanly focuses the field and the IME stays open.
      */
     private fun clearBlockingOverlays(svc: AccessibilityService, action: DeviceAction) {
         // Type actions target the focused field, which is often inside a
@@ -226,6 +792,19 @@ class AccessibilityExecutor @Inject constructor(
         // dismiss when the gesture lands outside them.
         if (state.isDialogVisible && gestureInsideActiveWindow(svc, action)) {
             return
+        }
+
+        // KEYBOARD-EDITABLE FIX: if the keyboard is visible AND the action is
+        // a Tap whose coordinates fall on an editable node, keep the keyboard.
+        // The agent is trying to focus a text field — dismissing the IME here
+        // would force a close+reopen cycle that often cancels the tap.
+        if (state.isKeyboardVisible && action is DeviceAction.Tap) {
+            if (tapTargetsEditable(svc, action.x, action.y)) {
+                Log.d(TAG, "clearBlockingOverlays: keeping keyboard — tap targets editable node at (${action.x},${action.y})")
+                // Still clear a dialog if one is visible (the keyboard + dialog
+                // combo is rare but possible — e.g. a search dialog).
+                if (!state.isDialogVisible) return
+            }
         }
 
         if (state.isDialogVisible || state.isKeyboardVisible) {
@@ -248,6 +827,30 @@ class AccessibilityExecutor @Inject constructor(
                     windowTracker.clearDialog()
                 }
             }
+        }
+    }
+
+    /**
+     * True if the tap target at (x, y) is an editable (EditText-like) node.
+     * Used by [clearBlockingOverlays] to decide whether to keep the keyboard
+     * visible — tapping a text field to focus it shouldn't close the IME.
+     *
+     * Does a lightweight single-point hit test via the accessibility tree:
+     * finds the deepest node whose bounds contain (x, y) and checks
+     * [AccessibilityNodeInfo.isEditable]. Recycles every node it touches.
+     */
+    private fun tapTargetsEditable(svc: AccessibilityService, x: Int, y: Int): Boolean {
+        val root = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return false
+        try {
+            val node = findDeepestNodeContaining(root, x, y, requireClickable = false)
+            if (node != null) {
+                val editable = runCatching { node.isEditable }.getOrDefault(false)
+                runCatching { node.recycle() }
+                return editable
+            }
+            return false
+        } finally {
+            runCatching { root.recycle() }
         }
     }
 
@@ -491,18 +1094,32 @@ class AccessibilityExecutor @Inject constructor(
         val pad = "  ".repeat(depth.coerceAtMost(8))
         val cls = runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "?"
         val text = runCatching { node.text?.toString().orEmpty().take(80) }.getOrDefault("")
+        val contentDesc = runCatching { node.contentDescription?.toString().orEmpty().take(60) }.getOrDefault("")
         val rawId = runCatching { node.viewIdResourceName }.getOrNull()
         val pkg = runCatching { node.packageName?.toString() }.getOrNull().orEmpty()
         val id = if (rawId != null) logger.rebindRef(rawId, pkg) ?: rawId else ""
         sb.append("$pad- $cls")
         if (id.isNotBlank()) sb.append(" id=$id")
         if (text.isNotBlank()) sb.append(" text=\"$text\"")
-        if (runCatching { node.isClickable }.getOrDefault(false)) sb.append(" [clickable]")
-        if (runCatching { node.isScrollable }.getOrDefault(false)) sb.append(" [scrollable]")
-        if (runCatching { node.isClickable || node.isScrollable }.getOrDefault(false)) {
+        if (contentDesc.isNotBlank()) sb.append(" desc=\"$contentDesc\"")
+        val clickable = runCatching { node.isClickable }.getOrDefault(false)
+        val scrollable = runCatching { node.isScrollable }.getOrDefault(false)
+        val editable = runCatching { node.isEditable }.getOrDefault(false)
+        if (clickable) sb.append(" [clickable]")
+        if (scrollable) sb.append(" [scrollable]")
+        if (editable) sb.append(" [editable]")
+        // SNAPSHOT HINT: for clickable/scrollable/editable nodes, compute the
+        // screen-center coordinates and emit an explicit "TAP:(cx,cy)" hint.
+        // This lets the LLM read the exact tap target directly from the
+        // observation without guessing from a screenshot — eliminating the
+        // coordinate-accuracy problem.
+        if (clickable || scrollable || editable) {
             val rect = android.graphics.Rect()
             runCatching { node.getBoundsInScreen(rect) }
             sb.append(" bounds=[${rect.left},${rect.top},${rect.right},${rect.bottom}]")
+            val cx = (rect.left + rect.right) / 2
+            val cy = (rect.top + rect.bottom) / 2
+            sb.append(" TAP:($cx,$cy)")
         }
         sb.appendLine()
         // S-M8: cap the number of children expanded per node to prevent

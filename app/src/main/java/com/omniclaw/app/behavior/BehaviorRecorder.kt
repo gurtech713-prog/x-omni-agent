@@ -191,6 +191,20 @@ class BehaviorRecorder @Inject constructor(
                 val m = Regex("(?i)launch\\s*\\(\\s*(.+?)\\s*\\)").find(s)
                 com.omniclaw.app.agent.tools.DeviceAction.Launch(m?.groupValues?.getOrNull(1).orEmpty())
             }
+            // SCROLL: direction-based, matches the AgentLoop.parseDeviceAction
+            // format. Records the direction + amount so replay can re-dispatch
+            // via the suspend executor path (which computes coordinates from
+            // the live screen size at replay time).
+            s.startsWith("scroll", ignoreCase = true) -> {
+                val m = Regex("(?i)scroll\\s*\\(\\s*([a-z]+)\\s*(?:,\\s*([0-9]*\\.?[0-9]+)\\s*)?\\)").find(s)
+                val dir = m?.groupValues?.getOrNull(1)?.lowercase()
+                val amt = m?.groupValues?.getOrNull(2)?.toFloatOrNull() ?: 0.35f
+                when (dir) {
+                    "up", "down", "left", "right" ->
+                        com.omniclaw.app.agent.tools.DeviceAction.Scroll(dir, amt)
+                    else -> null
+                }
+            }
             s.startsWith("back", ignoreCase = true) -> com.omniclaw.app.agent.tools.DeviceAction.Back
             s.startsWith("home", ignoreCase = true) -> com.omniclaw.app.agent.tools.DeviceAction.Home
             s.startsWith("screenshot", ignoreCase = true) -> com.omniclaw.app.agent.tools.DeviceAction.Screenshot

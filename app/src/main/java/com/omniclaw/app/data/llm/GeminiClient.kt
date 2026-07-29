@@ -474,49 +474,134 @@ class GeminiClient(
      */
     private fun convertMessages(messages: List<LlmClient.Message>): Pair<String?, List<JsonObject>> {
         val systemParts = mutableListOf<String>()
-        val raw = mutableListOf<Pair<String, String>>() // (geminiRole, text)
+        val raw = mutableListOf<JsonObject>() // Gemini-format content objects
 
         messages.forEach { m ->
             when (m.role.lowercase()) {
                 "system" -> systemParts.add(m.content)
-                "user" -> raw.add("user" to m.content)
-                "assistant" -> raw.add("model" to m.content)
-                "tool" -> raw.add("user" to "[tool result] ${m.content}")
-                else -> raw.add("user" to m.content)
-            }
-        }
-
-        // Merge consecutive same-role turns to satisfy Gemini's strict alternation.
-        val merged = mutableListOf<Pair<String, String>>()
-        for ((role, text) in raw) {
-            if (merged.isNotEmpty() && merged.last().first == role) {
-                val prev = merged.removeAt(merged.lastIndex)
-                merged.add(role to "${prev.second}\n\n$text")
-            } else {
-                merged.add(role to text)
+                "user" -> raw.add(buildJsonObject {
+                    put("role", "user")
+                    putJsonArray("parts") {
+                        add(buildJsonObject { put("text", m.content) })
+                    }
+                })
+                "assistant" -> {
+                    // CRITICAL FIX: Gemini uses functionCall parts (not OpenAI's
+                    // tool_calls field). When an assistant message carries
+                    // tool_calls, we must emit them as functionCall parts —
+                    // otherwise Gemini loses the tool invocation and can't
+                    // match the subsequent functionResponse.
+                    if (!m.toolCalls.isNullOrEmpty()) {
+                        raw.add(buildJsonObject {
+                            put("role", "model")
+                            putJsonArray("parts") {
+                                // Include the text content if non-blank (Gemini
+                                // allows text + functionCall in the same turn).
+                                if (m.content.isNotBlank()) {
+                                    add(buildJsonObject { put("text", m.content) })
+                                }
+                                m.toolCalls.forEach { tc ->
+                                    add(buildJsonObject {
+                                        putJsonObject("functionCall") {
+                                            put("name", tc.name)
+                                            // Parse the arguments JSON string into a
+                                            // JsonObject for Gemini (it expects an
+                                            // object, not a string like OpenAI).
+                                            val argsObj = runCatching {
+                                                json.parseToJsonElement(tc.arguments).jsonObject
+                                            }.getOrDefault(JsonObject(emptyMap()))
+                                            put("args", argsObj)
+                                        }
+                                    })
+                                }
+                            }
+                        })
+                    } else {
+                        raw.add(buildJsonObject {
+                            put("role", "model")
+                            putJsonArray("parts") {
+                                val safeText = if (m.content.isBlank()) "(empty)" else m.content
+                                add(buildJsonObject { put("text", safeText) })
+                            }
+                        })
+                    }
+                }
+                "tool" -> {
+                    // CRITICAL FIX: Gemini uses functionResponse parts (not
+                    // OpenAI's tool role with tool_call_id). The functionResponse
+                    // must carry the same name as the functionCall it responds to.
+                    // We look up the name from the preceding assistant message's
+                    // tool_calls using the tool_call_id.
+                    val toolName = findToolNameForId(messages, m.toolCallId)
+                    raw.add(buildJsonObject {
+                        put("role", "user")
+                        putJsonArray("parts") {
+                            add(buildJsonObject {
+                                putJsonObject("functionResponse") {
+                                    put("name", toolName ?: "device_action")
+                                    // Gemini expects the response as an object.
+                                    // We wrap the tool result text in a {result: ...} field.
+                                    val responseObj = runCatching {
+                                        json.parseToJsonElement(m.content).jsonObject
+                                    }.getOrElse {
+                                        buildJsonObject { put("result", m.content) }
+                                    }
+                                    put("response", responseObj)
+                                }
+                            })
+                        }
+                    })
+                }
+                else -> raw.add(buildJsonObject {
+                    put("role", "user")
+                    putJsonArray("parts") {
+                        add(buildJsonObject { put("text", m.content) })
+                    }
+                })
             }
         }
 
         // Gemini requires the first turn to be "user".
-        if (merged.isNotEmpty() && merged.first().first == "model") {
-            merged.add(0, "user" to "(start)")
-        }
-        if (merged.isEmpty()) {
-            merged.add("user" to "(no message)")
-        }
-
-        val contents = merged.map { (role, text) ->
-            buildJsonObject {
-                put("role", role)
-                putJsonArray("parts") {
-                    val safeText = if (text.isBlank()) "(empty)" else text
-                    add(buildJsonObject { put("text", safeText) })
-                }
+        if (raw.isNotEmpty()) {
+            val firstRole = (raw[0]["role"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+            if (firstRole == "model") {
+                raw.add(0, buildJsonObject {
+                    put("role", "user")
+                    putJsonArray("parts") {
+                        add(buildJsonObject { put("text", "(start)") })
+                    }
+                })
             }
+        }
+        if (raw.isEmpty()) {
+            raw.add(buildJsonObject {
+                put("role", "user")
+                putJsonArray("parts") {
+                    add(buildJsonObject { put("text", "(no message)") })
+                }
+            })
         }
 
         val sys = systemParts.joinToString("\n\n").takeIf { it.isNotBlank() }
-        return Pair(sys, contents)
+        return Pair(sys, raw)
+    }
+
+    /**
+     * Find the tool name for a given tool_call_id by scanning the message list
+     * for the preceding assistant message with matching tool_calls[].id.
+     * Used by [convertMessages] to pair functionResponse parts with their
+     * functionCall counterparts (Gemini requires the names to match).
+     */
+    private fun findToolNameForId(messages: List<LlmClient.Message>, toolCallId: String?): String? {
+        if (toolCallId == null) return null
+        for (m in messages) {
+            if (m.role.lowercase() == "assistant") {
+                m.toolCalls?.forEach { tc ->
+                    if (tc.id == toolCallId) return tc.name
+                }
+            }
+        }
+        return null
     }
 
     /** Execute an OkHttp call as a cancellable coroutine. */

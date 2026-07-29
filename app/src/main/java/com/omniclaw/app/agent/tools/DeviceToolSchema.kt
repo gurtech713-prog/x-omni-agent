@@ -29,11 +29,13 @@ object DeviceToolSchema {
           "type": "object",
           "properties": {
             "thought": {"type": "string", "description": "One-sentence reasoning for this action."},
-            "action": {"type": "string", "enum": ["tap","swipe","type","launch","back","home","screenshot","done"], "description": "The single device action to perform."},
+            "action": {"type": "string", "enum": ["tap","click","swipe","scroll","drag","type","launch","back","home","screenshot","done"], "description": "The single device action to perform. 'click' is an alias for 'tap'."},
             "x":  {"type": "integer", "description": "Tap / swipe-start x in screen pixels."},
             "y":  {"type": "integer", "description": "Tap / swipe-start y in screen pixels."},
             "x2": {"type": "integer", "description": "Swipe-end x in screen pixels."},
             "y2": {"type": "integer", "description": "Swipe-end y in screen pixels."},
+            "direction": {"type": "string", "enum": ["up","down","left","right"], "description": "Scroll direction (action=scroll). The executor computes the swipe path from the real screen size."},
+            "amount": {"type": "number", "description": "Scroll distance as a fraction of the screen (0.1-0.5). Default 0.35."},
             "text": {"type": "string", "description": "Text to enter (action=type)."},
             "package": {"type": "string", "description": "App package to open (action=launch)."}
           },
@@ -44,7 +46,7 @@ object DeviceToolSchema {
     /** The tool declaration handed to the LLM clients. */
     val SPEC = ToolSpec(
         name = TOOL_NAME,
-        description = "Perform exactly one Android UI action. Use tap/swipe with pixel coordinates taken from the screen observation, type to enter text into the focused field, launch to open an app by package, back/home/screenshot for navigation, or done when the user's request is satisfied.",
+        description = "Perform exactly one Android UI action. Use tap/swipe with pixel coordinates taken from the screen observation, scroll with a direction (up/down/left/right) to scroll without needing exact coordinates, type to enter text into the focused field, launch to open an app by package, back/home/screenshot for navigation, or done when the user's request is satisfied.",
         parametersSchema = PARAMETERS_SCHEMA,
     )
 
@@ -63,6 +65,9 @@ object DeviceToolSchema {
         val action: DeviceAction?,
         val done: Boolean,
         val valid: Boolean,
+        /** Human-readable error message when [valid] is false. Tells the LLM
+         *  exactly what was wrong so it can correct its next tool call. */
+        val error: String? = null,
     )
 
     /**
@@ -87,48 +92,102 @@ object DeviceToolSchema {
     fun parse(argumentsJson: String): Parsed {
         val obj: JsonObject =
             runCatching { json.parseToJsonElement(argumentsJson).jsonObject }.getOrNull()
-                ?: return Parsed("", null, done = false, valid = false)
+                ?: return Parsed("", null, done = false, valid = false, error = "Could not parse JSON: ${argumentsJson.take(200)}")
 
         val thought = (obj["thought"] as? JsonPrimitive)?.contentOrNull.orEmpty()
         val action = (obj["action"] as? JsonPrimitive)?.contentOrNull?.lowercase()?.trim()
-            ?: return Parsed(thought, null, done = false, valid = false)
+            ?: return Parsed(thought, null, done = false, valid = false, error = "Missing 'action' field. Required: action (string).")
 
-        // Helper: read an integer, accepting both int and float JSON values.
-        // Many LLMs send coordinates as floats (e.g. 540.0) — intOrNull
-        // returns null for those, so we fall back to float->int conversion.
+        // LENIENT integer reader: accepts int, float, AND string-encoded numbers.
+        // Also checks nested objects for common alternate layouts:
+        //   {x: 540, y: 1200}                        — standard
+        //   {x: "540", y: "1200"}                    — string-encoded
+        //   {coordinates: {x: 540, y: 1200}}         — nested "coordinates"
+        //   {position: {x: 540, y: 1200}}            — nested "position"
+        //   {point: {x: 540, y: 1200}}               — nested "point"
+        //   {location: {x: 540, y: 1200}}            — nested "location"
+        // This fixes the "parameter formatting problems" error that many LLMs
+        // trigger by using non-standard argument shapes.
         fun int(key: String): Int? {
-            val prim = obj[key] as? JsonPrimitive ?: return null
-            prim.intOrNull?.let { return it }
-            return prim.contentOrNull?.toFloatOrNull()?.toInt()
+            // Top-level
+            (obj[key] as? JsonPrimitive)?.let { prim ->
+                prim.intOrNull?.let { return it }
+                return prim.contentOrNull?.toFloatOrNull()?.toInt()
+            }
+            // Nested in common sub-objects
+            for (nestedKey in listOf("coordinates", "position", "point", "location", "coords")) {
+                val nested = obj[nestedKey] as? JsonObject ?: continue
+                (nested[key] as? JsonPrimitive)?.let { prim ->
+                    prim.intOrNull?.let { return it }
+                    return prim.contentOrNull?.toFloatOrNull()?.toInt()
+                }
+            }
+            return null
         }
 
         if (action == "done") return Parsed(thought, null, done = true, valid = true)
 
         val deviceAction: DeviceAction? = when (action) {
-            "tap" -> {
+            "tap", "click" -> {
                 val x = int("x"); val y = int("y")
-                if (x == null || y == null) null else DeviceAction.Tap(x, y)
+                if (x == null || y == null) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "tap/click requires 'x' and 'y' integer fields. Got: x=$x, y=$y. Send like: {\"action\":\"tap\",\"x\":540,\"y\":1200}")
+                }
+                DeviceAction.Tap(x, y)
             }
             "swipe" -> {
                 val x = int("x"); val y = int("y"); val x2 = int("x2"); val y2 = int("y2")
-                if (x == null || y == null || x2 == null || y2 == null) null
-                else DeviceAction.Swipe(x, y, x2, y2)
+                if (x == null || y == null || x2 == null || y2 == null) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "swipe requires 'x','y','x2','y2' integer fields. Got: x=$x, y=$y, x2=$x2, y2=$y2.")
+                }
+                DeviceAction.Swipe(x, y, x2, y2)
             }
-            "type" -> (obj["text"] as? JsonPrimitive)?.contentOrNull?.let { DeviceAction.Type(it) }
-            // CRITICAL FIX: accept both "package" (schema field name) and
-            // "packageName" (Kotlin/Java convention) — many LLMs send the
-            // latter because it matches the field name they see in examples.
+            "drag" -> {
+                val x = int("x"); val y = int("y"); val x2 = int("x2"); val y2 = int("y2")
+                if (x == null || y == null || x2 == null || y2 == null) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "drag requires 'x','y','x2','y2' integer fields. Got: x=$x, y=$y, x2=$x2, y2=$y2.")
+                }
+                DeviceAction.Drag(x, y, x2, y2)
+            }
+            "scroll" -> {
+                val dir = (obj["direction"] as? JsonPrimitive)?.contentOrNull?.lowercase()?.trim()
+                if (dir == null || dir !in listOf("up", "down", "left", "right")) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "scroll requires 'direction' field (up/down/left/right). Got: $dir")
+                }
+                val amt = (obj["amount"] as? JsonPrimitive)?.contentOrNull?.toFloatOrNull()
+                DeviceAction.Scroll(dir, amt ?: 0.35f)
+            }
+            "type" -> {
+                val text = (obj["text"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["value"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["input"] as? JsonPrimitive)?.contentOrNull
+                if (text == null) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "type requires 'text' string field. Got: null.")
+                }
+                DeviceAction.Type(text)
+            }
             "launch" -> {
                 val pkg = (obj["package"] as? JsonPrimitive)?.contentOrNull
                     ?: (obj["packageName"] as? JsonPrimitive)?.contentOrNull
                     ?: (obj["app"] as? JsonPrimitive)?.contentOrNull
                     ?: (obj["appName"] as? JsonPrimitive)?.contentOrNull
-                pkg?.let { DeviceAction.Launch(it) }
+                    ?: (obj["application"] as? JsonPrimitive)?.contentOrNull
+                if (pkg == null) {
+                    return Parsed(thought, null, done = false, valid = false,
+                        error = "launch requires 'package' string field (e.g. com.android.camera). Got: null.")
+                }
+                DeviceAction.Launch(pkg)
             }
             "back" -> DeviceAction.Back
             "home" -> DeviceAction.Home
             "screenshot" -> DeviceAction.Screenshot
-            else -> null
+            else -> return Parsed(thought, null, done = false, valid = false,
+                error = "Unknown action '$action'. Valid: tap, click, swipe, scroll, type, launch, back, home, screenshot, done.")
         }
 
         return Parsed(thought, deviceAction, done = false, valid = deviceAction != null)
@@ -157,6 +216,8 @@ object DeviceToolSchema {
         DeviceAction.NoOp -> null
         is DeviceAction.Tap -> "tap(${action.x},${action.y})"
         is DeviceAction.Swipe -> "swipe(${action.x1},${action.y1},${action.x2},${action.y2})"
+        is DeviceAction.Drag -> "drag(${action.x1},${action.y1},${action.x2},${action.y2})"
+        is DeviceAction.Scroll -> "scroll(${action.direction},${action.amount})"
         is DeviceAction.Type -> "type(\"${action.text}\")"
         is DeviceAction.Launch -> "launch(${action.packageName})"
         DeviceAction.Back -> "back"

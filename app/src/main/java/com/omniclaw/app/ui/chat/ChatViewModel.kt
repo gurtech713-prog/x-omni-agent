@@ -29,6 +29,9 @@ class ChatViewModel @Inject constructor(
     private val agent: AgentLoop,
     private val settings: SettingsRepository,
     private val ttsManager: com.omniclaw.app.voice.TextToSpeechManager,
+    private val audioRecorder: com.omniclaw.app.voice.AudioRecorder,
+    private val sttClient: com.omniclaw.app.voice.SttClient,
+    private val json: kotlinx.serialization.json.Json,
 ) : ViewModel() {
 
     val uiPrefs: StateFlow<UiPrefs> = settings.uiPrefs.stateIn(
@@ -52,6 +55,124 @@ class ChatViewModel @Inject constructor(
 
     private val _events = MutableStateFlow<List<AgentLoop.Event>>(emptyList())
     val events: StateFlow<List<AgentLoop.Event>> = _events.asStateFlow()
+
+    /**
+     * Per-session token usage counter for the cost dashboard. Tracks cumulative
+     * tokens across all steps in the active session. Updated when
+     * [AgentLoop.Event.StepFinished] events arrive (which carry [LlmUsage]).
+     */
+    private val _sessionTokens = MutableStateFlow(0L)
+    val sessionTokens: StateFlow<Long> = _sessionTokens.asStateFlow()
+
+    /**
+     * Retry the last user message. Used by the "Retry" button on failed sessions.
+     * Finds the last USER message in the active session and re-sends it.
+     */
+    fun retryLastMessage() {
+        val session = activeSession.value ?: return
+        val lastUserMsg = session.messages.lastOrNull { it.role == ChatMessage.Role.USER }
+        if (lastUserMsg != null) {
+            Log.i(TAG, "Retrying last user message: ${lastUserMsg.content}")
+            send(lastUserMsg.content)
+        }
+    }
+
+    // ---- Voice input (microphone button in Composer) ----
+
+    private val _isRecording = MutableStateFlow(false)
+    val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
+
+    /**
+     * Start recording audio for voice-to-text input. When [stopRecording] is
+     * called, the audio is transcribed via [SttClient] and the resulting text
+     * is emitted via [_transcribedText] for the Composer to display.
+     */
+    fun startRecording() {
+        if (_isRecording.value) return
+        val file = audioRecorder.start() ?: run {
+            Log.w(TAG, "Failed to start recording — permission denied or mic busy")
+            return
+        }
+        _isRecording.value = true
+        Log.i(TAG, "Started voice recording: ${file.absolutePath}")
+    }
+
+    private val _transcribedText = MutableStateFlow<String?>(null)
+    val transcribedText: StateFlow<String?> = _transcribedText.asStateFlow()
+
+    /**
+     * Stop recording and transcribe the audio. The transcribed text is emitted
+     * via [transcribedText] so the Composer can insert it into the text field.
+     */
+    fun stopRecording() {
+        if (!_isRecording.value) return
+        _isRecording.value = false
+        val file = audioRecorder.stop() ?: run {
+            Log.w(TAG, "Recording produced no file")
+            return
+        }
+        Log.i(TAG, "Stopped recording, transcribing: ${file.absolutePath}")
+        viewModelScope.launch {
+            val text = runCatchingCancellable { sttClient.transcribe(file) }.getOrNull()
+            if (text.isNullOrBlank()) {
+                Log.w(TAG, "Transcription returned empty")
+                _transcribedText.value = ""
+            } else {
+                Log.i(TAG, "Transcribed: $text")
+                _transcribedText.value = text
+            }
+            // Clean up the temp audio file
+            runCatching { file.delete() }
+        }
+    }
+
+    /** Clear the transcribed text (called after the Composer consumes it). */
+    fun clearTranscribedText() {
+        _transcribedText.value = null
+    }
+
+    /**
+     * Export the active session as a JSON string. Includes all messages,
+     * tool calls, thoughts, and metadata. Returns null if no active session.
+     */
+    fun exportSession(): String? {
+        val session = activeSession.value ?: return null
+        return runCatching {
+            val export = kotlinx.serialization.json.buildJsonObject {
+                put("sessionId", session.id)
+                put("title", session.title)
+                put("createdAt", session.createdAt)
+                put("status", session.status.name)
+                put("stepCount", session.stepCount)
+                put("tokenUsage", session.tokenUsage)
+                put("messages", kotlinx.serialization.json.JsonArray(session.messages.map { msg ->
+                    kotlinx.serialization.json.buildJsonObject {
+                        put("id", msg.id)
+                        put("role", msg.role.name)
+                        put("content", msg.content)
+                        put("timestamp", msg.timestamp)
+                        if (msg.toolCalls.isNotEmpty()) {
+                            put("toolCalls", kotlinx.serialization.json.JsonArray(msg.toolCalls.map { tc ->
+                                kotlinx.serialization.json.buildJsonObject {
+                                    put("id", tc.id)
+                                    put("name", tc.name)
+                                    put("args", tc.args)
+                                    put("result", tc.result ?: "")
+                                    put("ok", tc.ok)
+                                }
+                            }))
+                        }
+                        if (msg.thoughts.isNotEmpty()) {
+                            put("thoughts", kotlinx.serialization.json.JsonArray(msg.thoughts.map {
+                                kotlinx.serialization.json.JsonPrimitive(it)
+                            }))
+                        }
+                    }
+                }))
+            }
+            json.encodeToString(kotlinx.serialization.json.JsonObject.serializer(), export)
+        }.getOrNull()
+    }
 
     /**
      * Bounded backing buffer for [events]. Appends are O(1) on an [ArrayDeque],
@@ -120,6 +241,27 @@ class ChatViewModel @Inject constructor(
 
     init {
         Log.d(TAG, "ChatViewModel initialized")
+        // SESSION RECOVERY FIX: when the ViewModel is recreated (process kill,
+        // config change, or navigation pop+restore), _activeId is null. Without
+        // this recovery, the user's next message would ALWAYS create a new
+        // session — even if they had an active conversation seconds ago.
+        //
+        // On init, if there's no active session, grab the most recent session
+        // from the repository and set it as active. This way the user can
+        // continue their last conversation without the app starting a fresh
+        // chat on every message. We skip sessions that are FAILED or STOPPED
+        // (those are genuinely terminal and shouldn't be continued).
+        viewModelScope.launch {
+            if (_activeId.value == null) {
+                val recent = sessions.sessions.value
+                    .filter { it.status != SessionStatus.FAILED && it.status != SessionStatus.STOPPED }
+                    .maxByOrNull { it.lastActiveAt }
+                if (recent != null) {
+                    Log.i(TAG, "Recovered last active session: ${recent.id} (status=${recent.status})")
+                    _activeId.value = recent.id
+                }
+            }
+        }
         // Subscribe to agent events so the UI can show them live.
         // Filter by the active session so the event log only shows the current
         // session's steps, not a global mix.
@@ -164,6 +306,14 @@ class ChatViewModel @Inject constructor(
                             Log.d(TAG, "Triggering TTS speak (Completed, cleaned): $cleaned")
                             ttsManager.speak(cleaned)
                         }
+                    }
+                    // Track cumulative token usage for the cost dashboard.
+                    if (e is AgentLoop.Event.StepFinished) {
+                        _sessionTokens.value = _sessionTokens.value + e.usage.totalTokens
+                    }
+                    // Reset the token counter when a new session starts.
+                    if (e is AgentLoop.Event.StepStarted && e.step == 1) {
+                        _sessionTokens.value = 0L
                     }
                 }
             }
@@ -251,19 +401,44 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             val existingId = _activeId.value
             val existingSession = existingId?.let { sessions.getByIdSnapshot(it) }
-            // CHAT-2 FIX: a terminal session (DONE/FAILED/STOPPED) is archived - the
-            // next message starts a fresh session instead of reusing finished history.
+            // CHAT-CONTINUATION FIX: previously DONE was treated as terminal, but
+            // AgentLoop sets status=DONE after EVERY completed conversational turn
+            // (a normal reply, a "done" action, max-steps reached, etc). That meant
+            // the very next user message ALWAYS created a new session — the user
+            // could never continue a conversation in the same chat.
+            //
+            // Now only FAILED and STOPPED are treated as terminal (abnormal end
+            // states where continuing makes no sense). A DONE session is a normal
+            // "agent finished its turn" state and the user can keep chatting in
+            // the same thread. IDLE/RUNNING/DONE all reuse the existing session.
             val existingIsTerminal = existingSession?.status?.let {
-                it == SessionStatus.DONE || it == SessionStatus.FAILED || it == SessionStatus.STOPPED
+                it == SessionStatus.FAILED || it == SessionStatus.STOPPED
             } == true
             val id = if (existingId == null || existingSession == null || existingIsTerminal) {
-                Log.d(TAG, "Creating a new session for message: $text")
-                // CHAT-FLOW FIX (Bug 2): only clear the event log when
-                // actually starting a new session. The reuse path preserves
-                // prior step/thought events for ongoing-conversation context.
-                clearEvents()
-                newSession()
+                // LAST-CHANCE RECOVERY: before creating a brand-new session,
+                // check if there's a recent non-terminal session we can revive.
+                // This catches the race where the init-block recovery hasn't
+                // completed yet (it's async) but the user already typed and
+                // sent a message. Without this, the first message after a
+                // ViewModel recreation would always create a new session even
+                // though a perfectly good DONE session exists.
+                val recoverable = sessions.sessions.value
+                    .filter { it.status != SessionStatus.FAILED && it.status != SessionStatus.STOPPED }
+                    .maxByOrNull { it.lastActiveAt }
+                if (recoverable != null && !existingIsTerminal) {
+                    Log.d(TAG, "Recovering recent session ${recoverable.id} (status=${recoverable.status}) instead of creating new")
+                    _activeId.value = recoverable.id
+                    recoverable.id
+                } else {
+                    Log.d(TAG, "Creating a new session for message: $text")
+                    // CHAT-FLOW FIX (Bug 2): only clear the event log when
+                    // actually starting a new session. The reuse path preserves
+                    // prior step/thought events for ongoing-conversation context.
+                    clearEvents()
+                    newSession()
+                }
             } else {
+                Log.d(TAG, "Reusing existing session $existingId (status=${existingSession.status}) for message: $text")
                 existingId
             }
             // Use getByIdSnapshot (in-memory) so we don't race with the DB write
@@ -308,5 +483,14 @@ class ChatViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "ChatViewModel"
+
+        /** runCatching that re-throws CancellationException. */
+        private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+            Result.success(block())
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
     }
 }

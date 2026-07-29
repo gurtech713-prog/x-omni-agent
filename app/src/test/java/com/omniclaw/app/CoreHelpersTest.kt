@@ -83,6 +83,7 @@ class ParseDeviceActionTest {
     private sealed class DeviceAction {
         data class Tap(val x: Int, val y: Int) : DeviceAction()
         data class Swipe(val x1: Int, val y1: Int, val x2: Int, val y2: Int) : DeviceAction()
+        data class Scroll(val direction: String, val amount: Float = 0.35f) : DeviceAction()
         data class Type(val text: String) : DeviceAction()
         data class Launch(val packageName: String) : DeviceAction()
         data object Back : DeviceAction()
@@ -108,6 +109,15 @@ class ParseDeviceActionTest {
                     m?.groupValues?.getOrNull(3)?.toIntOrNull() ?: 0,
                     m?.groupValues?.getOrNull(4)?.toIntOrNull() ?: 0,
                 )
+            }
+            s.startsWith("scroll", ignoreCase = true) -> {
+                val m = Regex("(?i)scroll\\s*\\(\\s*([a-z]+)\\s*(?:,\\s*([0-9]*\\.?[0-9]+)\\s*)?\\)").find(s)
+                val dir = m?.groupValues?.getOrNull(1)?.lowercase()
+                val amt = m?.groupValues?.getOrNull(2)?.toFloatOrNull() ?: 0.35f
+                when (dir) {
+                    "up", "down", "left", "right" -> DeviceAction.Scroll(dir, amt)
+                    else -> DeviceAction.NoOp
+                }
             }
             s.startsWith("type", ignoreCase = true) -> {
                 val m = Regex("(?i)type\\s*\\(\\s*\"(.*)\"\\s*\\)").find(s)
@@ -146,6 +156,34 @@ class ParseDeviceActionTest {
         val s = a as DeviceAction.Swipe
         assertEquals(100, s.x1); assertEquals(200, s.y1)
         assertEquals(300, s.x2); assertEquals(400, s.y2)
+    }
+
+    @Test fun `scroll down parses direction`() {
+        val a = parseDeviceAction("scroll(down)")
+        assertTrue(a is DeviceAction.Scroll)
+        assertEquals("down", (a as DeviceAction.Scroll).direction)
+    }
+
+    @Test fun `scroll up with amount parses both`() {
+        val a = parseDeviceAction("scroll(up,0.5)")
+        assertTrue(a is DeviceAction.Scroll)
+        val s = a as DeviceAction.Scroll
+        assertEquals("up", s.direction)
+        assertEquals(0.5f, s.amount, 0.001f)
+    }
+
+    @Test fun `scroll defaults amount when omitted`() {
+        val a = parseDeviceAction("scroll(left)")
+        assertTrue(a is DeviceAction.Scroll)
+        assertEquals(0.35f, (a as DeviceAction.Scroll).amount, 0.001f)
+    }
+
+    @Test fun `scroll right case insensitive`() {
+        assertTrue(parseDeviceAction("SCROLL(RIGHT)") is DeviceAction.Scroll)
+    }
+
+    @Test fun `scroll with invalid direction returns NoOp`() {
+        assertTrue(parseDeviceAction("scroll(sideways)") is DeviceAction.NoOp)
     }
 
     @Test fun `type with quoted text`() {

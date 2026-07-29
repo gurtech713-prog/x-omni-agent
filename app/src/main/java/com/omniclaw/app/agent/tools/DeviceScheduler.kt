@@ -73,6 +73,113 @@ class DeviceScheduler @Inject constructor(
     /** Returns the raw bitmap bytes of the latest screenshot, or null. */
     suspend fun screenshot(): ByteArray? = executor.screenshot()
 
+    /**
+     * Tap a UI element by its text or content description — NO coordinates
+     * required. Delegates to [AccessibilityExecutor.tapElementByText].
+     * Returns true if a matching element was found and clicked.
+     */
+    suspend fun tapElementByText(query: String): Boolean {
+        val svc = boundService ?: return false
+        return runCatching { executor.tapElementByText(query) }.getOrDefault(false)
+    }
+
+    /**
+     * Check if a UI element matching [query] exists on the current screen.
+     * Does NOT click it — just returns true if found. Used by wait_for_element.
+     */
+    suspend fun elementExists(query: String): Boolean {
+        val svc = boundService ?: return false
+        return runCatching { executor.elementExists(query) }.getOrDefault(false)
+    }
+
+    /**
+     * Find ALL elements matching [query]. Returns their metadata (text, bounds,
+     * TAP coordinates, clickability) so the LLM can choose which to tap.
+     */
+    suspend fun findAllElements(query: String): List<AccessibilityExecutor.ElementInfo> {
+        val svc = boundService ?: return emptyList()
+        return runCatching { executor.findAllElements(query) }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Get the current foreground package name. Used for app-specific skill profiles.
+     */
+    fun foregroundPackage(): String? {
+        return runCatching { executor.foregroundPackage() }.getOrNull()
+    }
+
+    /**
+     * Undo the last action — presses BACK to revert the last screen change.
+     * If BACK doesn't work (e.g. on the home screen), dispatches HOME.
+     */
+    suspend fun undoLastAction(): Boolean {
+        // Press BACK — this dismisses dialogs, closes keyboards, navigates back.
+        val backOk = dispatch(DeviceAction.Back)
+        if (backOk) return true
+        // If BACK failed, try HOME as a last resort
+        return dispatch(DeviceAction.Home)
+    }
+
+    /**
+     * VLM-based tap: capture a screenshot, ask the vision model to locate
+     * the element by description, then tap the returned coordinates.
+     *
+     * @param description natural-language description (e.g. "shutter button")
+     * @param vlm the VLM client (injected by AgenticToolRegistry)
+     * @return true if the VLM found the element and the tap landed
+     */
+    suspend fun tapElementVisual(description: String, vlm: com.omniclaw.app.vision.VlmClient): Boolean {
+        val png = screenshot() ?: return false
+        val prompt = "Look at this screenshot. Find the UI element described as: \"$description\". " +
+            "Respond with ONLY the tap coordinates as JSON: {\"x\": <number>, \"y\": <number>}. " +
+            "If you cannot find it, respond with {\"x\": -1, \"y\": -1}."
+        val answer = runCatching { vlm.describe(png, prompt) }.getOrNull() ?: return false
+        // Parse x,y from the VLM response
+        val xMatch = Regex("\"x\"\\s*:\\s*(-?\\d+)").find(answer)
+        val yMatch = Regex("\"y\"\\s*:\\s*(-?\\d+)").find(answer)
+        val x = xMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return false
+        val y = yMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return false
+        if (x < 0 || y < 0) return false
+        return dispatch(DeviceAction.Tap(x, y))
+    }
+
+    /**
+     * Select text in the focused editable field. Uses ACTION_SET_SELECTION.
+     */
+    suspend fun selectText(start: Int, end: Int): Boolean {
+        val svc = boundService ?: return false
+        return runCatching { executor.selectText(start, end) }.getOrDefault(false)
+    }
+
+    /**
+     * Copy the current selection to the clipboard via ACTION_COPY.
+     */
+    suspend fun copySelection(): Boolean {
+        val svc = boundService ?: return false
+        return runCatching { executor.copySelection() }.getOrDefault(false)
+    }
+
+    /**
+     * Read the current clipboard text. Returns null if empty or inaccessible.
+     */
+    fun readClipboard(): String? {
+        return runCatching {
+            val cm = appContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+            val clip = cm.primaryClip ?: return null
+            if (clip.itemCount == 0) return null
+            clip.getItemAt(0).coerceToText(appContext).toString()
+        }.getOrNull()
+    }
+
+    /**
+     * Verify whether the screen changed after an action. Delegates to
+     * [AccessibilityExecutor.verifyScreenChanged].
+     */
+    suspend fun verifyScreenChanged(beforeFingerprint: String): AccessibilityExecutor.VerifyResult {
+        return executor.verifyScreenChanged(beforeFingerprint)
+    }
+
     suspend fun dispatch(action: DeviceAction): Boolean {
         // CRITICAL FIX (agent not performing tasks): Launch actions do NOT
         // require the accessibility service — they use PackageManager +
@@ -218,6 +325,11 @@ class DeviceScheduler @Inject constructor(
     /**
      * Synchronous dispatch for non-suspend callers (BehaviorRecorder replay
      * legacy path). Prefer the suspend [dispatch] for new code.
+     *
+     * SCROLL NOTE: [DeviceAction.Scroll] is not supported here because it
+     * requires the suspend [GestureManager.scroll] path (which reads display
+     * metrics asynchronously). Callers using dispatchBlocking should emit
+     * [DeviceAction.Swipe] instead with pre-computed coordinates.
      */
     fun dispatchBlocking(action: DeviceAction): Boolean {
         val svc = boundService ?: return false
@@ -226,6 +338,17 @@ class DeviceScheduler @Inject constructor(
             is DeviceAction.Swipe -> kotlinx.coroutines.runBlocking { svc.swipe(action.x1, action.y1, action.x2, action.y2) }
             is DeviceAction.Type -> svc.type(action.text)
             is DeviceAction.Launch -> svc.launch(action.packageName)
+            // Scroll and Drag need the suspend executor path (display metrics / gesture manager) — fall
+            // back to a no-op here rather than crashing. BehaviorRecorder replay
+            // is the only caller and it records Swipe, not Scroll/Drag.
+            is DeviceAction.Scroll -> {
+                Log.w("DeviceScheduler", "dispatchBlocking does not support Scroll; use dispatch() instead")
+                false
+            }
+            is DeviceAction.Drag -> {
+                Log.w("DeviceScheduler", "dispatchBlocking does not support Drag; use dispatch() instead")
+                false
+            }
             DeviceAction.Back -> svc.back()
             DeviceAction.Home -> svc.home()
             DeviceAction.Screenshot -> true

@@ -45,6 +45,20 @@ class DeviceActionTest {
     }
 
     @Test
+    fun `scroll carries direction and amount`() {
+        val a = DeviceAction.Scroll("down", 0.5f)
+        assertEquals("down", a.direction)
+        assertEquals(0.5f, a.amount, 0.001f)
+    }
+
+    @Test
+    fun `scroll defaults amount to 0_35`() {
+        val a = DeviceAction.Scroll("up")
+        assertEquals("up", a.direction)
+        assertEquals(0.35f, a.amount, 0.001f)
+    }
+
+    @Test
     fun `back home screenshot noop are singletons`() {
         assertEquals(DeviceAction.Back, DeviceAction.Back)
         assertEquals(DeviceAction.Home, DeviceAction.Home)
@@ -58,6 +72,7 @@ class DeviceActionTest {
             DeviceAction.NoOp,
             DeviceAction.Tap(0, 0),
             DeviceAction.Swipe(0, 0, 0, 0),
+            DeviceAction.Scroll("down", 0.35f),
             DeviceAction.Type(""),
             DeviceAction.Launch(""),
             DeviceAction.Back,
@@ -86,6 +101,8 @@ class DeviceActionTest {
         fun nameOf(a: DeviceAction): String = when (a) {
             is DeviceAction.Tap -> "tap"
             is DeviceAction.Swipe -> "swipe"
+            is DeviceAction.Drag -> "drag"
+            is DeviceAction.Scroll -> "scroll"
             is DeviceAction.Type -> "type"
             is DeviceAction.Launch -> "launch"
             DeviceAction.Back -> "back"
@@ -95,12 +112,23 @@ class DeviceActionTest {
         }
         assertEquals("tap", nameOf(DeviceAction.Tap(0, 0)))
         assertEquals("swipe", nameOf(DeviceAction.Swipe(0, 0, 0, 0)))
+        assertEquals("drag", nameOf(DeviceAction.Drag(0, 0, 0, 0)))
+        assertEquals("scroll", nameOf(DeviceAction.Scroll("down", 0.35f)))
         assertEquals("type", nameOf(DeviceAction.Type("x")))
         assertEquals("launch", nameOf(DeviceAction.Launch("x")))
         assertEquals("back", nameOf(DeviceAction.Back))
         assertEquals("home", nameOf(DeviceAction.Home))
         assertEquals("screenshot", nameOf(DeviceAction.Screenshot))
         assertEquals("noop", nameOf(DeviceAction.NoOp))
+    }
+
+    @Test
+    fun `drag carries four coordinates`() {
+        val a = DeviceAction.Drag(1, 2, 3, 4)
+        assertEquals(1, a.x1)
+        assertEquals(2, a.y1)
+        assertEquals(3, a.x2)
+        assertEquals(4, a.y2)
     }
 
     @Test
@@ -116,5 +144,6 @@ class DeviceActionTest {
         assertTrue(dispatchResult(DeviceAction.Screenshot))
         assertTrue(dispatchResult(DeviceAction.NoOp))
         assertFalse(dispatchResult(DeviceAction.Tap(0, 0)))
+        assertFalse(dispatchResult(DeviceAction.Scroll("down", 0.35f)))
     }
 }
